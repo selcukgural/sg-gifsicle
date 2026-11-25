@@ -8,13 +8,19 @@
 //
 // The LZW encoder keeps its codes in an adaptive tree, after Whirlgif: each code is a node, whose
 // children are a linked list until it has `MaxLinksType` of them and a table indexed by suffix after.
-// The nodes are items of lists and point at each other by their place in them, where C uses
-// pointers; a table is a stretch of the list `links`.
+// The nodes are items of arrays and point at each other by their place in them, where C uses
+// pointers; a table is a stretch of the array `links`. An array is read at `n & NodeMask` (or
+// `LinkMask`): the place is always inside, so the mask changes nothing, and the C compiler then
+// knows it is inside and checks nothing.
 //
 // The writer writes into memory; the file is written from it at the end.
 
 const nint NodesSize = 4096
 const nint LinksSize = 4096 + 256
+const nint NodeMask = NodesSize - 1
+// `links` is LinksSize long in C; here it is the next power of two, for the mask.
+const nint LinksSpace = 8192
+const nint LinkMask = LinksSpace - 1
 const byte TableType = 0
 const byte LinksTypeStart = 1
 const byte MaxLinksType = 5
@@ -22,17 +28,17 @@ const byte MaxLinksType = 5
 struct CodeTable {
     // the nodes: code, type, suffix, length, sibling and child (a node, or the start of a table
     // in `links`); -1 is the null pointer
-    List<ushort> code
-    List<byte> type
-    List<byte> suffix
-    List<uint> length
-    List<int> sibling
-    List<int> child
+    ushort[NodesSize] code
+    byte[NodesSize] type
+    byte[NodesSize] suffix
+    uint[NodesSize] length
+    int[NodesSize] sibling
+    int[NodesSize] child
     // the lossy encoder's: the loss accumulated, and the error carried to the next pixel
     List<ulong> diffaccum
     List<Wkcolor> error
 
-    List<int> links
+    int[LinksSpace] links
     int clearCode
     uint maxLoss
     uint maxpos
@@ -61,11 +67,10 @@ struct Writer {
 
 CodeTable newCodeTable(read CompressInfo gcinfo, read Kc kc) {
     var gfc = CodeTable {
-        code = List<ushort>.repeat(0, NodesSize), type = List<byte>.repeat(0, NodesSize),
-        suffix = List<byte>.repeat(0, NodesSize), length = List<uint>.repeat(0, NodesSize),
-        sibling = List<int>.repeat(-1, NodesSize), child = List<int>.repeat(-1, NodesSize),
+        code = ushort[NodesSize], type = byte[NodesSize], suffix = byte[NodesSize], length = uint[NodesSize],
+        sibling = int[NodesSize](-1), child = int[NodesSize](-1),
         diffaccum = List<ulong>(), error = List<Wkcolor>(),
-        links = List<int>.repeat(-1, LinksSize), clearCode = 0, maxLoss = 0, maxpos = 0, linksPos = 0,
+        links = int[LinksSpace](-1), clearCode = 0, maxLoss = 0, maxpos = 0, linksPos = 0,
         hasGlobalKcs = false, globalKcs = List<Kcolor>(), hasLocalKcs = false, localKcs = List<Kcolor>(),
         kcsWhich = 0, lossScale = 0.0, hasKcdiff = false, kcdiff = List<uint>(),
     }
@@ -104,29 +109,29 @@ void gfcClear(ref CodeTable gfc) {
     // The first clear_code nodes are reserved for single-pixel codes
     gfc.linksPos = gfc.clearCode
     for c in 0..(nint)gfc.clearCode {
-        gfc.code[c] = (ushort)c
-        gfc.type[c] = LinksTypeStart
-        gfc.suffix[c] = (byte)c
-        gfc.length[c] = 1
-        gfc.child[c] = -1
-        gfc.links[c] = (int)c
+        gfc.code[c & NodeMask] = (ushort)c
+        gfc.type[c & NodeMask] = LinksTypeStart
+        gfc.suffix[c & NodeMask] = (byte)c
+        gfc.length[c & NodeMask] = 1
+        gfc.child[c & NodeMask] = -1
+        gfc.links[c & LinkMask] = (int)c
     }
 }
 
 int gfcLookup(read CodeTable gfc, int node, byte suffix) {
     if node < 0 {
-        return gfc.links[(nint)suffix]
+        return gfc.links[(nint)suffix & LinkMask]
     }
     nint n = (nint)node
-    if gfc.type[n] == TableType {
-        return gfc.links[(nint)gfc.child[n] + (nint)suffix]
+    if gfc.type[n & NodeMask] == TableType {
+        return gfc.links[((nint)gfc.child[n & NodeMask] + (nint)suffix) & LinkMask]
     }
-    int ch = gfc.child[n]
+    int ch = gfc.child[n & NodeMask]
     while ch >= 0 {
-        if gfc.suffix[(nint)ch] == suffix {
+        if gfc.suffix[(nint)ch & NodeMask] == suffix {
             return ch
         }
-        ch = gfc.sibling[(nint)ch]
+        ch = gfc.sibling[(nint)ch & NodeMask]
     }
     return -1
 }
@@ -136,35 +141,35 @@ void gfcChangeNodeToTable(ref CodeTable gfc, int workNode, int nextNode) {
     nint table = (nint)gfc.linksPos
     gfc.linksPos += gfc.clearCode
     for c in 0..(nint)gfc.clearCode {
-        gfc.links[table + c] = -1
+        gfc.links[(table + c) & LinkMask] = -1
     }
-    gfc.links[table + (nint)gfc.suffix[(nint)nextNode]] = nextNode
-    int n = gfc.child[(nint)workNode]
+    gfc.links[(table + (nint)gfc.suffix[(nint)nextNode & NodeMask]) & LinkMask] = nextNode
+    int n = gfc.child[(nint)workNode & NodeMask]
     while n >= 0 {
-        gfc.links[table + (nint)gfc.suffix[(nint)n]] = n
-        n = gfc.sibling[(nint)n]
+        gfc.links[(table + (nint)gfc.suffix[(nint)n & NodeMask]) & LinkMask] = n
+        n = gfc.sibling[(nint)n & NodeMask]
     }
-    gfc.type[(nint)workNode] = TableType
-    gfc.child[(nint)workNode] = (int)table
+    gfc.type[(nint)workNode & NodeMask] = TableType
+    gfc.child[(nint)workNode & NodeMask] = (int)table
 }
 
 void gfcDefine(ref CodeTable gfc, int workNode, byte suffix, int nextCode) {
     // Add a new code to the dictionary; its node is LINKS_TYPE at first.
     nint next = (nint)nextCode
     nint work = (nint)workNode
-    gfc.code[next] = (ushort)nextCode
-    gfc.type[next] = LinksTypeStart
-    gfc.suffix[next] = suffix
-    gfc.length[next] = gfc.length[work] + 1
-    gfc.child[next] = -1
+    gfc.code[next & NodeMask] = (ushort)nextCode
+    gfc.type[next & NodeMask] = LinksTypeStart
+    gfc.suffix[next & NodeMask] = suffix
+    gfc.length[next & NodeMask] = gfc.length[work & NodeMask] + 1
+    gfc.child[next & NodeMask] = -1
     // link the new node into the work node's children
-    if gfc.type[work] == TableType {
-        gfc.links[(nint)gfc.child[work] + (nint)suffix] = nextCode
-    } else if gfc.type[work] < MaxLinksType || gfc.linksPos + gfc.clearCode > (int)LinksSize {
-        gfc.sibling[next] = gfc.child[work]
-        gfc.child[work] = nextCode
-        if gfc.type[work] < MaxLinksType {
-            gfc.type[work] += 1
+    if gfc.type[work & NodeMask] == TableType {
+        gfc.links[((nint)gfc.child[work & NodeMask] + (nint)suffix) & LinkMask] = nextCode
+    } else if gfc.type[work & NodeMask] < MaxLinksType || gfc.linksPos + gfc.clearCode > (int)LinksSize {
+        gfc.sibling[next & NodeMask] = gfc.child[work & NodeMask]
+        gfc.child[work & NodeMask] = nextCode
+        if gfc.type[work & NodeMask] < MaxLinksType {
+            gfc.type[work & NodeMask] += 1
         }
     } else {
         gfcChangeNodeToTable(ref gfc, workNode, nextCode)
@@ -255,9 +260,9 @@ void writeCompressedImage(ref Gt g, nint gfs, read Image gfi, int minCodeBits, r
         // Output 'output_code' to the memory buffer.
         if bufpos + 32 >= bufcap {
             uint ncap = bufcap * 2 + (24 << 3)
-            while buf.length() < (nint)(ncap >> 3) {
-                buf.add(0)
-            }
+            var nbuf = List<byte>.repeat(0, (nint)(ncap >> 3))
+            nbuf[0..buf.length()].copyFrom(read buf)
+            buf = nbuf
             bufcap = ncap
         }
         uint endpos = bufpos + (uint)curCodeBits
@@ -303,7 +308,7 @@ void writeCompressedImage(ref Gt g, nint gfs, read Image gfi, int minCodeBits, r
         if grr.codeTable.maxLoss > 0 {
             workNode = gfcLookupLossy(ref grr.codeTable, read gfi, pos)
             if workNode >= 0 {
-                run = grr.codeTable.length[(nint)workNode]
+                run = grr.codeTable.length[(nint)workNode & NodeMask]
             } else {
                 run = 0
             }
@@ -380,7 +385,7 @@ void writeCompressedImage(ref Gt g, nint gfs, read Image gfi, int minCodeBits, r
         }
 
         if workNode >= 0 {
-            outputCode = (int)grr.codeTable.code[(nint)workNode]
+            outputCode = (int)grr.codeTable.code[(nint)workNode & NodeMask]
             // Adjust current run length average.
             run = (run << RunEwmaScale) + ((uint)1 << (RunEwmaShift - 1))
             if run < runEwma {
@@ -422,10 +427,9 @@ int calculateMinCodeBits(read Gt g, nint gfi, read Writer grr) {
         nint y = 0
         while y < height && colorsUsed < 128 {
             nint at = g.images[gfi].rows[y]
-            for x in at..at + width {
-                int p = (int)g.images[gfi].data[x]
-                if p > colorsUsed {
-                    colorsUsed = p
+            for p in g.images[gfi].data[at..at + width] {
+                if (int)p > colorsUsed {
+                    colorsUsed = (int)p
                 }
             }
             y += 1

@@ -74,13 +74,15 @@ bool gifEof(read Reader grr) {
     return grr.pos >= grr.length
 }
 
-// The state of a read: the stream and the image being read, and the decoder's tables.
+// The state of a read: the stream and the image being read, and the decoder's tables. The tables
+// are arrays of a code's every value, read at `code & CodeMask`: a code has at most twelve bits, so
+// the mask changes nothing, and the C compiler then knows the index is inside and checks nothing.
 struct Context {
     nint stream
     nint gfi
-    List<ushort> prefix
-    List<byte> suffix
-    List<ushort> length
+    ushort[GifMaxCode] prefix
+    byte[GifMaxCode] suffix
+    ushort[GifMaxCode] length
     nint decodepos
     // Where the image's pixels start and end in its data, C's `image` and `maximage`.
     nint maximage
@@ -91,11 +93,13 @@ struct Context {
 
 Context newContext(nint stream, nint gfi, int handler) {
     return Context {
-        stream = stream, gfi = gfi, prefix = List<ushort>.repeat(0, (nint)GifMaxCode),
-        suffix = List<byte>.repeat(0, (nint)GifMaxCode), length = List<ushort>.repeat(0, (nint)GifMaxCode),
+        stream = stream, gfi = gfi, prefix = ushort[GifMaxCode], suffix = byte[GifMaxCode],
+        length = ushort[GifMaxCode],
         decodepos = 0, maximage = 0, handler = handler, errors = int[2] { 0, 0 },
     }
 }
+
+const nint CodeMask = (nint)GifMaxCode - 1
 
 const int HandlerDefault = 0
 const int HandlerGifsicle = 1
@@ -118,16 +122,31 @@ void gifReadError(ref Gt g, ref Context gfc, int isError, read string? text) {
     }
 }
 
-// The pixels of one code, written back from its end; the first of them.
+// The pixels of one code, written back from its end; the first of them. A code inside the image,
+// as all but the last of a sound one are, is written into a window of it, so that the C compiler
+// knows each place is inside and checks none; of one that runs past the end, as C does, the pixels
+// past it are walked and not written.
 byte oneCode(ref Context gfc, ref List<byte> image, nint code0) {
     nint code = code0
     byte lastsuffix = 0
-    nint codelength = (nint)gfc.length[code]
+    nint start = gfc.decodepos
+    nint codelength = (nint)gfc.length[code & CodeMask]
     gfc.decodepos += codelength
+    if gfc.decodepos <= gfc.maximage {
+        var all = ref image[start..gfc.decodepos]
+        nint j = all.length()
+        while j > 0 {
+            j -= 1
+            lastsuffix = gfc.suffix[code & CodeMask]
+            code = (nint)gfc.prefix[code & CodeMask]
+            all[j] = lastsuffix
+        }
+        return lastsuffix
+    }
     nint ptr = gfc.decodepos
     while codelength > 0 {
-        lastsuffix = gfc.suffix[code]
-        code = (nint)gfc.prefix[code]
+        lastsuffix = gfc.suffix[code & CodeMask]
+        code = (nint)gfc.prefix[code & CodeMask]
         ptr -= 1
         if ptr < gfc.maximage {
             image[ptr] = lastsuffix
@@ -175,9 +194,9 @@ void readImageData(ref Gt g, ref Context gfc, ref Reader grr, ref List<byte> ima
     }
     nint clearCode = 1 << minCodeSize
     for code in 0..clearCode {
-        gfc.prefix[code] = 49428
-        gfc.suffix[code] = (byte)(code & 0xFF)
-        gfc.length[code] = 1
+        gfc.prefix[code & CodeMask] = 49428
+        gfc.suffix[code & CodeMask] = (byte)(code & 0xFF)
+        gfc.length[code & CodeMask] = 1
     }
     nint nextCode = clearCode + 1
     nint bitsNeeded = (nint)minCodeSize + 1
@@ -224,11 +243,11 @@ void readImageData(ref Gt g, ref Context gfc, ref Reader grr, ref List<byte> ima
         }
 
         // First, the prefix and length of the next code (in case code == nextCode).
-        gfc.prefix[nextCode] = (ushort)oldCode
-        gfc.length[nextCode] = gfc.length[oldCode].wrappingAdd(1)
-        gfc.suffix[nextCode] = oneCode(ref gfc, ref image, code)
+        gfc.prefix[nextCode & CodeMask] = (ushort)oldCode
+        gfc.length[nextCode & CodeMask] = gfc.length[oldCode & CodeMask].wrappingAdd(1)
+        gfc.suffix[nextCode & CodeMask] = oneCode(ref gfc, ref image, code)
         if code == nextCode && gfc.decodepos <= gfc.maximage {
-            image[gfc.decodepos - 1] = gfc.suffix[nextCode]
+            image[gfc.decodepos - 1] = gfc.suffix[nextCode & CodeMask]
         }
         if nextCode != clearCode {
             nextCode += 1
