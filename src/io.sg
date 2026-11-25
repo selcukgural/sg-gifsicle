@@ -54,11 +54,11 @@ List<byte> readStdinRest(ref Gt g) {
 }
 
 bool stdinIsTerminal() {
-    return false
+    return Stdin.isTerminal()
 }
 
 bool stdoutIsTerminal() {
-    return false
+    return Stdout.isTerminal()
 }
 
 // strerror's text for an error of the system.
