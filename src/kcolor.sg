@@ -162,6 +162,30 @@ void kcSetGamma(ref Gt g, int type, double gamma) {
     g.kc.curGamma = gamma
 }
 
+// The Oklab transformation of `a0/a1/a2` [RGB]. clang fuses each sum of products as gifsicle is
+// built on macOS: the first product is fused with the rounded second, then the third is fused in.
+Kcolor kcOklabTransform(int a0, int a1, int a2) {
+    float cr = LinearSrgbTable[(nint)a0]
+    float cg = LinearSrgbTable[(nint)a1]
+    float cb = LinearSrgbTable[(nint)a2]
+
+    float l = cb.fusedMultiplyAdd(0.0514459929, cr.fusedMultiplyAdd(0.4122214708, 0.5363325363 * cg))
+    float m = cb.fusedMultiplyAdd(0.1073969566, cr.fusedMultiplyAdd(0.2119034982, 0.6806995451 * cg))
+    float s = cb.fusedMultiplyAdd(0.6299787005, cr.fusedMultiplyAdd(0.0883024619, 0.2817188376 * cg))
+
+    float l1 = l.cbrt()
+    float m1 = m.cbrt()
+    float s1 = s.cbrt()
+
+    float okl = s1.fusedMultiplyAdd(-0.0040720468, l1.fusedMultiplyAdd(0.2104542553, 0.7936177850 * m1))
+    float oka = s1.fusedMultiplyAdd(0.4505937099, l1.fusedMultiplyAdd(1.9779984951, -2.4285922050 * m1))
+    float okb = s1.fusedMultiplyAdd(-0.8086757660, l1.fusedMultiplyAdd(0.0259040371, 0.7827717662 * m1))
+
+    // On sRGB colors, `okl` ranges from 0 to 1, `oka` from -0.23388740 to +0.27621666, `okb` from
+    // -0.31152815 to +0.19856972.
+    return kcolor((int)(okl * 32767.0), (int)(((double)oka + 0.5) * 32767.0), (int)(((double)okb + 0.5) * 32767.0))
+}
+
 // ---- kacolor: a kcolor with a fourth component, alpha ----
 
 struct Kacolor : Copyable {
@@ -453,6 +477,7 @@ struct Kd3Treepos : Copyable {
 // The transformations of an 8-bit color into a kcolor (C's function pointer).
 const int Kd3Gamma = 0
 const int Kd3Luminance = 1
+const int Kd3Oklab = 2
 
 struct Kd3Tree {
     bool live
@@ -488,8 +513,14 @@ void kd3Cleanup(ref Kd3Tree kd3) {
 Kcolor kd3Make8g(read Kc kc, read Kd3Tree kd3, int a0, int a1, int a2) {
     if kd3.transform == Kd3Luminance {
         return kcLuminanceTransform(kc, a0, a1, a2)
+    } else if kd3.transform == Kd3Oklab {
+        return kcOklabTransform(a0, a1, a2)
     }
     return kcMake8g(kc, a0, a1, a2)
+}
+
+Kcolor kd3Makegfcg(read Kc kc, read Kd3Tree kd3, Color c) {
+    return kd3Make8g(kc, kd3, (int)c.red, (int)c.green, (int)c.blue)
 }
 
 void kd3AddTransformed(ref Kd3Tree kd3, Kcolor k) {
@@ -657,6 +688,12 @@ void kd3InitBuild(read Kc kc, ref Kd3Tree kd3, int transform, read Colormap gfcm
         kd3Add8g(kc, ref kd3, (int)gfcm.col[i].red, (int)gfcm.col[i].green, (int)gfcm.col[i].blue)
     }
     kd3Build(ref kd3)
+}
+
+// the index of the color in `kd3` closest to the 8-bit color `a0/a1/a2`
+int kd3Closest8g(read Kc kc, ref Kd3Tree kd3, int a0, int a1, int a2) {
+    uint dist = 0
+    return kd3ClosestTransformed(ref kd3, kd3Make8g(kc, kd3, a0, a1, a2), ref dist)
 }
 
 // the index of the color in `kd3` closest to `k`, and its distance in `distStore`

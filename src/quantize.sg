@@ -1,4 +1,4 @@
-// quantize.sg - Color quantization for gifsicle (quantize.c).
+// quantize.sg - Histograms and quantization for gifsicle (quantize.c).
 // Copyright (C) 1997-2025 Eddie Kohler, ekohler@gmail.com
 // SG translation of gifsicle 1.99. This file is part of sg-gifsicle.
 //
@@ -6,7 +6,217 @@
 // copy, distribute, or alter it at will, as long as this notice is kept intact and this source
 // code is made available. There is no warranty, express or implied.
 //
-// So far the part resizing needs: choosing diverse colors from a histogram (kcdiversity).
+// Where gifsicle's arithmetic of floating point sums products, clang fuses it as it builds gifsicle
+// on macOS: in `a*b + c*d + e*f`, the first product is fused with the rounded second, then the
+// third is fused in. The port writes each such fusion out with `fusedMultiplyAdd`.
+
+// ---- C's random(): gifsicle never seeds it ----
+
+// The generator of random() in the C libraries of macOS (FreeBSD's) and Linux (GNU's), which agree:
+// an additive feedback generator of 31 words, as srandom(1) leaves it.
+struct CRandom {
+    List<uint> state
+    nint f
+    nint r
+}
+
+uint cRandomGoodRand(uint ctx) {
+    int x = ctx.wrappingToInt()
+    // can't be initialized with 0, so use another value
+    if x == 0 {
+        x = 123459876
+    }
+    int hi = x / 127773
+    int lo = x % 127773
+    x = 16807 * lo - 2836 * hi
+    if x < 0 {
+        x += 0x7FFFFFFF
+    }
+    return x.wrappingToUint()
+}
+
+CRandom newCRandom() {
+    var rs = CRandom { state = List<uint>.repeat(0, 31), f = 3, r = 0 }
+    rs.state[0] = 1
+    for i in 1..31 {
+        rs.state[i] = cRandomGoodRand(rs.state[i - 1])
+    }
+    for _ in 0..310 {
+        _ = cRandom(ref rs)
+    }
+    return rs
+}
+
+// the next number, from 0 to 2^31 - 1
+long cRandom(ref CRandom rs) {
+    rs.state[rs.f] = rs.state[rs.f].wrappingAdd(rs.state[rs.r])
+    long v = (long)((rs.state[rs.f] >> 1) & 0x7FFFFFFF)
+    rs.f += 1
+    if rs.f >= 31 {
+        rs.f = 0
+        rs.r += 1
+    } else {
+        rs.r += 1
+        if rs.r >= 31 {
+            rs.r = 0
+        }
+    }
+    return v
+}
+
+// ---- COLORMAP FUNCTIONS return a palette (a vector of Gif_Colors). The pixel fields are
+// undefined; the haspixel fields are all 0. ----
+
+struct AdaptiveSlot : Copyable {
+    int first
+    int size
+    uint pixel
+}
+
+// sorts `kch.h[first..first + size]` by the component `k` of its colors, as C's qsort does
+void kchistSortSlice(ref Kchist kch, int first, int size, int k) {
+    nint n = (nint)size
+    nint at = (nint)first
+    var perm = List<int>.repeat(0, n)
+    var key = List<long>.repeat(0, n)
+    for i in 0..n {
+        perm[i] = (int)i
+        key[i] = (long)kch.h[at + i].ka.a[k]
+    }
+    sortPerm(ref perm, 0, n, read key)
+    var sorted = List<KchistItem>.withCapacity(n)
+    for i in 0..n {
+        sorted.add(kch.h[at + (nint)perm[i]])
+    }
+    for i in 0..n {
+        kch.h[at + i] = sorted[i]
+    }
+}
+
+nint colormapMedianCut(ref Gt g, ref Kchist kch, ref OutputData od) {
+    int adaptSize = od.colormapSize
+    var slots = List<AdaptiveSlot>.repeat(AdaptiveSlot { first = 0, size = 0, pixel = 0 }, (nint)adaptSize)
+    var gfcm = gifNewFullColormap(ref g, adaptSize, 256)
+    int nadapt = 0
+
+    // This code was written with reference to ppmquant by Jef Poskanzer, part of the pbmplus
+    // package.
+
+    if adaptSize >= kch.n && od.colormapFixed == None {
+        var word = "colors"
+        if kch.n == 1 {
+            word = "color"
+        }
+        warning(ref g, 1, "trivial adaptive palette (only %d %s in source)", read List<string> { $"{kch.n}".toString(), word })
+    }
+    if adaptSize >= kch.n {
+        adaptSize = kch.n
+    }
+
+    // 0. remove any transparent color from consideration; reduce adaptive palette size to
+    // accommodate transparency if it looks like that'll be necessary
+    if adaptSize > 2 && adaptSize < kch.n && kch.n <= 265 && od.colormapNeedsTransparency {
+        adaptSize -= 1
+    }
+
+    // 1. set up the first slot, containing all pixels.
+    slots[0].first = 0
+    slots[0].size = kch.n
+    slots[0].pixel = 0
+    for i in 0..(nint)kch.n {
+        slots[0].pixel = slots[0].pixel.wrappingAdd(kch.h[i].count)
+    }
+
+    // 2. split slots until we have enough.
+    nadapt = 1
+    while nadapt < adaptSize {
+        // 2.1. pick the slot to split.
+        int split = -1
+        uint splitPixel = 0
+        for i in 0..(nint)nadapt {
+            if slots[i].size >= 2 && slots[i].pixel > splitPixel {
+                split = (int)i
+                splitPixel = slots[i].pixel
+            }
+        }
+        if split < 0 {
+            break
+        }
+        nint sp = (nint)split
+        nint slice = (nint)slots[sp].first
+        int size = slots[sp].size
+
+        // 2.2. find its extent.
+        var minc = kacK(kch.h[slice].ka)
+        var maxc = minc
+        for i in 1..(nint)size {
+            for k in 0..3 {
+                int v = (int)kch.h[slice + i].ka.a[k]
+                minc.a[k] = (short)kcMin((int)minc.a[k], v)
+                maxc.a[k] = (short)kcMax((int)maxc.a[k], v)
+            }
+        }
+
+        // 2.3. decide how to split it. use the luminance method. also sort the colors.
+        double redDiff = 0.299 * (double)((int)maxc.a[0] - (int)minc.a[0])
+        double greenDiff = 0.587 * (double)((int)maxc.a[1] - (int)minc.a[1])
+        double blueDiff = 0.114 * (double)((int)maxc.a[2] - (int)minc.a[2])
+        if redDiff >= greenDiff && redDiff >= blueDiff {
+            kchistSortSlice(ref kch, slots[sp].first, size, 0)
+        } else if greenDiff >= blueDiff {
+            kchistSortSlice(ref kch, slots[sp].first, size, 1)
+        } else {
+            kchistSortSlice(ref kch, slots[sp].first, size, 2)
+        }
+
+        // 2.4. decide where to split the slot and split it there.
+        uint halfPixels = slots[sp].pixel / 2
+        uint pixelAccum = kch.h[slice].count
+        int i = 1
+        while i < size - 1 && pixelAccum < halfPixels {
+            pixelAccum = pixelAccum.wrappingAdd(kch.h[slice + (nint)i].count)
+            i += 1
+        }
+
+        // We know the area before the split has more pixels than the area after, possibly by a
+        // large margin (bad news). If it would shrink the margin, change the split.
+        uint diff1 = pixelAccum.wrappingMultiply(2).wrappingSubtract(slots[sp].pixel)
+        uint diff2 = slots[sp].pixel.wrappingSubtract(pixelAccum.wrappingSubtract(kch.h[slice + (nint)i - 1].count).wrappingMultiply(2))
+        if diff2 < diff1 && i > 1 {
+            i -= 1
+            pixelAccum = pixelAccum.wrappingSubtract(kch.h[slice + (nint)i].count)
+        }
+
+        nint na = (nint)nadapt
+        slots[na].first = slots[sp].first + i
+        slots[na].size = size - i
+        slots[na].pixel = slots[sp].pixel.wrappingSubtract(pixelAccum)
+        slots[sp].size = i
+        slots[sp].pixel = pixelAccum
+        nadapt += 1
+    }
+
+    // 3. make the new palette by choosing one color from each slot.
+    for i in 0..(nint)nadapt {
+        var px = double[3](0.0)
+        nint slice = (nint)slots[i].first
+        uint pixel = slots[i].pixel
+        if pixel == 0 {
+            pixel = 1
+        }
+        for j in 0..(nint)slots[i].size {
+            double count = (double)kch.h[slice + j].count
+            for k in 0..3 {
+                px[k] = ((double)kch.h[slice + j].ka.a[k]).fusedMultiplyAdd(count, px[k])
+            }
+        }
+        var kc = kcolor((int)(px[0] / (double)pixel), (int)(px[1] / (double)pixel), (int)(px[2] / (double)pixel))
+        g.colormaps[gfcm].col[i] = kcTogfcg(read g.kc, kc)
+    }
+
+    g.colormaps[gfcm].ncol = nadapt
+    return gfcm
+}
 
 struct Kcdiversity {
     List<int> closest
@@ -63,10 +273,10 @@ int kcdiversityFindDiverse(read Kcdiversity div, read Kchist kch, double ditherw
             }
         }
     } else {
-        double maxDist = (double)div.minDist[(nint)chosen] + ditherweight * (double)div.minDitherDist[(nint)chosen]
+        double maxDist = ditherweight.fusedMultiplyAdd((double)div.minDitherDist[(nint)chosen], (double)div.minDist[(nint)chosen])
         for i in chosen + 1..n {
             if div.minDist[(nint)i] != 0 {
-                double dist = (double)div.minDist[(nint)i] + ditherweight * (double)div.minDitherDist[(nint)i]
+                double dist = ditherweight.fusedMultiplyAdd((double)div.minDitherDist[(nint)i], (double)div.minDist[(nint)i])
                 if dist > maxDist {
                     chosen = i
                     maxDist = dist
@@ -129,4 +339,1347 @@ int kcdiversityChoose(ref Kcdiversity div, read Kchist kch, int chosen, bool dod
     div.chosen[(nint)div.nchosen] = chosen
     div.nchosen += 1
     return chosen
+}
+
+// Each chosen color moves to the mean of the colors closest to it, its own counted thrice. C sums in
+// a vector of floats, each lane `(float)((double)x + component * count)`, fused.
+void colormapDiversityDoBlend(ref Kcdiversity div, ref Kchist kch) {
+    nint n = (nint)kch.n
+    nint nchosen = (nint)div.nchosen
+    var chosenmap = List<int>.repeat(0, n)
+    var di = List<ScaleColor>.repeat(scZero(), nchosen)
+    for i in 0..nchosen {
+        chosenmap[(nint)div.chosen[i]] = (int)i
+    }
+    for i in 0..n {
+        double count = (double)kch.h[i].count
+        if div.closest[i] == (int)i {
+            count *= 3.0
+        }
+        nint j = (nint)chosenmap[(nint)div.closest[i]]
+        for k in 0..3 {
+            di[j].a[k] = (float)((double)kch.h[i].ka.a[k]).fusedMultiplyAdd(count, (double)di[j].a[k])
+        }
+        di[j].a[3] = (float)(count + (double)di[j].a[3])
+    }
+    for i in 0..nchosen {
+        nint chosen = (nint)div.chosen[i]
+        if di[i].a[3] >= (float)kch.h[chosen].count.wrappingMultiply(5) {
+            for k in 0..3 {
+                kch.h[chosen].ka.a[k] = ((int)(di[i].a[k] / di[i].a[3])).wrappingToShort()
+            }
+        }
+    }
+}
+
+nint colormapDiversity(ref Gt g, ref Kchist kch, read OutputData od, bool blend0) {
+    int adaptSize = od.colormapSize
+    var gfcm = gifNewFullColormap(ref g, adaptSize, 256)
+    bool blend = blend0
+
+    // This code uses XV's modified diversity algorithm, and was written with reference to XV's
+    // implementation of that algorithm by John Bradley and Tom Lane.
+
+    if adaptSize > kch.n && od.colormapFixed == None {
+        warning(ref g, 1, "trivial adaptive palette (only %d colors in source)", read List<string> { $"{kch.n}".toString() })
+    }
+    if adaptSize > kch.n {
+        adaptSize = kch.n
+    }
+
+    // 0. remove any transparent color from consideration; reduce adaptive palette size to
+    // accommodate transparency if it looks like that'll be necessary. It will be necessary to
+    // accommodate transparency if (1) there is transparency in the image; (2) the adaptive
+    // palette isn't trivial; and (3) there are a small number of colors in the image (arbitrary
+    // constant: <= 265), so it's likely that most images will use most of the slots, so it's
+    // likely there won't be unused slots.
+    if adaptSize > 2 && adaptSize < kch.n && kch.n <= 265 && od.colormapNeedsTransparency {
+        adaptSize -= 1
+    }
+
+    // blending has bad effects when there are very few colors
+    if adaptSize < 4 {
+        blend = false
+    }
+
+    // 1. initialize min_dist and sort the colors in order of popularity.
+    var div = kcdiversityInit(ref kch, od.ditherType != DitherNone)
+
+    // 2. choose colors one at a time
+    for nadapt in 0..adaptSize {
+        int chosen = 0
+        // 2.1. choose the color to be added
+        if nadapt == 0 || (nadapt >= 10 && nadapt % 2 == 0) {
+            // 2.1a. want most popular unchosen color
+            chosen = kcdiversityFindPopular(read div, read kch)
+        } else if od.ditherType == DitherNone {
+            // 2.1b. choose based on diversity from unchosen colors
+            chosen = kcdiversityFindDiverse(read div, read kch, 0.0)
+        } else {
+            // 2.1c. choose based on diversity from unchosen colors, but allow dithered
+            // combinations to stand in for colors, particularly early on in the color finding
+            // process. Weight assigned to dithered combinations drops as we proceed. C's
+            // `pow(0.25, y)` is `exp2(y * -2)` as clang builds it.
+            double y = 1.0 + (double)(nadapt - 1) / 3.0
+            double ditherweight = 0.05 + (y * -2.0).exp2()
+            chosen = kcdiversityFindDiverse(read div, read kch, ditherweight)
+        }
+        _ = kcdiversityChoose(ref div, read kch, chosen, od.ditherType != DitherNone && nadapt > 0 && nadapt < 64)
+    }
+
+    // 3. make the new palette by choosing one color from each slot.
+    if blend {
+        colormapDiversityDoBlend(ref div, ref kch)
+    }
+
+    for nadapt in 0..(nint)div.nchosen {
+        g.colormaps[gfcm].col[nadapt] = kcTogfcg(read g.kc, kacK(kch.h[(nint)div.chosen[nadapt]].ka))
+    }
+    g.colormaps[gfcm].ncol = div.nchosen
+    return gfcm
+}
+
+nint colormapBlendDiversity(ref Gt g, ref Kchist kch, ref OutputData od) {
+    return colormapDiversity(ref g, ref kch, read od, true)
+}
+
+nint colormapFlatDiversity(ref Gt g, ref Kchist kch, ref OutputData od) {
+    return colormapDiversity(ref g, ref kch, read od, false)
+}
+
+// ---- mapping an image to a new colormap ----
+
+void colormapImagePosterize(ref Gt g, read Image gfi, ref List<byte> newData, ref Colormap oldCm, ref Kd3Tree kd3,
+        ref List<uint> histogram) {
+    nint ncol = (nint)oldCm.ncol
+    var map = int[256](0)
+    int transparent = gfi.transparent
+
+    // find closest colors in new colormap
+    for i in 0..ncol {
+        var c = oldCm.col[i]
+        int p = kd3Closest8g(read g.kc, ref kd3, (int)c.red, (int)c.green, (int)c.blue)
+        map[i] = p
+        oldCm.col[i].pixel = p.wrappingToUint()
+        oldCm.col[i].haspixel = 1
+    }
+    for i in ncol..256 {
+        map[i] = 0
+        oldCm.col[i].pixel = 0
+        oldCm.col[i].haspixel = 1
+    }
+
+    // map image
+    nint width = (nint)gfi.width
+    nint nd = 0
+    for j in 0..(nint)gfi.height {
+        nint row = gfi.rows[j]
+        for i in 0..width {
+            byte d = gfi.data[row + i]
+            if (int)d != transparent {
+                byte p = map[(nint)d].wrappingToByte()
+                newData[nd] = p
+                histogram[(nint)p] += 1
+            }
+            nd += 1
+        }
+    }
+}
+
+const int DitherScale = 1024
+const int DitherShift = 10
+const int DitherScaleM1 = DitherScale - 1
+const int DitherItem2err = 1 << (DitherShift - 7)
+const nint NRandomValues = 512
+
+// The same random values on each call, in an attempt to minimize "jumping dithering" effects on
+// animations; each dither makes its own the first time, from C's random().
+List<int> makeRandomValues(ref CRandom rs) {
+    var values = List<int>.repeat(0, NRandomValues)
+    for i in 0..NRandomValues {
+        values[i] = (int)(cRandom(ref rs) % (long)(DitherScaleM1 * 2)) - DitherScaleM1
+    }
+    return values
+}
+
+// the colors of `oldCm` as `kd3` sees them, and each one's closest color in `kd3` as its pixel
+List<Kcolor> ditherOldKcs(ref Gt g, ref Colormap oldCm, ref Kd3Tree kd3) {
+    var oldKc = List<Kcolor>.repeat(kcolor(0, 0, 0), oldCm.col.length())
+    for i in 0..(nint)oldCm.ncol {
+        oldKc[i] = kd3Makegfcg(read g.kc, read kd3, oldCm.col[i])
+        uint dist = 0
+        oldCm.col[i].pixel = kd3ClosestTransformed(ref kd3, oldKc[i], ref dist).wrappingToUint()
+        oldCm.col[i].haspixel = 1
+    }
+    for i in (nint)oldCm.ncol..256 {
+        oldKc[i] = kd3Make8g(read g.kc, read kd3, 0, 0, 0)
+        oldCm.col[i].pixel = 0
+        oldCm.col[i].haspixel = 1
+    }
+    return oldKc
+}
+
+// the color of `kd3` for `use`: the one `oldPixel` stands for if `use` is within its radius
+byte ditherPick(ref Kd3Tree kd3, uint oldPixel, Kcolor use1) {
+    nint e = (nint)oldPixel
+    if kcDistance(kd3.ks[e], use1) < kd3.xradius[e] {
+        return (byte)e
+    }
+    uint dist = 0
+    return kd3ClosestTransformed(ref kd3, use1, ref dist).wrappingToByte()
+}
+
+void colormapImageFloydSteinberg(ref Gt g, read Image gfi, ref List<byte> allNewData, ref Colormap oldCm, ref Kd3Tree kd3,
+        ref List<uint> histogram) {
+    nint width = (nint)gfi.width
+    bool ditherDirection = false
+    int transparent = gfi.transparent
+
+    // Initialize distances; beware uninitialized colors
+    var oldKc = ditherOldKcs(ref g, ref oldCm, ref kd3)
+
+    // This code was written with reference to ppmquant by Jef Poskanzer, part of the pbmplus
+    // package.
+
+    // Initialize Floyd-Steinberg error vectors to small random values, so we don't get artifacts
+    // on the top row
+    var err = List<Wkcolor>.repeat(wkcZero(), width + 2)
+    var err1 = List<Wkcolor>.repeat(wkcZero(), width + 2)
+    if g.fsRandomValues.length() == 0 {
+        g.fsRandomValues = makeRandomValues(ref g.random)
+    }
+    for i in 0..width + 2 {
+        nint j = (i + (nint)gfi.left) * 3
+        for k in 0..3 {
+            err[i].a[k] = g.fsRandomValues[(j + k) % NRandomValues]
+        }
+    }
+    // err1 initialized below
+
+    kd3BuildXradius(ref kd3)
+
+    // Do the image!
+    for j in 0..(nint)gfi.height {
+        // used for error diffusion
+        nint d0 = 2
+        nint d1 = 0
+        nint d2 = 1
+        nint d3 = 2
+        nint x = 0
+        if ditherDirection {
+            x = width - 1
+            d0 = 0
+            d1 = 2
+            d2 = 1
+            d3 = 0
+        }
+        nint row = gfi.rows[j]
+        nint newRow = j * width
+
+        for i in 0..width + 2 {
+            err1[i] = wkcZero()
+        }
+
+        // Do a single row
+        while x >= 0 && x < width {
+            byte d = gfi.data[row + x]
+            // the transparent color never gets adjusted
+            if (int)d != transparent {
+                // find desired new color
+                var use1 = oldKc[(nint)d]
+
+                // use Floyd-Steinberg errors to adjust
+                for k in 0..3 {
+                    int v = (int)use1.a[k] + (err[x + 1].a[k] & ~(DitherItem2err - 1)) / DitherItem2err
+                    use1.a[k] = (short)kcClampv(v)
+                }
+
+                byte p = ditherPick(ref kd3, oldCm.col[(nint)d].pixel, use1)
+                allNewData[newRow + x] = p
+                histogram[(nint)p] += 1
+
+                // calculate and propagate the error between desired and selected color. Assume
+                // that, with a large scale (1024), we don't need to worry about image artifacts
+                // caused by error accumulation (the fact that the error terms might not sum to
+                // the error).
+                for k in 0..3 {
+                    int e = ((int)use1.a[k] - (int)kd3.ks[(nint)p].a[k]) * DitherItem2err
+                    if e != 0 {
+                        err[x + d0].a[k] += ((e * 7) & ~15) / 16
+                        err1[x + d1].a[k] += ((e * 3) & ~15) / 16
+                        err1[x + d2].a[k] += ((e * 5) & ~15) / 16
+                        err1[x + d3].a[k] += (e & ~15) / 16
+                    }
+                }
+            }
+            if ditherDirection {
+                x -= 1
+            } else {
+                x += 1
+            }
+        }
+        // Did a single row
+
+        // change dithering directions
+        var temp = err1.replace(List<Wkcolor>())
+        err1 = err.replace(List<Wkcolor>())
+        err = temp
+        ditherDirection = !ditherDirection
+    }
+}
+
+// A variant of the Floyd-Steinberg dither, as the Atkinson dither is a variant of it.
+void colormapImageAtkinson(ref Gt g, read Image gfi, ref List<byte> allNewData, ref Colormap oldCm, ref Kd3Tree kd3,
+        ref List<uint> histogram) {
+    nint width = (nint)gfi.width
+    int transparent = gfi.transparent
+
+    // Initialize distances; beware uninitialized colors
+    var oldKc = ditherOldKcs(ref g, ref oldCm, ref kd3)
+
+    // Initialize Atkinson error vectors. As in Floyd-Steinberg, the error for pixel x is stored at
+    // index x+1; the extra slots catch errors propagated past the image edges.
+    var err0 = List<Wkcolor>.repeat(wkcZero(), width + 3)
+    var err1 = List<Wkcolor>.repeat(wkcZero(), width + 3)
+    var err2 = List<Wkcolor>.repeat(wkcZero(), width + 3)
+
+    if g.atkinsonRandomValues.length() == 0 {
+        g.atkinsonRandomValues = makeRandomValues(ref g.random)
+    }
+    for i in 0..width + 3 {
+        nint j = (i + (nint)gfi.left) * 3
+        for k in 0..3 {
+            err0[i].a[k] = g.atkinsonRandomValues[(j + k) % NRandomValues]
+        }
+    }
+
+    kd3BuildXradius(ref kd3)
+
+    // Do the image!
+    for j in 0..(nint)gfi.height {
+        nint row = gfi.rows[j]
+        nint newRow = j * width
+
+        // Initialize the error row two rows down; err1 already holds errors propagated from the
+        // previous rows
+        for i in 0..width + 3 {
+            err2[i] = wkcZero()
+        }
+
+        for x in 0..width {
+            byte d = gfi.data[row + x]
+            // Transparent color never gets adjusted, skip
+            if (int)d == transparent {
+                continue
+            }
+
+            // Calculate desired new color including current error
+            var use1 = oldKc[(nint)d]
+            for k in 0..3 {
+                use1.a[k] = (short)kcClampv((int)use1.a[k] + err0[x + 1].a[k] / DitherScale)
+            }
+
+            // Find the closest color in the colormap
+            byte p = ditherPick(ref kd3, oldCm.col[(nint)d].pixel, use1)
+            allNewData[newRow + x] = p
+            histogram[(nint)p] += 1
+
+            // Calculate and propagate the error using the Atkinson dithering algorithm
+            for k in 0..3 {
+                int e = ((int)use1.a[k] - (int)kd3.ks[(nint)p].a[k]) * DitherScale
+                err0[x + 2].a[k] += e / 8
+                err0[x + 3].a[k] += e / 8
+                err1[x].a[k] += e / 8
+                err1[x + 1].a[k] += e / 8
+                err1[x + 2].a[k] += e / 8
+                err2[x + 1].a[k] += e / 8
+            }
+        }
+
+        // Rotate error buffers
+        var temp = err0.replace(List<Wkcolor>())
+        err0 = err1.replace(List<Wkcolor>())
+        err1 = err2.replace(List<Wkcolor>())
+        err2 = temp
+    }
+}
+
+// ---- ordered dithering ----
+
+struct OdselectPlanitem : Copyable {
+    byte plan
+    int frac
+}
+
+void planFromCplan(ref List<byte> plan, nint at, int nplan, read List<OdselectPlanitem> cp, int ncp, int whole) {
+    int cfracSubt = 0
+    int planpos = 0
+    for i in 0..(nint)ncp {
+        cfracSubt += cp[i].frac
+        int endPlanpos = cfracSubt * nplan / whole
+        while planpos != endPlanpos {
+            plan[at + (nint)planpos] = cp[i].plan
+            planpos += 1
+        }
+    }
+}
+
+// The point of the segment from `p0` to `p1` closest to `want`, if it is inside: `t` places it on
+// the segment and `dist` is its distance.
+bool kcLineClosest(Kcolor p0, Kcolor p1, Kcolor want, ref double t, ref uint dist) {
+    var p01 = wkcZero()
+    var p0ref = wkcZero()
+    for d in 0..3 {
+        p01.a[d] = (int)p1.a[d] - (int)p0.a[d]
+        p0ref.a[d] = (int)want.a[d] - (int)p0.a[d]
+    }
+    uint den = kcDistance(p0, p1)
+    if den == 0 {
+        return false
+    }
+    // NB: We've run out of bits of precision. We can calculate the denominator in unsigned
+    // arithmetic, but the numerator might be negative, or it might be so large that it is
+    // unsigned. Calculate the numerator as a double. (C multiplies the second and third terms as
+    // ints.)
+    double num = ((double)p01.a[0]).fusedMultiplyAdd((double)p0ref.a[0], (double)(p01.a[1] * p0ref.a[1]))
+    t = (num + (double)(p01.a[2] * p0ref.a[2])) / (double)den
+    if t < 0.0 || t > 1.0 {
+        return false
+    }
+    var online = kcolor(0, 0, 0)
+    for d in 0..3 {
+        int v = (int)((double)p01.a[d] * t) + (int)p0.a[d]
+        online.a[d] = (short)kcClampv(v)
+    }
+    dist = kcDistance(online, want)
+    return true
+}
+
+// x*a + y*b + z*c, as clang fuses it
+double dot3(double x, double a, double y, double b, double z, double c) {
+    return z.fusedMultiplyAdd(c, x.fusedMultiplyAdd(a, y * b))
+}
+
+// x*a - y*b, as clang fuses it
+double crossTerm(double x, double a, double y, double b) {
+    return x.fusedMultiplyAdd(a, -(y * b))
+}
+
+// The point of the triangle `p0`, `p1`, `p2` closest to `want`, if it is inside and closer than any
+// point along its edges: `t0` and `t1` give its barycentric coordinates and `dist` its distance.
+bool kcPlaneClosest(Kcolor p0, Kcolor p1, Kcolor p2, Kcolor want, ref double t0, ref double t1, ref uint dist) {
+    var p0ref = wkcZero()
+    var p01 = wkcZero()
+    var p02 = wkcZero()
+
+    // Calculate the non-unit normal of the plane determined by the input colors (p0-p2)
+    for d in 0..3 {
+        p0ref.a[d] = (int)want.a[d] - (int)p0.a[d]
+        p01.a[d] = (int)p1.a[d] - (int)p0.a[d]
+        p02.a[d] = (int)p2.a[d] - (int)p0.a[d]
+    }
+    double n0 = (double)(p01.a[1] * p02.a[2] - p01.a[2] * p02.a[1])
+    double n1 = (double)(p01.a[2] * p02.a[0] - p01.a[0] * p02.a[2])
+    double n2 = (double)(p01.a[0] * p02.a[1] - p01.a[1] * p02.a[0])
+
+    // Moeller-Trumbore ray tracing algorithm: trace a ray from `want` along normal `n`; convert to
+    // barycentric coordinates to see if the ray intersects with the triangle.
+    double pvec0 = crossTerm(n1, (double)p02.a[2], n2, (double)p02.a[1])
+    double pvec1 = crossTerm(n2, (double)p02.a[0], n0, (double)p02.a[2])
+    double pvec2 = crossTerm(n0, (double)p02.a[1], n1, (double)p02.a[0])
+
+    double det = dot3(pvec0, (double)p01.a[0], pvec1, (double)p01.a[1], pvec2, (double)p01.a[2])
+    if det.abs() <= 0.0001220703125 {
+        return false
+    }
+    det = 1.0 / det
+
+    double u = dot3((double)p0ref.a[0], pvec0, (double)p0ref.a[1], pvec1, (double)p0ref.a[2], pvec2) * det
+    if u < 0.0 || u > 1.0 {
+        return false
+    }
+
+    double q0 = (double)(p0ref.a[1] * p01.a[2] - p0ref.a[2] * p01.a[1])
+    double q1 = (double)(p0ref.a[2] * p01.a[0] - p0ref.a[0] * p01.a[2])
+    double q2 = (double)(p0ref.a[0] * p01.a[1] - p0ref.a[1] * p01.a[0])
+
+    double v = dot3(n0, q0, n1, q1, n2, q2) * det
+    if v < 0.0 || v > 1.0 || u + v > 1.0 {
+        return false
+    }
+
+    // Now we know at there is a point in the triangle that is closer to `want` than any point
+    // along its edges. Return the barycentric coordinates for that point and the distance to that
+    // point.
+    t0 = u
+    t1 = v
+    v = dot3((double)p02.a[0], q0, (double)p02.a[1], q1, (double)p02.a[2], q2) * det
+    double nn = dot3(n0, n0, n1, n1, n2, n2)
+    dist = (uint)(v * v).fusedMultiplyAdd(nn, 0.5)
+    return true
+}
+
+void limitOrderedDitherPlan(ref List<byte> plan, nint at, int nplan, int nc0, Kcolor want, read Kd3Tree kd3) {
+    int nc = nc0
+    if nc > 16 {
+        nc = 16
+    }
+    var cp = List<OdselectPlanitem>.repeat(OdselectPlanitem { plan = 0, frac = 0 }, 256)
+    var bestcp = List<OdselectPlanitem>.repeat(OdselectPlanitem { plan = 0, frac = 0 }, 16)
+    int nbestcp = 0
+
+    // sort colors
+    cp[0].plan = plan[at]
+    cp[0].frac = 1
+    nint ncp = 1
+    for i in 1..(nint)nplan {
+        if plan[at + i - 1] == plan[at + i] {
+            cp[ncp - 1].frac += 1
+        } else {
+            cp[ncp].plan = plan[at + i]
+            cp[ncp].frac = 1
+            ncp += 1
+        }
+    }
+
+    // calculate plan
+    uint mindist = 0xFFFFFFFF
+    uint dist = 0
+    double ta = 0.0
+    double tb = 0.0
+    for i in 0..ncp {
+        // check for closest single color
+        dist = kcDistance(kd3.ks[(nint)cp[i].plan], want)
+        if dist < mindist {
+            bestcp[0].plan = cp[i].plan
+            bestcp[0].frac = KcWhole
+            nbestcp = 1
+            mindist = dist
+        }
+
+        nint j = i + 1
+        while nc >= 2 && j < ncp {
+            // check for closest blend of two colors
+            if kcLineClosest(kd3.ks[(nint)cp[i].plan], kd3.ks[(nint)cp[j].plan], want, ref ta, ref dist) && dist < mindist {
+                bestcp[0].plan = cp[i].plan
+                bestcp[1].plan = cp[j].plan
+                bestcp[1].frac = (int)((double)KcWhole * ta)
+                bestcp[0].frac = KcWhole - bestcp[1].frac
+                nbestcp = 2
+                mindist = dist
+            }
+
+            nint k = j + 1
+            while nc >= 3 && k < ncp {
+                // check for closest blend of three colors
+                if kcPlaneClosest(kd3.ks[(nint)cp[i].plan], kd3.ks[(nint)cp[j].plan], kd3.ks[(nint)cp[k].plan], want,
+                        ref ta, ref tb, ref dist) && dist < mindist {
+                    bestcp[0].plan = cp[i].plan
+                    bestcp[1].plan = cp[j].plan
+                    bestcp[1].frac = (int)((double)KcWhole * ta)
+                    bestcp[2].plan = cp[k].plan
+                    bestcp[2].frac = (int)((double)KcWhole * tb)
+                    bestcp[0].frac = KcWhole - bestcp[1].frac - bestcp[2].frac
+                    nbestcp = 3
+                    mindist = dist
+                }
+                k += 1
+            }
+            j += 1
+        }
+    }
+
+    planFromCplan(ref plan, at, nplan, read bestcp, nbestcp, KcWhole)
+}
+
+// sorts the plan by luminance, then by index (a total order: equal items are equal bytes, so any
+// sort gives qsort's order)
+void sortOrderedDitherPlan(ref List<byte> plan, nint at, int nplan, read List<int> lum) {
+    for i in 1..(nint)nplan {
+        byte p = plan[at + i]
+        long key = ((long)lum[(nint)p] << 8) | (long)p
+        nint j = i
+        while j > 0 {
+            byte q = plan[at + j - 1]
+            long qkey = ((long)lum[(nint)q] << 8) | (long)q
+            if qkey <= key {
+                break
+            }
+            plan[at + j] = q
+            j -= 1
+        }
+        plan[at + j] = p
+    }
+}
+
+void setOrderedDitherPlan(ref Gt g, ref List<byte> plan, nint at, int nplan, int nc, ref Color gfc, ref Kd3Tree kd3,
+        read List<int> lum) {
+    var err = wkcZero()
+    var want = kd3Makegfcg(read g.kc, read kd3, gfc)
+    var cur = kcolor(0, 0, 0)
+
+    for i in 0..(nint)nplan {
+        for d in 0..3 {
+            int v = (int)want.a[d] + err.a[d]
+            cur.a[d] = (short)kcClampv(v)
+        }
+        uint dist = 0
+        plan[at + i] = kd3ClosestTransformed(ref kd3, cur, ref dist).wrappingToByte()
+        for d in 0..3 {
+            err.a[d] += (int)want.a[d] - (int)kd3.ks[(nint)plan[at + i]].a[d]
+        }
+    }
+
+    sortOrderedDitherPlan(ref plan, at, nplan, lum)
+
+    if nc < nplan && plan[at] != plan[at + (nint)nplan - 1] {
+        int ncp = 1
+        for i in 1..(nint)nplan {
+            if plan[at + i - 1] != plan[at + i] {
+                ncp += 1
+            }
+        }
+        if ncp > nc {
+            limitOrderedDitherPlan(ref plan, at, nplan, nc, want, read kd3)
+        }
+    }
+
+    gfc.haspixel = 1
+}
+
+void colormapImageOrdered(ref Gt g, read Image gfi, ref List<byte> allNewData, ref Colormap oldCm, ref Kd3Tree kd3,
+        ref List<uint> histogram, read List<byte> matrix) {
+    int mw = (int)matrix[0]
+    int mh = (int)matrix[1]
+    int nplan = (int)matrix[2]
+    // plans are indexed by pixel value, which can exceed old_cm->ncol
+    var plan = List<byte>.repeat(0, (nint)nplan * 256)
+    nint width = (nint)gfi.width
+    int transparent = gfi.transparent
+
+    // Written with reference to Joel Ylilouma's versions.
+
+    // Initialize colors
+    for i in 0..256 {
+        oldCm.col[i].haspixel = 0
+    }
+
+    // Initialize luminances, create luminance sorter
+    var lum = List<int>.repeat(0, (nint)kd3.nitems)
+    for i in 0..(nint)kd3.nitems {
+        lum[i] = kcLuminance(kd3.ks[i])
+    }
+
+    // Do the image!
+    bool pow2 = (mw & (mw - 1)) == 0 && (mh & (mh - 1)) == 0 && (nplan & (nplan - 1)) == 0
+    int mws = 0
+    int nplans = 0
+    if pow2 {
+        while (1 << mws) != mw {
+            mws += 1
+        }
+        while (1 << nplans) != nplan {
+            nplans += 1
+        }
+    }
+    for y in 0..(nint)gfi.height {
+        nint row = gfi.rows[y]
+        nint newRow = y * width
+        for x in 0..width {
+            byte d = gfi.data[row + x]
+            // the transparent color never gets adjusted
+            if (int)d == transparent {
+                continue
+            }
+            nint thisplan = 0
+            nint i = 0
+            if pow2 {
+                thisplan = (nint)d << (nint)nplans
+                if oldCm.col[(nint)d].haspixel == 0 {
+                    var gfc = oldCm.col[(nint)d]
+                    setOrderedDitherPlan(ref g, ref plan, thisplan, 1 << nplans, (int)matrix[3], ref gfc, ref kd3, read lum)
+                    oldCm.col[(nint)d] = gfc
+                }
+                i = (nint)matrix[4 + ((x + (nint)gfi.left) & (nint)(mw - 1)) + (((y + (nint)gfi.top) & (nint)(mh - 1)) << (nint)mws)]
+            } else {
+                thisplan = (nint)nplan * (nint)d
+                if oldCm.col[(nint)d].haspixel == 0 {
+                    var gfc = oldCm.col[(nint)d]
+                    setOrderedDitherPlan(ref g, ref plan, thisplan, nplan, (int)matrix[3], ref gfc, ref kd3, read lum)
+                    oldCm.col[(nint)d] = gfc
+                }
+                i = (nint)matrix[4 + (x + (nint)gfi.left) % (nint)mw + ((y + (nint)gfi.top) % (nint)mh) * (nint)mw]
+            }
+            byte p = plan[thisplan + i]
+            allNewData[newRow + x] = p
+            histogram[(nint)p] += 1
+        }
+    }
+}
+
+void dither(ref Gt g, read Image gfi, ref List<byte> newData, ref Colormap oldCm, ref Kd3Tree kd3, ref List<uint> histogram,
+        read OutputData od) {
+    if od.ditherType == DitherDefault || od.ditherType == DitherFloydSteinberg {
+        colormapImageFloydSteinberg(ref g, gfi, ref newData, ref oldCm, ref kd3, ref histogram)
+    } else if od.ditherType == DitherOrdered || od.ditherType == DitherOrderedNew {
+        colormapImageOrdered(ref g, gfi, ref newData, ref oldCm, ref kd3, ref histogram, read od.ditherData)
+    } else if od.ditherType == DitherAtkinson {
+        colormapImageAtkinson(ref g, gfi, ref newData, ref oldCm, ref kd3, ref histogram)
+    } else {
+        colormapImagePosterize(ref g, gfi, ref newData, ref oldCm, ref kd3, ref histogram)
+    }
+}
+
+// Gives the image's transparent pixels a color of `newCm`; true means run the dither again.
+bool tryAssignTransparency(ref Image gfi, read Colormap oldCm, ref List<byte> newData, ref Colormap newCm, ref int newNcol,
+        ref Kd3Tree kd3, read List<uint> histogram) {
+    int transparent = gfi.transparent
+    int newTransparent = -1
+
+    if transparent < 0 {
+        return false
+    }
+
+    var transpValue = color(0, 0, 0)
+    if transparent < oldCm.ncol {
+        transpValue = oldCm.col[(nint)transparent]
+    }
+
+    // look for an unused pixel in the existing colormap; prefer the same color we had
+    for i in 0..(nint)newNcol {
+        if histogram[i] == 0 && colorEq(transpValue, newCm.col[i]) {
+            newTransparent = (int)i
+            break
+        }
+    }
+    if newTransparent < 0 {
+        for i in 0..(nint)newNcol {
+            if histogram[i] == 0 {
+                newTransparent = (int)i
+                break
+            }
+        }
+    }
+
+    // try to expand the colormap
+    if newTransparent < 0 && newNcol < 256 {
+        newTransparent = newNcol
+        // copy only the color: new_cm's `pixel` fields count uses
+        newCm.col[(nint)newTransparent].red = transpValue.red
+        newCm.col[(nint)newTransparent].green = transpValue.green
+        newCm.col[(nint)newTransparent].blue = transpValue.blue
+        newNcol += 1
+    }
+
+    if newTransparent < 0 {
+        // not found: mark the least-frequently-used color as the new transparent color and
+        // return true (meaning 'dither again')
+        uint minUsed = 0xFFFFFFFF
+        for i in 0..256 {
+            if histogram[i] < minUsed {
+                newTransparent = (int)i
+                minUsed = histogram[i]
+            }
+        }
+        // mark it as unusable
+        kd3Disable(ref kd3, newTransparent)
+        return true
+    }
+
+    nint width = (nint)gfi.width
+    nint nd = 0
+    for j in 0..(nint)gfi.height {
+        nint row = gfi.rows[j]
+        for i in 0..width {
+            if (int)gfi.data[row + i] == transparent {
+                newData[nd] = (byte)newTransparent
+            }
+            nd += 1
+        }
+    }
+
+    gfi.transparent = newTransparent
+    return false
+}
+
+Colormap blankColormap() {
+    return Colormap { ncol = 0, capacity = 0, userFlags = 0, refcount = 0, col = List<Color>(), live = false }
+}
+
+void colormapStream(ref Gt g, nint gfs, nint newCmAt, ref OutputData od, bool allowShrink0) {
+    bool allowShrink = allowShrink0
+    var kd3 = kd3None()
+    int origNcol = g.colormaps[newCmAt].ncol
+    int newNcol = origNcol
+
+    // new_col[j].pixel == number of pixels with color j in the new image.
+    for j in 0..256 {
+        g.colormaps[newCmAt].col[j].pixel = 0
+    }
+
+    // initialize kd3 tree
+    bool newGray = true
+    for j in 0..(nint)g.colormaps[newCmAt].ncol {
+        var c = g.colormaps[newCmAt].col[j]
+        if c.red != c.green || c.red != c.blue {
+            newGray = false
+            break
+        }
+    }
+    int transform = Kd3Gamma
+    if newGray {
+        transform = Kd3Luminance
+    } else if od.colormapGammaType == KcGammaOklab {
+        transform = Kd3Oklab
+    }
+    kd3InitBuild(read g.kc, ref kd3, transform, read g.colormaps[newCmAt])
+
+    for imagei in 0..g.streams[gfs].images.length() {
+        nint gfi = g.streams[gfs].images[imagei]
+        nint gfcm = g.images[gfi].local
+        if gfcm == None {
+            gfcm = g.streams[gfs].global
+        }
+        bool onlyCompressed = !g.images[gfi].hasImg
+
+        if gfcm != None {
+            // If there was an old colormap, change the image data
+            var newData = List<byte>.repeat(0, (nint)g.images[gfi].width * (nint)g.images[gfi].height)
+            var histogram = List<uint>.repeat(0, 256)
+            unmarkColors(ref g, newCmAt)
+            unmarkColors(ref g, gfcm)
+
+            if onlyCompressed {
+                _ = gifUncompressImage(ref g, gfs, gfi)
+            }
+
+            kd3EnableAll(ref kd3)
+            // The image and the two colormaps are taken out of the program's state while the
+            // image is mapped, and put back after.
+            var image = g.images[gfi].replace(emptyImage())
+            var oldCm = g.colormaps[gfcm].replace(blankColormap())
+            var newCm = g.colormaps[newCmAt].replace(blankColormap())
+            while true {
+                for j in 0..256 {
+                    histogram[j] = 0
+                }
+                dither(ref g, read image, ref newData, ref oldCm, ref kd3, ref histogram, read od)
+                if !tryAssignTransparency(ref image, read oldCm, ref newData, ref newCm, ref newNcol, ref kd3, read histogram) {
+                    break
+                }
+            }
+            g.images[gfi] = image
+            g.colormaps[gfcm] = oldCm
+            g.colormaps[newCmAt] = newCm
+
+            gifReleaseUncompressedImage(ref g, gfi)
+            // version 1.28 bug fix: release any compressed version or it'll cause bad images
+            gifReleaseCompressedImage(ref g, gfi)
+            gifSetUncompressedImage(ref g, gfi, newData, false)
+
+            // update count of used colors
+            for j in 0..256 {
+                g.colormaps[newCmAt].col[j].pixel = g.colormaps[newCmAt].col[j].pixel.wrappingAdd(histogram[j])
+            }
+            int transparent = g.images[gfi].transparent
+            if transparent >= 0 {
+                // we don't have data on the number of used colors for transparency so fudge it;
+                // but always count it, so allow_shrink keeps it
+                uint fudge = (uint)g.images[gfi].width * (uint)g.images[gfi].height / 8
+                if fudge == 0 {
+                    fudge = 1
+                }
+                nint t = (nint)transparent
+                g.colormaps[newCmAt].col[t].pixel = g.colormaps[newCmAt].col[t].pixel.wrappingAdd(fudge)
+            }
+        } else {
+            // Can't compress new_cm afterwards if we didn't actively change colors over
+            allowShrink = false
+        }
+
+        if g.images[gfi].local != None {
+            gifDeleteColormap(ref g, g.images[gfi].local)
+            g.images[gfi].local = None
+        }
+
+        // 1.92: recompress *after* deleting the local colormap. The image now uses new_cm, so
+        // compress against it (--careful sizes codes from the colormap).
+        if gfcm != None && onlyCompressed {
+            nint oldGlobal = g.streams[gfs].global
+            int oldNcol = g.colormaps[newCmAt].ncol
+            g.streams[gfs].global = newCmAt
+            g.colormaps[newCmAt].ncol = newNcol
+            var info = g.gifWriteInfo
+            _ = gifFullCompressImage(ref g, gfs, gfi, read info)
+            g.colormaps[newCmAt].ncol = oldNcol
+            g.streams[gfs].global = oldGlobal
+            gifReleaseUncompressedImage(ref g, gfi)
+        }
+    }
+
+    // Set new_cm->ncol from new_ncol. We didn't update new_cm->ncol before so the closest-color
+    // algorithms wouldn't see any new transparent colors. That way added transparent colors were
+    // only used for transparency.
+    g.colormaps[newCmAt].ncol = newNcol
+
+    // change the background. I hate the background by now
+    nint nimages = g.streams[gfs].images.length()
+    nint global = g.streams[gfs].global
+    int firstTransparent = -1
+    if nimages > 0 {
+        firstTransparent = g.images[g.streams[gfs].images[0]].transparent
+    }
+    if (nimages == 0 || firstTransparent < 0) && global != None && g.streams[gfs].background < g.colormaps[global].ncol {
+        var c = g.colormaps[global].col[(nint)g.streams[gfs].background]
+        int bg = kd3Closest8g(read g.kc, ref kd3, (int)c.red, (int)c.green, (int)c.blue)
+        g.streams[gfs].background = bg
+        g.colormaps[newCmAt].col[(nint)bg].pixel = g.colormaps[newCmAt].col[(nint)bg].pixel.wrappingAdd(1)
+    } else if nimages > 0 && firstTransparent >= 0 {
+        g.streams[gfs].background = firstTransparent
+    } else {
+        g.streams[gfs].background = 0
+    }
+
+    gifDeleteColormap(ref g, g.streams[gfs].global)
+    kd3Cleanup(ref kd3)
+
+    // We may have used only a subset of the colors in new_cm. We try to store only that subset,
+    // just as if we'd piped the output of 'gifsicle --use-colormap=X' through 'gifsicle' another
+    // time.
+    nint copy = gifCopyColormap(ref g, newCmAt)
+    g.streams[gfs].global = copy
+    nint ncol = (nint)g.colormaps[newCmAt].ncol
+    for j in 0..ncol {
+        g.colormaps[copy].col[j].haspixel = 0
+    }
+    if allowShrink {
+        // only bother to recompress if we'll get anything out of it
+        allowShrink = false
+        for j in 0..ncol - 1 {
+            uint here = g.colormaps[newCmAt].col[j].pixel
+            if here == 0 || here < g.colormaps[newCmAt].col[j + 1].pixel {
+                allowShrink = true
+                break
+            }
+        }
+    }
+
+    if allowShrink {
+        var map = int[256](0)
+
+        // Gif_CopyColormap copies the 'pixel' values as well
+        for j in 0..ncol {
+            g.colormaps[copy].col[j].haspixel = (byte)j
+        }
+
+        // sort based on popularity
+        var perm = List<int>.repeat(0, ncol)
+        var key = List<long>.repeat(0, ncol)
+        for j in 0..ncol {
+            perm[j] = (int)j
+            key[j] = -(long)g.colormaps[copy].col[j].pixel
+        }
+        sortPerm(ref perm, 0, ncol, read key)
+        var sorted = List<Color>.withCapacity(ncol)
+        for j in 0..ncol {
+            sorted.add(g.colormaps[copy].col[(nint)perm[j]])
+        }
+        for j in 0..ncol {
+            g.colormaps[copy].col[j] = sorted[j]
+        }
+
+        // set up the map and reduce the number of colors
+        for j in 0..ncol {
+            map[(nint)g.colormaps[copy].col[j].haspixel] = (int)j
+        }
+        for j in 0..ncol {
+            if g.colormaps[copy].col[j].pixel == 0 {
+                g.colormaps[copy].ncol = (int)j
+                break
+            }
+        }
+
+        // map the image data, transparencies, and background
+        if g.streams[gfs].background < g.colormaps[copy].ncol {
+            g.streams[gfs].background = map[(nint)g.streams[gfs].background]
+        }
+        for imagei in 0..g.streams[gfs].images.length() {
+            nint gfi = g.streams[gfs].images[imagei]
+            bool onlyCompressed = !g.images[gfi].hasImg
+            if onlyCompressed {
+                _ = gifUncompressImage(ref g, gfs, gfi)
+            }
+
+            nint size = (nint)g.images[gfi].width * (nint)g.images[gfi].height
+            if size > g.images[gfi].data.length() {
+                size = g.images[gfi].data.length()
+            }
+            for p in 0..size {
+                g.images[gfi].data[p] = (byte)map[(nint)g.images[gfi].data[p]]
+            }
+            if g.images[gfi].transparent >= 0 {
+                g.images[gfi].transparent = map[(nint)g.images[gfi].transparent]
+            }
+
+            if onlyCompressed {
+                var info = g.gifWriteInfo
+                _ = gifFullCompressImage(ref g, gfs, gfi, read info)
+                gifReleaseUncompressedImage(ref g, gfi)
+            }
+        }
+    }
+
+    // new_cm may be shared with later outputs (--use-colormap), so remove any transparent colors
+    // added to it
+    g.colormaps[newCmAt].ncol = origNcol
+}
+
+// ---- Halftone algorithms ----
+
+const byte[] DitherMatrixO3x3 = {
+    3, 3, 9, 9,
+     2,  6,  3,
+     5,  0,  8,
+     1,  7,  4
+}
+
+const byte[] DitherMatrixO4x4 = {
+    4, 4, 16, 16,
+     0,  8,  3, 10,
+    12,  4, 14,  6,
+     2, 11,  1,  9,
+    15,  7, 13,  5
+}
+
+const byte[] DitherMatrixO8x8 = {
+    8, 8, 64, 64,
+     0, 48, 12, 60,  3, 51, 15, 63,
+    32, 16, 44, 28, 35, 19, 47, 31,
+     8, 56,  4, 52, 11, 59,  7, 55,
+    40, 24, 36, 20, 43, 27, 39, 23,
+     2, 50, 14, 62,  1, 49, 13, 61,
+    34, 18, 46, 30, 33, 17, 45, 29,
+    10, 58,  6, 54,  9, 57,  5, 53,
+    42, 26, 38, 22, 41, 25, 37, 21
+}
+
+const byte[] DitherMatrixRo64x64 = {
+    64, 64, 16, 16,
+     6, 15,  2, 15,  2, 14,  1, 13,  2, 14,  5, 13,  0, 14,  0,  9,  6, 10,  7, 13,  6, 13,  3, 10,  5, 15,  4, 11,  0, 11,  6, 10,  7, 12,  7, 13,  0,  9,  6, 15,  6, 10,  0, 15,  1, 15,  0,  8,  0, 15,  6, 15,  7, 15,  7,  9,  1, 15,  3,  8,  1,  8,  0, 14,
+     9,  3, 10,  5, 10,  6, 10,  5,  9,  6,  9,  2,  9,  4, 13,  4, 13,  3,  8,  3, 10,  1, 13,  6, 11,  1, 12,  3, 14,  5, 15,  3,  8,  3,  8,  3, 12,  4, 11,  3, 13,  3,  8,  4,  9,  6, 12,  4, 11,  6, 11,  3, 10,  0, 12,  1, 11,  7, 12,  4, 12,  4, 11,  5,
+     1, 14,  0, 10,  2,  9,  2, 11,  1,  8,  1,  8,  3,  9,  4, 15,  7, 13,  7, 14,  7, 14,  0, 10,  0, 14,  7,  9,  0, 11,  1, 15,  0, 11,  0, 11,  3, 15,  7, 14,  6, 10,  5,  8,  0, 11,  0,  8,  7, 11,  0, 15,  0, 12,  1, 13,  6,  9,  0, 15,  4,  9,  1,  8,
+    10,  5, 15,  6, 13,  6, 14,  7, 14,  4, 12,  5, 15,  6, 10,  2, 11,  3, 10,  3, 11,  3, 13,  6, 11,  5, 14,  3, 14,  6,  8,  5, 14,  5, 14,  7, 10,  7, 11,  3, 13,  3, 13,  2, 14,  4, 15,  5, 15,  3,  8,  4, 11,  4,  9,  5, 12,  3,  8,  5, 15,  2, 13,  5,
+     3, 10,  2,  9,  5, 15,  4,  9,  0, 11,  7, 11,  0, 14,  5, 11,  5, 14,  7, 15,  6,  9,  0,  9,  0,  8,  4, 14,  6, 12,  0, 11,  4, 15,  5,  8,  6, 10,  6, 11,  6, 10,  3, 12,  5,  9,  6,  9,  5, 12,  6, 12,  7, 14,  0, 14,  2, 15,  5,  8,  2, 10,  3,  9,
+    14,  7, 14,  7,  8,  1, 12,  2, 14,  4, 15,  3, 11,  5, 12,  2,  8,  0, 10,  3, 12,  1, 13,  5, 14,  5, 11,  0, 11,  3, 13,  7,  8,  1, 12,  3, 15,  3, 14,  2, 15,  3, 11,  6, 15,  1, 12,  1,  9,  3,  9,  3, 11,  3, 11,  7, 11,  5, 12,  0, 14,  6, 13,  6,
+     5, 10,  6, 12,  3, 15,  3,  8,  7, 10,  0, 15,  7, 10,  5,  8,  1, 14,  5, 10,  7, 14,  2, 14,  0, 14,  1,  8,  3,  8,  5, 10,  5, 15,  0,  8,  6, 14,  0,  8,  2, 15,  4, 11,  6, 10,  0,  8,  5,  9,  4, 14,  1, 15,  3, 10,  1, 15,  0, 15,  5,  8,  7, 13,
+    15,  3,  8,  0,  9,  6, 12,  6, 15,  0, 11,  4, 14,  3, 15,  3, 10,  5, 12,  3, 10,  3,  9,  6,  9,  5, 13,  5, 15,  6, 14,  0,  9,  0, 12,  4, 11,  3, 15,  4, 11,  6, 15,  2, 15,  3, 14,  4, 13,  2, 11,  1,  8,  5, 12,  7,  9,  4,  8,  5, 12,  2, 11,  0,
+     0, 13,  5, 11,  5, 14,  5, 15,  7,  9,  5,  8,  2, 10,  3, 15,  6,  9,  3, 12,  5, 11,  6, 14,  3, 13,  6, 13,  0,  9,  1, 11,  3,  8,  3,  9,  4,  9,  6, 14,  7,  8,  6, 12,  7, 13,  6,  9,  5, 13,  3, 15,  5, 14,  3, 15,  4, 12,  4, 12,  2, 13,  0, 15,
+    10,  7, 14,  1,  8,  2, 10,  2, 12,  0, 13,  1, 13,  5, 11,  6, 12,  3,  9,  6, 15,  1,  9,  1, 10,  6, 10,  3, 15,  6, 15,  5, 15,  7, 12,  6, 12,  0,  9,  3, 12,  3, 11,  3,  8,  3, 13,  2,  9,  3,  9,  6, 10,  2, 11,  6,  9,  0,  9,  1,  9,  6, 10,  4,
+     3, 10,  4,  9,  4,  9,  6, 13,  3, 15,  0,  8,  4, 10,  0, 14,  5, 15,  7, 15,  2, 12,  7, 10,  5, 15,  7,  8,  0,  9,  0,  8,  6, 14,  4, 15,  2, 15,  1, 15,  0,  9,  5, 14,  0, 12,  7, 10,  6,  8,  6, 11,  0, 13,  7, 14,  1, 13,  2, 10,  5,  9,  0, 14,
+    14,  6, 13,  1, 12,  3,  8,  3,  9,  6, 12,  4, 15,  2,  8,  5,  9,  1, 10,  1,  8,  5, 15,  0,  8,  2, 12,  3, 12,  5, 12,  5, 11,  2, 10,  2,  8,  5, 10,  5, 12,  4,  9,  3,  8,  4, 13,  1, 15,  0, 12,  3,  8,  4, 10,  3,  9,  5, 13,  5, 13,  3, 11,  4,
+     4, 12,  3, 10,  6,  9,  0, 14,  0,  8,  1,  9,  1,  9,  6, 15,  0, 10,  2,  9,  6, 10,  7, 10,  2, 14,  4,  8,  0, 13,  4,  8,  1, 11,  6, 14,  7, 14,  0,  8,  4, 14,  7, 14,  4,  9,  2, 12,  0, 12,  3,  8,  5,  9,  6, 14,  0,  9,  2, 14,  5, 10,  1, 15,
+    10,  2, 15,  6, 14,  3, 11,  6, 15,  4, 15,  4, 13,  5, 11,  3, 12,  4, 14,  5, 12,  0, 13,  3,  8,  6, 15,  2, 10,  6, 13,  2, 12,  6,  8,  3, 10,  3, 14,  5,  8,  0, 10,  3, 13,  2,  9,  6, 10,  6, 15,  4, 13,  2,  8,  3, 14,  6, 11,  7, 13,  0, 10,  5,
+     2, 13,  1,  9,  5, 10,  3, 15,  6, 10,  0, 15,  4, 15,  4, 15,  6,  9,  0, 14,  1,  9,  6, 12,  0, 11,  5,  9,  0, 14,  5, 14,  6,  9,  3, 11,  7, 11,  1, 15,  1,  9,  3, 13,  5, 12,  0,  9,  2,  9,  6, 13,  2,  9,  6, 13,  7, 11,  7,  8,  0, 13,  3,  9,
+     9,  6, 13,  6, 13,  0,  8,  5, 14,  2, 11,  7, 11,  2, 11,  2, 12,  3, 11,  4, 13,  4, 10,  3, 15,  5, 13,  0, 11,  6, 10,  0, 13,  3, 15,  7, 14,  3,  8,  4, 12,  6,  9,  6, 10,  3, 14,  5, 13,  5, 11,  3, 13,  6,  8,  2, 14,  3, 15,  3, 11,  4, 12,  6,
+     4, 10,  7, 11,  1, 10,  2, 14,  7, 14,  0, 14,  4, 15,  0,  8,  0, 15,  5, 15,  7, 11,  7, 14,  6, 12,  0,  8,  1, 15,  1, 14,  2,  8,  0, 11,  4,  8,  5, 11,  1, 15,  0, 12,  7, 14,  0, 11,  4,  8,  2,  8,  0, 14,  2, 14,  4,  9,  4, 10,  7, 15,  5, 14,
+    14,  0, 13,  2, 14,  5, 11,  5, 10,  2, 10,  6, 11,  3, 12,  5, 11,  7, 11,  1, 12,  3, 11,  3,  9,  3, 12,  4, 11,  6,  9,  5, 14,  5, 12,  7, 14,  2, 12,  1,  8,  4, 11,  7, 10,  3, 14,  4, 14,  0, 14,  5, 11,  7, 11,  5, 15,  1, 14,  0, 10,  3, 10,  0,
+     5, 12,  7, 10,  7, 11,  0, 14,  5, 14,  1, 14,  3,  8,  0, 15,  0,  9,  5,  9,  1,  8,  6, 15,  6, 15,  7, 13,  7,  9,  4, 11,  0, 10,  6, 10,  7, 12,  7, 15,  0,  9,  7, 14,  2, 11,  0, 12,  7, 11,  7, 13,  0,  9,  6, 14,  2, 11,  1, 15,  0,  8,  0, 10,
+    10,  3, 15,  3, 15,  3,  8,  4, 11,  3, 11,  6, 15,  6, 11,  5, 12,  5, 13,  0, 15,  4,  8,  1, 11,  3, 10,  3, 15,  3, 14,  1, 14,  6, 13,  3, 11,  3, 11,  3, 13,  6,  8,  3, 12,  5,  8,  4, 13,  3,  8,  2, 13,  4,  8,  3, 14,  7,  8,  5, 14,  4, 15,  5,
+     3,  9,  0, 10,  0, 12,  3, 11,  7, 10,  6,  8,  7, 12,  0, 11,  1,  8,  5, 12,  5, 12,  7, 11,  2, 14,  0, 10,  0, 12,  0, 15,  2,  9,  5,  9,  0, 15,  4, 14,  6,  9,  7, 11,  6, 10,  0,  9,  1,  9,  0, 14,  4, 12,  5,  9,  6, 10,  4, 11,  6, 12,  5, 12,
+    12,  6, 15,  4,  8,  4, 15,  7, 15,  3, 14,  0,  9,  3, 13,  5, 14,  5, 11,  1,  9,  0, 15,  3,  8,  7, 12,  7,  8,  5,  9,  4, 12,  6, 12,  1, 10,  6,  9,  0, 15,  3, 14,  0, 15,  3, 13,  5, 15,  5,  9,  6, 10,  0, 14,  0, 13,  1, 15,  1,  8,  3,  8,  1,
+     2,  8,  7, 15,  0, 11,  1, 12,  1, 12,  0, 15,  0, 11,  2, 13,  1, 10,  5,  8,  7, 13,  6, 10,  0, 11,  4, 12,  7, 10,  1,  9,  1,  9,  0, 12,  2, 11,  7, 15,  1, 11,  0,  9,  2,  8,  4, 12,  2, 12,  6, 14,  4, 14,  3, 13,  3, 15,  1, 14,  4, 15,  6, 12,
+    13,  6, 11,  3, 12,  4,  8,  4,  9,  4,  9,  5, 12,  6, 10,  5, 14,  7, 14,  3, 10,  2, 13,  3, 14,  5,  8,  2, 13,  1, 15,  6, 15,  4,  8,  4, 15,  5, 10,  1, 14,  5, 12,  4, 13,  5, 11,  1,  9,  5,  9,  3,  9,  0, 10,  7, 10,  7, 11,  6, 10,  3,  9,  0,
+     3, 15,  5,  8,  1,  9,  5,  8,  4, 13,  6,  8,  4, 15,  6, 10,  6, 14,  7, 11,  0,  9,  1, 12,  0,  8,  6, 12,  6, 10,  3, 12,  7, 13,  7, 11,  3,  8,  0, 13,  7, 12,  0, 15,  4, 12,  5,  8,  4, 15,  5, 10,  0, 15,  3, 15,  1,  8,  1, 15,  4, 14,  6, 15,
+    10,  6, 14,  0, 13,  4, 13,  1,  9,  1, 13,  3, 11,  2, 12,  1,  8,  3, 12,  3, 14,  6,  8,  4, 15,  4,  8,  3, 15,  1,  9,  6, 11,  2, 14,  3, 13,  7, 10,  4, 10,  3,  8,  7, 11,  2, 12,  1, 11,  1, 14,  3,  9,  6,  9,  7, 13,  5, 11,  7, 10,  2,  9,  3,
+     1,  9,  0, 14,  7, 12,  7, 14,  5,  9,  6, 10,  6, 14,  6, 15,  1, 14,  7, 10,  3, 12,  0, 14,  5,  9,  6,  8,  1, 12,  0, 13,  2,  8,  4,  9,  6, 15,  0, 14,  4, 10,  7, 11,  5, 14,  2,  8,  4, 15,  3,  8,  7, 13,  1,  9,  0, 15,  0, 14,  5, 14,  0, 14,
+    15,  4, 10,  6, 11,  1, 10,  2, 14,  3, 15,  1, 10,  3, 10,  3,  8,  4, 12,  3, 10,  6,  9,  6, 14,  2, 12,  3, 11,  4,  9,  6, 12,  5, 15,  0, 10,  3,  8,  4, 14,  1, 14,  3, 11,  2, 12,  7, 11,  2, 12,  6, 10,  1, 13,  4, 11,  4, 10,  5, 11,  2, 11,  7,
+     0,  8,  1, 11,  4,  8,  4, 10,  6, 11,  3, 10,  6, 10,  6,  8,  1, 11,  1, 15,  7, 15,  6,  9,  1,  9,  7,  8,  0, 14,  5, 12,  3, 13,  4, 12,  0, 15,  5, 12,  1, 12,  7,  9,  6,  8,  3, 15,  0, 13,  6, 15,  7, 15,  7, 13,  2, 15,  1, 14,  2, 15,  0,  8,
+    12,  5, 13,  5, 15,  1, 12,  1, 15,  1, 14,  6, 14,  2, 14,  2, 14,  6, 11,  6, 11,  3, 12,  2, 13,  6, 15,  3,  9,  5,  8,  2,  8,  5,  9,  1,  9,  4,  9,  2,  8,  4, 13,  1, 13,  0, 11,  6, 11,  6,  9,  2, 11,  3, 10,  1, 10,  6,  9,  6, 11,  7, 15,  5,
+     5, 12,  0,  9,  5,  8,  5,  9,  0, 10,  2, 13,  4,  8,  5, 14,  2,  9,  2, 15,  4,  8,  2,  8,  0, 12,  6, 12,  0, 10,  5, 15,  4,  9,  3, 13,  0,  9,  4, 15,  1, 14,  1,  9,  0,  9,  2, 14,  6, 12,  0, 15,  7,  9,  2,  9,  0, 15,  6, 10,  3, 15,  3, 13,
+     9,  1, 15,  5, 12,  3, 14,  0, 15,  7,  8,  5, 14,  1, 11,  1, 13,  6, 10,  7, 13,  0, 14,  5, 10,  7, 11,  3, 15,  6, 11,  1, 12,  2,  8,  4, 13,  5, 10,  2, 10,  6, 13,  5, 13,  4, 10,  5,  9,  3,  8,  4, 12,  1, 12,  5, 11,  6, 14,  3, 11,  7, 11,  7,
+     2, 11,  4, 12,  7,  8,  3, 15,  3, 11,  4, 11,  7, 10,  1, 10,  2, 10,  0, 11,  4, 12,  0, 10,  1,  8,  7, 11,  1, 10,  1, 15,  7, 10,  2, 11,  1,  9,  6, 14,  2, 11,  1, 14,  4, 12,  2, 13,  1,  9,  5,  8,  7, 11,  7, 10,  7, 15,  4, 13,  3, 10,  1, 11,
+    13,  5,  8,  0, 15,  3, 11,  6, 12,  7, 15,  3, 15,  1, 15,  4, 14,  5, 13,  6,  8,  1, 15,  6, 13,  5, 12,  2, 15,  4,  9,  4, 15,  3, 14,  6, 14,  5,  9,  3, 12,  6, 11,  5,  8,  2,  9,  5, 12,  5, 15,  1, 13,  3, 14,  2,  8,  0,  8,  0, 12,  7, 15,  5,
+     0, 14,  1,  8,  2,  8,  2, 15,  2,  9,  6, 12,  0, 12,  7, 12,  7, 13,  0, 15,  6, 14,  5, 11,  1, 12,  5,  8,  5,  8,  1, 14,  0, 10,  4, 12,  6,  9,  6,  8,  0,  9,  0, 15,  4, 15,  5, 13,  1, 15,  5, 12,  7, 10,  6, 14,  4,  9,  6, 15,  0, 15,  7, 13,
+    10,  4, 13,  5, 13,  5, 11,  5, 12,  5,  9,  3,  9,  4,  8,  3,  9,  3, 10,  6, 11,  1, 15,  2,  8,  5, 15,  1, 13,  2, 11,  6, 14,  6,  8,  2, 15,  3, 14,  3, 13,  6,  9,  6,  9,  0, 10,  2, 10,  7, 11,  1, 15,  3,  9,  3, 13,  3, 10,  3,  9,  4, 10,  1,
+     4, 11,  7, 10,  2, 14,  4, 15,  3, 15,  2, 15,  7, 10,  2, 14,  1,  8,  0, 15,  2,  8,  1, 12,  2, 13,  1,  8,  7, 12,  6, 11,  1, 10,  4, 11,  2, 15,  0, 13,  0, 12,  7, 11,  5, 12,  7,  8,  6, 15,  4, 12,  7, 10,  6, 10,  0, 10,  0, 11,  4, 12,  7, 10,
+    13,  2, 14,  2, 10,  7, 11,  1, 11,  7, 11,  7, 12,  3, 11,  7, 13,  4, 11,  6, 12,  5, 11,  6, 10,  7, 13,  4, 11,  3, 15,  3, 14,  4, 15,  3,  8,  5, 10,  7, 10,  6, 15,  3,  9,  3, 15,  1, 11,  3,  9,  0, 15,  1, 15,  3, 15,  4, 13,  5,  8,  3, 15,  3,
+     3,  9,  1, 12,  4, 14,  0, 11,  7, 15,  1, 11,  3, 14,  0, 11,  5, 10,  2, 10,  2,  8,  6, 14,  7, 11,  0, 10,  7, 14,  7, 15,  6,  9,  6,  9,  1, 12,  7,  9,  4,  8,  7, 13,  0, 13,  6, 12,  6,  8,  1,  9,  1, 15,  4, 12,  0, 12,  4, 10,  0, 13,  0, 12,
+    13,  5, 10,  6,  9,  1, 13,  6, 11,  0, 14,  7, 11,  7, 14,  5, 15,  2, 13,  5, 15,  4,  9,  2, 13,  3, 14,  7, 10,  3, 10,  3, 12,  3, 12,  2,  8,  5, 15,  3, 13,  3, 11,  3, 10,  4,  9,  3, 15,  1, 14,  4, 11,  6, 10,  3,  8,  4, 13,  0, 10,  4,  8,  5,
+     5,  8,  3, 13,  4, 14,  1, 13,  7,  9,  2, 14,  4, 14,  4, 12,  7, 10,  6, 10,  5, 12,  2, 11,  6, 12,  7, 13,  4, 11,  2, 11,  3,  8,  5, 15,  2, 10,  1,  9,  2, 12,  0, 12,  0, 10,  1, 12,  0,  9,  7, 10,  0, 15,  4,  9,  0,  8,  1, 14,  4, 14,  4, 13,
+    12,  2,  8,  6, 10,  0,  8,  5, 13,  3,  8,  5, 10,  3, 11,  2, 15,  0, 13,  3,  8,  2, 15,  6,  9,  1,  8,  3, 14,  1, 15,  5, 14,  7,  8,  0, 12,  6, 15,  5,  8,  5,  9,  4, 15,  5,  8,  5, 15,  4, 12,  3,  9,  6, 12,  3, 13,  5, 11,  7, 10,  1,  8,  3,
+     4, 15,  2, 11,  2, 10,  6, 11,  3, 14,  7, 15,  0, 10,  0, 14,  3, 12,  4,  8,  7,  9,  3, 11,  0, 13,  2, 12,  2, 13,  5,  8,  5,  8,  2, 11,  4, 12,  2, 10,  7,  8,  6, 10,  7, 12,  7, 11,  0, 15,  7,  8,  7, 15,  0,  9,  2, 12,  6, 13,  0,  9,  4,  9,
+     8,  3, 12,  5, 15,  5, 13,  1,  8,  7,  8,  3, 12,  5,  9,  5,  9,  6, 14,  1, 12,  3, 15,  7, 10,  7,  8,  5,  8,  5, 15,  0, 13,  1, 14,  7,  9,  1, 14,  7, 13,  2, 12,  3,  8,  1, 13,  3,  8,  4, 12,  0, 11,  3, 12,  5, 11,  5,  9,  3, 12,  6, 14,  2,
+     5, 13,  2,  8,  6, 12,  7, 10,  5, 14,  4, 11,  2, 11,  2, 13,  2, 13,  5, 10,  5,  9,  0, 10,  7, 13,  4, 15,  2,  9,  1,  9,  5,  9,  6, 10,  4, 12,  5, 12,  4, 10,  3, 14,  3, 15,  1,  8,  4, 12,  5,  8,  5, 14,  7, 11,  7, 15,  5, 11,  2, 13,  1,  9,
+    10,  0, 13,  6, 10,  2, 15,  3,  8,  1, 12,  2, 14,  6,  8,  5, 10,  7, 13,  1, 13,  1, 12,  7,  9,  1,  9,  2, 12,  5, 12,  4, 12,  3, 12,  2,  9,  0,  8,  1, 15,  1, 10,  7, 10,  6, 12,  4, 11,  1, 14,  2, 11,  0, 14,  1,  9,  2, 12,  2,  8,  5, 13,  5,
+     6, 10,  7, 11,  0,  9,  3,  9,  5, 11,  0,  8,  0, 13,  2, 13,  4, 13,  5,  9,  4,  8,  2,  8,  0, 10,  0, 14,  6,  9,  6,  9,  4, 14,  7,  9,  0, 11,  7, 10,  7, 11,  7, 14,  4, 14,  5, 15,  4,  8,  4, 11,  5, 14,  0,  8,  1, 14,  7, 14,  2, 11,  7, 13,
+    12,  3, 13,  3, 14,  5, 15,  6, 12,  0, 15,  4, 11,  5,  9,  5,  9,  2, 14,  1, 12,  1, 13,  5, 15,  4, 11,  7, 12,  1, 13,  2,  8,  1, 12,  0, 15,  6, 14,  2, 14,  3, 10,  1, 11,  3, 11,  0, 12,  1, 15,  2, 11,  1, 12,  4,  9,  4, 10,  2, 13,  6, 10,  2,
+     2,  8,  4,  8,  4,  9,  0,  9,  2, 15,  5,  9,  6, 11,  7, 14,  0,  9,  2, 12,  2,  8,  0, 10,  1,  9,  7,  8,  2,  9,  1, 11,  2, 11,  2,  8,  1,  9,  1, 11,  7, 13,  6, 11,  1, 11,  0,  9,  2, 13,  4, 14,  1, 15,  2,  8,  7, 15,  0, 13,  6,  9,  4, 13,
+    13,  5, 13,  1, 14,  0, 12,  6,  9,  6, 12,  0, 13,  0, 11,  3, 13,  6, 11,  7, 12,  5, 14,  6, 14,  5, 15,  3, 13,  6, 14,  7, 15,  6, 15,  5, 13,  4, 14,  5,  8,  2, 14,  3, 14,  6, 14,  5, 10,  6, 10,  2,  9,  5, 15,  5, 11,  1,  8,  5, 13,  3, 11,  2,
+     2,  8,  6,  8,  0,  9,  1, 15,  0, 11,  4, 15,  7,  8,  4,  8,  1, 13,  7, 11,  1, 13,  5, 15,  1, 15,  2,  9,  0, 13,  5, 12,  3, 12,  2,  8,  1, 10,  1, 13,  5, 15,  3,  9,  3,  9,  2, 12,  5, 14,  6, 13,  1,  9,  6,  9,  1,  8,  4, 15,  7, 10,  7, 15,
+    14,  5, 14,  3, 12,  4, 10,  7, 12,  7,  8,  2, 12,  1, 13,  2, 11,  4, 13,  3,  8,  5,  8,  1, 10,  7, 12,  6,  9,  5,  8,  0,  8,  7, 14,  5, 13,  6,  8,  4,  8,  2, 12,  6, 13,  5,  8,  7,  8,  3, 10,  3, 13,  4, 12,  1, 13,  4, 11,  1, 14,  3,  8,  1,
+     2, 13,  6, 10,  0,  9,  1, 15,  0, 12,  4, 11,  2,  9,  0,  9,  0, 13,  1,  8,  0, 11,  5,  9,  6, 13,  2, 15,  2, 12,  7, 12,  6, 15,  2, 14,  1, 13,  1, 14,  4, 11,  2, 14,  1,  9,  0, 15,  1, 12,  5, 14,  6, 13,  2, 15,  3,  9,  1, 15,  7,  8,  1, 14,
+    11,  7, 13,  3, 15,  6,  8,  4,  8,  4, 14,  2, 14,  6, 13,  6, 11,  4, 14,  4, 15,  4, 14,  3, 10,  2, 10,  5,  9,  6,  9,  3,  9,  1, 11,  6,  9,  4,  8,  4, 15,  0,  8,  4, 13,  4,  9,  4,  9,  5,  9,  3, 10,  2,  9,  5, 12,  6,  8,  4, 12,  0, 11,  4,
+     4, 10,  4, 13,  1, 12,  7,  8,  0, 13,  4, 12,  2, 13,  1, 14,  7, 15,  3,  8,  7, 12,  3, 10,  4,  9,  4, 11,  7,  8,  2, 11,  2, 10,  0, 12,  1, 14,  6, 14,  7, 13,  7, 11,  3, 10,  0, 10,  4,  9,  3, 13,  0, 13,  7,  8,  7,  9,  7, 11,  2,  8,  1, 14,
+    15,  0, 11,  1,  9,  6, 15,  3, 10,  7,  9,  1,  9,  7, 10,  7, 10,  1, 12,  5,  8,  1, 15,  7, 13,  3, 12,  2, 13,  2, 14,  7, 14,  5, 10,  4,  8,  4, 11,  1, 10,  3, 14,  0, 14,  6, 14,  5, 13,  2,  8,  7, 10,  7, 13,  2, 14,  2, 13,  2, 14,  5, 11,  6,
+     7, 11,  5, 13,  1, 11,  7,  8,  5, 14,  4, 13,  1, 14,  5, 10,  2, 15,  4, 13,  7, 11,  7, 10,  1,  8,  5,  9,  4, 12,  7, 10,  1, 13,  7, 13,  7, 11,  0, 14,  5, 14,  2, 14,  4, 12,  4, 13,  7, 13,  7,  8,  2, 14,  2, 13,  5,  9,  5,  9,  2,  8,  1, 10,
+    12,  0,  8,  2, 13,  4, 12,  1, 11,  1, 10,  1, 10,  4, 12,  2, 11,  5,  8,  1, 15,  3, 14,  1, 13,  4, 14,  2,  9,  2, 12,  2,  8,  4,  8,  2, 12,  3, 10,  6, 11,  0, 11,  7, 10,  1,  9,  2, 10,  0, 13,  1, 11,  7, 10,  6, 13,  1, 12,  1, 12,  6, 14,  7,
+     2, 14,  4, 15,  7, 14,  5,  8,  4, 13,  2, 10,  4, 13,  0, 13,  1, 11,  1, 12,  7, 12,  6, 13,  4, 13,  4, 13,  2, 12,  2, 13,  1, 13,  7, 10,  2, 11,  2, 10,  7, 15,  7, 11,  5, 13,  2,  8,  2, 14,  4,  9,  2, 14,  0,  8,  1,  8,  7, 10,  5, 15,  6, 14,
+    11,  7, 10,  2, 11,  1, 13,  0, 11,  1, 15,  7,  8,  1,  9,  4, 13,  4,  8,  4,  8,  3, 10,  0,  9,  0,  9,  2,  9,  7,  9,  6, 10,  7, 13,  1, 13,  7, 14,  6, 11,  3, 12,  2,  8,  2, 12,  5, 11,  5, 12,  2, 10,  5, 14,  4, 12,  4, 13,  2,  9,  1, 10,  0,
+     2, 12,  0, 13,  7, 13,  2, 12,  4,  8,  1, 12,  4, 13,  6, 11,  7, 13,  7, 13,  1,  9,  7, 10,  2, 10,  1,  9,  2, 10,  1, 11,  6,  9,  4, 13,  2, 10,  0, 10,  2, 14,  0, 13,  7, 10,  7, 10,  0, 12,  0,  9,  0, 13,  2, 13,  1,  9,  0, 15,  2, 14,  2, 13,
+    11,  7,  8,  4, 10,  2, 10,  7, 12,  1, 11,  7,  8,  2, 13,  1, 10,  0, 10,  2, 13,  6, 14,  0, 14,  7, 13,  6, 14,  5, 13,  4, 15,  1, 10,  2, 13,  7, 13,  7,  9,  4,  9,  6, 13,  3, 13,  3,  8,  4, 13,  4, 10,  6, 10,  5, 12,  4, 10,  7, 11,  6,  9,  6,
+     4, 14,  6, 11,  7, 13,  6, 10,  4,  8,  4, 11,  6,  8,  5, 13,  7, 14,  7, 14,  1,  9,  0, 12,  1,  9,  1, 12,  4, 14,  7, 10,  4, 13,  7, 13,  7, 11,  4, 10,  1, 11,  7, 13,  4, 12,  1, 10,  4, 12,  2,  8,  2, 12,  2, 10,  2, 12,  1, 12,  4, 12,  2, 12,
+     8,  2, 13,  2,  8,  1, 13,  1, 12,  1, 12,  2, 12,  2, 11,  1,  9,  2, 11,  3, 12,  4,  8,  4, 12,  4, 10,  6, 10,  1, 13,  2, 11,  2, 10,  1, 12,  0, 14,  2, 14,  4,  9,  2,  8,  1, 13,  4,  8,  0, 12,  4, 11,  6, 12,  6, 11,  7, 10,  7, 11,  2, 10,  7
+}
+
+const byte[] DitherMatrixDiagonal45x8 = {
+    8, 8, 64, 2,
+    16, 32, 48, 56, 40, 24,  8,  0,
+    36, 52, 60, 44, 28, 12,  4, 20,
+    49, 57, 41, 25,  9,  1, 17, 33,
+    61, 45, 29, 13,  5, 21, 37, 53,
+    42, 26, 10,  2, 18, 34, 50, 58,
+    30, 14,  6, 22, 38, 54, 62, 46,
+    11,  3, 19, 35, 51, 59, 43, 27,
+     7, 23, 39, 55, 63, 47, 31, 15
+}
+
+// ---- matrices made for a size: halftones ----
+
+struct HalftonePixel : Copyable {
+    int x
+    int y
+    double distance
+    double angle
+}
+
+List<HalftonePixel> halftonePixelMake(int w, int h) {
+    var hp = List<HalftonePixel>.withCapacity((nint)w * (nint)h)
+    for y in 0..h {
+        for x in 0..w {
+            hp.add(HalftonePixel { x = x, y = y, distance = -1.0, angle = 0.0 })
+        }
+    }
+    return hp
+}
+
+void halftonePixelCombine(ref HalftonePixel hp, double cx, double cy) {
+    double dx = (double)hp.x - cx
+    double dy = (double)hp.y - cy
+    double d = dx.fusedMultiplyAdd(dx, dy * dy)
+    if hp.distance < 0.0 || d < hp.distance {
+        hp.distance = d
+        hp.angle = dy.atan2(dx)
+    }
+}
+
+// a key of a double whose order as a long is the order of the doubles; -0 is 0
+long doubleOrderKey(double x) {
+    double v = x + 0.0
+    ulong bits = v.toBits()
+    if v >= 0.0 {
+        return (long)bits
+    }
+    return -(long)(bits & 0x7FFFFFFFFFFFFFFF) - 1
+}
+
+// Sorts the pixels as C's qsort does with gifsicle's `halftone_pixel_compare`: by distance, and by
+// angle where the distances are within 0.01 (they are then equal: every distance is a multiple of
+// 0.25), and never finding two pixels equal.
+void sortHalftonePixels(ref List<HalftonePixel> hp) {
+    nint n = hp.length()
+    // the angles' ranks
+    var perm = List<int>.repeat(0, n)
+    var key = List<long>.repeat(0, n)
+    for i in 0..n {
+        perm[i] = (int)i
+        key[i] = doubleOrderKey(hp[i].angle)
+    }
+    sortPerm(ref perm, 0, n, read key)
+    var rank = List<long>.repeat(0, n)
+    long r = 0
+    for i in 0..n {
+        if i > 0 && key[(nint)perm[i]] != key[(nint)perm[i - 1]] {
+            r += 1
+        }
+        rank[(nint)perm[i]] = r
+    }
+    for i in 0..n {
+        perm[i] = (int)i
+        key[i] = ((long)(hp[i].distance * 4.0) << 20) | rank[i]
+    }
+    sortPermNoTies(ref perm, 0, n, read key)
+    var sorted = List<HalftonePixel>.withCapacity(n)
+    for i in 0..n {
+        sorted.add(hp[(nint)perm[i]])
+    }
+    hp = sorted
+}
+
+List<byte> halftonePixelMatrix(read List<HalftonePixel> hp, int w, int h, int nc) {
+    nint wh = (nint)w * (nint)h
+    var m = List<byte>.repeat(0, 4 + wh)
+    m[0] = (byte)w
+    m[1] = (byte)h
+    m[3] = (byte)nc
+    if wh > 255 {
+        double s = 255.0 / (double)wh
+        m[2] = 255
+        for i in 0..wh {
+            m[4 + (nint)hp[i].x + (nint)hp[i].y * (nint)w] = (byte)(int)((double)i * s)
+        }
+    } else {
+        m[2] = (byte)wh
+        for i in 0..wh {
+            m[4 + (nint)hp[i].x + (nint)hp[i].y * (nint)w] = (byte)i
+        }
+    }
+    return m
+}
+
+List<byte> makeHalftoneMatrixSquare(int w, int h, int nc) {
+    var hp = halftonePixelMake(w, h)
+    for i in 0..hp.length() {
+        halftonePixelCombine(ref hp[i], (double)(w - 1) / 2.0, (double)(h - 1) / 2.0)
+    }
+    sortHalftonePixels(ref hp)
+    return halftonePixelMatrix(read hp, w, h, nc)
+}
+
+List<byte> makeHalftoneMatrixTriangular(int w, int h, int nc) {
+    var hp = halftonePixelMake(w, h)
+    double fw = (double)w
+    double fh = (double)h
+    for i in 0..hp.length() {
+        halftonePixelCombine(ref hp[i], (fw - 1.0) / 2.0, (fh - 1.0) / 2.0)
+        halftonePixelCombine(ref hp[i], -0.5, -0.5)
+        halftonePixelCombine(ref hp[i], fw - 0.5, -0.5)
+        halftonePixelCombine(ref hp[i], -0.5, fh - 0.5)
+        halftonePixelCombine(ref hp[i], fw - 0.5, fh - 0.5)
+    }
+    sortHalftonePixels(ref hp)
+    return halftonePixelMatrix(read hp, w, h, nc)
+}
+
+// ---- --dither ----
+
+void ditherRelease(ref OutputData od) {
+    od.ditherType = DitherNone
+    od.ditherData.clear()
+}
+
+void copyDither(ref OutputData dst, read OutputData src) {
+    dst.ditherType = src.ditherType
+    dst.ditherData = src.ditherData.clone()
+    dst.ditherName = src.ditherName.clone()
+}
+
+void setDitherMatrix(ref OutputData od, read byte[] matrix) {
+    od.ditherType = DitherOrdered
+    od.ditherData.clear()
+    od.ditherData.addAll(matrix)
+}
+
+// Sets the dither of `od` from a name such as `o4` or `halftone,10,3`; -1 if it is not one.
+int setDitherType(ref OutputData od, read string fullName) {
+    var s = fullName.asBytes()
+    nint len = s.length()
+    var parm = int[4](0)
+    int nparm = 0
+
+    // separate arguments from dither name
+    nint comma = -1
+    var at = s.indexOf(0x2C)
+    if at is not null {
+        comma = at
+    }
+    nint nameEnd = len
+    if comma >= 0 && comma < 256 {
+        nameEnd = comma
+    }
+    var name = s[0..nameEnd]
+    // C's strtol from the character after each separator, while that is a digit
+    while nparm < 4 && comma >= 0 && comma < len && comma + 1 < len && isDigitByte(s[comma + 1]) {
+        nint q = comma + 1
+        long v = 0
+        while q < len && isDigitByte(s[q]) {
+            if v <= 65535 {
+                v = v * 10 + (long)(s[q] - 0x30)
+            }
+            q += 1
+        }
+        if v > 65535 {
+            v = 65535
+        }
+        parm[(nint)nparm] = (int)v
+        comma = q
+        nparm += 1
+    }
+    if comma >= 0 && comma < len {
+        return -1
+    }
+    // matrices store the number of colors in a byte
+    if nparm >= 2 && parm[1] > 255 {
+        return -1
+    }
+
+    // parse dither name
+    ditherRelease(ref od)
+
+    if name == "none".asBytes() || name == "posterize".asBytes() {
+        // ok
+    } else if name == "default".asBytes() {
+        od.ditherType = DitherDefault
+    } else if name == "floyd-steinberg".asBytes() || name == "fs".asBytes() {
+        od.ditherType = DitherFloydSteinberg
+    } else if name == "atkinson".asBytes() || name == "at".asBytes() {
+        od.ditherType = DitherAtkinson
+    } else if name == "o3".asBytes() || name == "o3x3".asBytes() || (name == "o".asBytes() && nparm >= 1 && parm[0] == 3) {
+        setDitherMatrix(ref od, read DitherMatrixO3x3)
+    } else if name == "o4".asBytes() || name == "o4x4".asBytes() || (name == "o".asBytes() && nparm >= 1 && parm[0] == 4) {
+        setDitherMatrix(ref od, read DitherMatrixO4x4)
+    } else if name == "o8".asBytes() || name == "o8x8".asBytes() || (name == "o".asBytes() && nparm >= 1 && parm[0] == 8) {
+        setDitherMatrix(ref od, read DitherMatrixO8x8)
+    } else if name == "ro64".asBytes() || name == "ro64x64".asBytes() || name == "o".asBytes() || name == "ordered".asBytes() {
+        setDitherMatrix(ref od, read DitherMatrixRo64x64)
+    } else if name == "diag45".asBytes() || name == "diagonal".asBytes() {
+        setDitherMatrix(ref od, read DitherMatrixDiagonal45x8)
+    } else if name == "halftone".asBytes() || name == "half".asBytes() || name == "trihalftone".asBytes() || name == "trihalf".asBytes() {
+        int size = 6
+        if nparm >= 1 && parm[0] > 0 {
+            size = parm[0]
+        }
+        int ncol = 2
+        if nparm >= 2 && parm[1] > 1 {
+            ncol = parm[1]
+        }
+        // matrix height (size * sqrt(3)) must fit in 255
+        if size > 147 {
+            return -1
+        }
+        od.ditherType = DitherOrderedNew
+        int height = (int)((double)size).fusedMultiplyAdd(3.0.sqrt(), 0.5)
+        od.ditherData = makeHalftoneMatrixTriangular(size, height, ncol)
+    } else if name == "sqhalftone".asBytes() || name == "sqhalf".asBytes() || name == "squarehalftone".asBytes() {
+        int size = 6
+        if nparm >= 1 && parm[0] > 0 {
+            size = parm[0]
+        }
+        int ncol = 2
+        if nparm >= 2 && parm[1] > 1 {
+            ncol = parm[1]
+        }
+        if size > 255 {
+            return -1
+        }
+        od.ditherType = DitherOrderedNew
+        od.ditherData = makeHalftoneMatrixSquare(size, size, ncol)
+    } else {
+        return -1
+    }
+
+    if od.ditherType == DitherOrdered && nparm >= 2 && parm[1] > 1 && parm[1] != (int)od.ditherData[3] {
+        od.ditherData[3] = (byte)parm[1]
+        od.ditherType = DitherOrderedNew
+    }
+    return 0
 }

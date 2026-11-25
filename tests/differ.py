@@ -47,9 +47,33 @@ OPTIONS = [
     ["-U", "--resize", "50x40"], ["--resize", "50x40", "-O3"], ["-j4", "--resize", "40x40"], ["-j4", "-U", "--resize", "40x40"],
     ["-j4", "-U", "--resize-colors", "128", "--resize-method", "catrom", "--resize", "40x40"],
     ["--crop", "2,2+20x20", "--resize", "10x30"], ["--rotate-90", "--scale", "0.8"], ["-t", "#000000", "--scale", "0.7"],
+    # colors: reducing, dithering, colormaps, gamma
+    *[["--colors", n] for n in ("2", "3", "7", "16", "129", "255", "256")],
+    *[["--colors", n, "--color-method", m, *d] for m in ("diversity", "blend-diversity", "median-cut")
+      for n, d in (("4", []), ("32", ["--dither"]), ("200", ["--dither=o8"]))],
+    *[["--colors", "12", f"--dither={d}"] for d in (
+        "none", "posterize", "default", "fs", "floyd-steinberg", "atkinson", "at", "o3", "o4", "o8", "ro64", "o",
+        "ordered", "diag45", "diagonal", "halftone", "half,4,3", "trihalftone,10", "trihalf,147,2", "sqhalftone,5",
+        "sqhalf,7,4", "squarehalftone,30,9", "o4,8", "o,3", "o,4,9", "ro64,16", "o,4x5", "o8,1", "halftone,148",
+        "sqhalftone,256", "o,4,300", "foo", "o,", "halftone,,3", "o4,99999999999999999999")],
+    ["--colors", "5", "--dither", "--no-dither"], ["-f", "--colors", "3", "-O3"], ["--dither=at", "--colors", "64", "-U"],
+    ["--colors", "8", "--gamma", "oklab"], ["--colors", "8", "--gamma", "oklab", "--dither"], ["--colors", "8", "--gamma", "srgb"],
+    ["--colors", "8", "--gamma", "1.0"], ["--colors", "8", "--gamma", "2.2", "--dither=o4"], ["--colors", "8", "--gamma", "0.5"],
+    ["--colors", "8", "--no-gamma"], ["--colors", "8", "--gamma", "bad"], ["--colors", "8", "--gamma", "-1"],
+    ["--use-colormap", "web"], ["--use-colormap", "gray", "--dither"], ["--use-colormap", "bw", "--dither=o4"],
+    ["--gray"], ["--use-colormap", "{0}", "--dither=atkinson", "{0}"], ["--use-exact-colormap", "web"],
+    ["--use-exact-colormap", "bw", "--dither"], ["--use-colormap", "web", "--gamma", "oklab", "--dither=ro64"],
+    ["--colors", "16", "--resize", "30x30"], ["--resize", "40x40", "--colors", "64", "--dither"],
+    ["--colors", "6", "--crop", "1,1+9x9", "--rotate-90"], ["--colors", "9", "-t", "#000000", "-O2"],
+    ["-b", "--colors", "8", "--dither=fs", "{0}", "--dither=atkinson", "{0}", "--dither=fs", "{0}"],
+    ["--colors", "4", "-i"], ["--colors", "40", "--careful", "-O3"],
+    # lossy
+    ["--lossy"], ["--lossy=0"], ["--lossy=1"], ["--lossy=80"], ["--lossy=400"], ["--lossy=80", "-O3"],
+    ["--lossy=60", "-i"], ["--lossy=50", "--careful"], ["--lossy=30", "--colors", "32", "--dither"],
+    ["--lossy=100", "-U", "-O2"], ["--lossy=200", "--gamma", "1.5"], ["--lossy=-1"],
 ]
 HEAVY = {"e-bad-frame-too-large.gif"}
-HEAVY_OPTIONS = [[], ["-I"], ["-O2"], ["-U"], ["--crop", "3,3+20x15"]]
+HEAVY_OPTIONS = [[], ["-I"], ["-O2"], ["-U"], ["--crop", "3,3+20x15"], ["--colors", "8"], ["--lossy=80"]]
 ICONS = "/usr/share/httpd/icons"
 
 

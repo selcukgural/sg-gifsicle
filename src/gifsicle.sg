@@ -493,6 +493,11 @@ struct Gt {
     // the optimizer's data, for each image it is working on
     List<OptData> optData
     Kc kc
+
+    // C's random(), and the random values each dither makes from it the first time
+    CRandom random
+    List<int> fsRandomValues
+    List<int> atkinsonRandomValues
 }
 
 Gt newGt(List<string> args) {
@@ -525,7 +530,8 @@ Gt newGt(List<string> args) {
         gifWriteInfo = newCompressInfo(), mode = BlankMode, nestedMode = 0, defOutput = blankOutputData(),
         activeOutput = blankOutputData(), clp = clpNewParser(args, ProgramName, utf8), stdinRead = false,
         stdin = fileReader(List<byte>()), mergerSets = List<nint>(), mergerIndexes = List<nint>(),
-        optData = List<OptData>(), kc = newKc(),
+        optData = List<OptData>(), kc = newKc(), random = newCRandom(), fsRandomValues = List<int>(),
+        atkinsonRandomValues = List<int>(),
     }
 }
 

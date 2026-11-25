@@ -42,8 +42,8 @@ The options are gifsicle's; its manual applies as it is.
 | Crop, flip, rotate, positions, extensions, comments, names, background, transparency | Done |
 | `-O1`, `-O2`, `-O3`, `-U` (unoptimize), `--careful` | Done |
 | Resizing (`--resize`, `--scale`, `--resize-colors` and every method) | Done |
-| Color reduction and dithering (`--colors`, `--use-colormap`, `--dither`, `--gamma`) | Not yet |
-| `--lossy` | Not yet |
+| Color reduction and dithering (`--colors`, `--color-method`, `--use-colormap`, `--dither`, `--gamma`) | Done |
+| `--lossy` | Done |
 | `--transform-colormap` | Not yet tested |
 | `-j` | Taken; resizing runs one frame after the other, which gives the same frames |
 
@@ -55,14 +55,19 @@ that C leaves to the compiler and the library decide some of them:
 - **Fused arithmetic.** C lets a compiler turn `a * b + c` within one expression into one fused
   multiply-add, rounded once, and clang does (`-ffp-contract=on`); SG never fuses on its own. Where
   gifsicle's arithmetic of floating point is fused as clang builds it (the mixing of pixels when
-  resizing, the weights of its filters, the tables of `--gamma`), the port writes the fusion out with
-  `fusedMultiplyAdd`. A gifsicle built without fusion (GCC on x86-64, by default) gives a different
+  resizing, the weights of its filters, the tables of `--gamma`, the Oklab colors, the blending and
+  median of colors when reducing them, the plans of ordered dithers, the score of `--lossy`), the port
+  writes the fusion out with `fusedMultiplyAdd`, as the machine code of gifsicle shows it. Where clang
+  turns `pow(0.25, y)` into `exp2(-2 * y)`, the port calls `exp2` too. A gifsicle built without fusion (GCC on x86-64, by default) gives a different
   pixel here and there.
 - **The order of `qsort`.** C's `qsort` does not keep the order of items that compare equal, and
   gifsicle sorts colors with it, so which of two equally popular colors comes first is the library's
   choice. The port sorts as the C library of macOS does (`src/qsort.sg`, from Apple's libc, itself
   from FreeBSD). The GNU library of Linux orders such ties differently, so a gifsicle built on Linux
-  can choose other colors for `--resize-colors` and, later, color reduction.
+  can choose other colors for `--resize-colors` and color reduction.
+- **`random()`.** Floyd-Steinberg and Atkinson dithers start from random errors that gifsicle takes
+  from C's `random()`, never seeded. The port has the same generator (`src/quantize.sg`); the C
+  libraries of macOS and Linux give the same numbers.
 
 ## Testing
 
@@ -77,7 +82,7 @@ python3 sg-gifsicle/tests/differ.py --quick    # without the GIF of 65535 by 655
 GIFSICLE_TESTS=gifsicle-1.99/test python3 sg-gifsicle/tests/testie.py
 ```
 
-`differ.py` runs both programs, each in a folder of its own, with over a hundred sets of options over
+`differ.py` runs both programs, each in a folder of its own, with two hundred sets of options over
 GIFs made from a seed by `tests/gifs.py` (small and large, animated, interlaced, with local color
 tables, transparency, every disposal, and broken ones), the icons of the system where there are
 some, and any folder given with `--gifs DIR`. The exit code, the output, the standard error and

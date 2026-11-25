@@ -53,6 +53,8 @@ struct CodeTable {
     double lossScale
     bool hasKcdiff
     List<uint> kcdiff
+    // the nodes the lossy encoder has still to explore
+    List<int> lossyStack
 }
 
 struct Writer {
@@ -72,7 +74,7 @@ CodeTable newCodeTable(read CompressInfo gcinfo, read Kc kc) {
         diffaccum = List<ulong>(), error = List<Wkcolor>(),
         links = int[LinksSpace](-1), clearCode = 0, maxLoss = 0, maxpos = 0, linksPos = 0,
         hasGlobalKcs = false, globalKcs = List<Kcolor>(), hasLocalKcs = false, localKcs = List<Kcolor>(),
-        kcsWhich = 0, lossScale = 0.0, hasKcdiff = false, kcdiff = List<uint>(),
+        kcsWhich = 0, lossScale = 0.0, hasKcdiff = false, kcdiff = List<uint>(), lossyStack = List<int>(),
     }
     if gcinfo.loss > 0 {
         gfc.maxLoss = (uint)gcinfo.loss * kcDistance(kcMake8g(kc, 0, 0, 0), kcMake8g(kc, 0, 0, 8))
@@ -81,6 +83,7 @@ CodeTable newCodeTable(read CompressInfo gcinfo, read Kc kc) {
         gfc.lossScale = 4.0 / (double)gfc.maxLoss
         gfc.diffaccum = List<ulong>.repeat(0, NodesSize)
         gfc.error = List<Wkcolor>.repeat(wkcZero(), NodesSize)
+        gfc.lossyStack = List<int>.repeat(0, NodesSize)
     }
     return gfc
 }
@@ -210,6 +213,174 @@ byte gfcPixel(read CodeTable gfc, read Image gfi, uint pos) {
         p = 0
     }
     return p
+}
+
+// ---- the lossy encoder: a code may stand for pixels whose colors are close to the image's ----
+
+void gfcLossyInit(ref Gt g, ref CodeTable gfc, nint gfs, read Image gfi) {
+    nint gfcm = gfi.local
+    if gfcm == None {
+        gfcm = g.streams[gfs].global
+    }
+    nint ncol = 0
+    if gfcm != None {
+        ncol = (nint)g.colormaps[gfcm].ncol
+    }
+    bool isLocal = gfi.local != None
+    int oldWhich = gfc.kcsWhich
+    // The global colormap is the same for every image, but local colormaps differ, so recompute
+    // local colors each time
+    bool has = gfc.hasGlobalKcs
+    if isLocal {
+        has = gfc.hasLocalKcs
+    }
+    if !has || isLocal {
+        var kcs = List<Kcolor>.repeat(kcolor(0, 0, 0), 256)
+        for i in 0..ncol {
+            kcs[i] = kcMakegfcg(read g.kc, g.colormaps[gfcm].col[i])
+        }
+        for i in ncol..256 {
+            kcs[i] = kcMake8g(read g.kc, 0, 0, 0)
+        }
+        if isLocal {
+            gfc.localKcs = kcs
+            gfc.hasLocalKcs = true
+        } else {
+            gfc.globalKcs = kcs
+            gfc.hasGlobalKcs = true
+        }
+    }
+    gfc.kcsWhich = 1
+    if isLocal {
+        gfc.kcsWhich = 2
+    }
+    if gfc.hasKcdiff && !isLocal && oldWhich == 1 {
+        return
+    }
+    if !gfc.hasKcdiff {
+        gfc.kcdiff = List<uint>.repeat(0, 256 * 256)
+        gfc.hasKcdiff = true
+    }
+    for i in 0..256 {
+        for j in 0..i {
+            uint d = kcDistance(gfcKc(read gfc, i), gfcKc(read gfc, j))
+            gfc.kcdiff[(i << 8) | j] = d
+            gfc.kcdiff[(j << 8) | i] = d
+        }
+        gfc.kcdiff[(i << 8) | i] = 0
+    }
+}
+
+// the color of pixel value `i` in the colormap being written
+Kcolor gfcKc(read CodeTable gfc, nint i) {
+    if gfc.kcsWhich == 2 {
+        return gfc.localKcs[i]
+    }
+    return gfc.globalKcs[i]
+}
+
+// difference between expected color a+dither and color b (used to calculate dithering required)
+Wkcolor diffusedDifference(read CodeTable gfc, byte expected, byte actual, Wkcolor error) {
+    var a = gfcKc(gfc, (nint)expected)
+    var b = gfcKc(gfc, (nint)actual)
+    var wkc = wkcZero()
+    for i in 0..3 {
+        wkc.a[i] = (int)a.a[i] - (int)b.a[i] + 3 * error.a[i] / 4
+    }
+    return wkc
+}
+
+bool gfcLossyCandidate(ref CodeTable gfc, read Image gfi, nint n, nint ch, byte expected) {
+    byte actual = gfc.suffix[ch & NodeMask]
+    // exact match
+    if expected == actual {
+        gfc.diffaccum[ch] = gfc.diffaccum[n]
+        gfc.error[ch] = diffusedDifference(read gfc, expected, expected, gfc.error[n])
+        return true
+    }
+    // transparency never matches
+    if (int)expected == gfi.transparent || (int)actual == gfi.transparent {
+        return false
+    }
+    // check local loss
+    uint diff = gfc.kcdiff[((nint)expected << 8) | (nint)actual]
+    if diff > gfc.maxLoss {
+        return false
+    }
+    // check accumulated loss
+    if !wkcIszero(gfc.error[n]) && kcDistance(kcAdjust(gfcKc(read gfc, (nint)expected), gfc.error[n]), gfcKc(read gfc, (nint)actual)) > gfc.maxLoss {
+        return false
+    }
+    // success
+    gfc.diffaccum[ch] = gfc.diffaccum[n].wrappingAdd((ulong)diff)
+    gfc.error[ch] = diffusedDifference(read gfc, expected, actual, gfc.error[n])
+    return true
+}
+
+// The node whose run of pixels from `pos` scores best: long, and with little loss. C fuses the
+// score's `length - diffaccum * loss_scale`.
+int gfcLookupLossy(ref CodeTable gfc, read Image gfi, uint pos) {
+    if pos == gfc.maxpos {
+        return -1
+    }
+
+    // initialize with first node
+    int best = gfcLookup(read gfc, -1, gfcPixel(read gfc, gfi, pos))
+    nint b = (nint)best
+    gfc.diffaccum[b] = 0
+    gfc.error[b] = wkcZero()
+    double bestScore = 1.0
+    gfc.lossyStack[0] = best
+    nint nstack = 1
+
+    // explore until stack is empty
+    while nstack > 0 {
+        nint n = (nint)gfc.lossyStack[nstack - 1]
+        uint tpos = pos + gfc.length[n & NodeMask]
+        nstack -= 1
+
+        // check if this node is better than current best
+        if (int)n != best {
+            double score = (-(double)gfc.diffaccum[n]).fusedMultiplyAdd(gfc.lossScale, (double)gfc.length[n & NodeMask])
+            if score > bestScore {
+                best = (int)n
+                bestScore = score
+            }
+        }
+
+        // reset error at start of line
+        if tpos == gfc.maxpos {
+            continue
+        }
+        if tpos % (uint)gfi.width == 0 {
+            gfc.error[n] = wkcZero()
+        }
+
+        byte expected = gfcPixel(read gfc, gfi, tpos)
+
+        // consider all children
+        if gfc.type[n & NodeMask] == TableType {
+            nint table = (nint)gfc.child[n & NodeMask]
+            for i in 0..(nint)gfc.clearCode {
+                int ch = gfc.links[(table + i) & LinkMask]
+                if ch >= 0 && gfcLossyCandidate(ref gfc, gfi, n, (nint)ch, expected) {
+                    gfc.lossyStack[nstack] = ch
+                    nstack += 1
+                }
+            }
+        } else {
+            int ch = gfc.child[n & NodeMask]
+            while ch >= 0 {
+                if gfcLossyCandidate(ref gfc, gfi, n, (nint)ch, expected) {
+                    gfc.lossyStack[nstack] = ch
+                    nstack += 1
+                }
+                ch = gfc.sibling[(nint)ch & NodeMask]
+            }
+        }
+    }
+
+    return best
 }
 
 const uint RunEwmaShift = 4
