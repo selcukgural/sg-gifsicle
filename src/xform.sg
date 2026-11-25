@@ -249,26 +249,37 @@ void flipImage(ref Gt g, nint gfi, ref Frame fr, bool isVert) {
     }
 }
 
-void rotateImage(ref Gt g, nint gfi, ref Frame fr, int rotation) {
-    nint width = (nint)g.images[gfi].width
-    nint height = (nint)g.images[gfi].height
-    var newData = List<byte>.withCapacity(width * height)
+// The pixels of `im` turned by a quarter (1) or three quarters (3), walked as C walks them.
+List<byte> turnedPixels(read Image im, int rotation) {
+    nint width = (nint)im.width
+    nint height = (nint)im.height
+    var out = List<byte>.repeat(0, width * height)
+    nint at = 0
     if rotation == 1 {
         for x in 0..width {
             for y in (0..height).reversed() {
-                newData.add(g.images[gfi].data[g.images[gfi].rows[y] + x])
+                out[at] = im.data[im.rows[y] + x]
+                at += 1
             }
         }
     } else {
         for x in (0..width).reversed() {
             for y in 0..height {
-                newData.add(g.images[gfi].data[g.images[gfi].rows[y] + x])
+                out[at] = im.data[im.rows[y] + x]
+                at += 1
             }
         }
     }
-    if newData.length() == 0 {
-        newData.add(0)
+    if out.length() == 0 {
+        out.add(0)
     }
+    return out
+}
+
+void rotateImage(ref Gt g, nint gfi, ref Frame fr, int rotation) {
+    nint width = (nint)g.images[gfi].width
+    nint height = (nint)g.images[gfi].height
+    var newData = turnedPixels(read g.images[gfi], rotation)
     int sw = (int)g.streams[fr.stream].screenWidth
     int sh = (int)g.streams[fr.stream].screenHeight
     int ntop = 0

@@ -13,9 +13,13 @@
 // `LinkMask`): the place is always inside, so the mask changes nothing, and the C compiler then
 // knows it is inside and checks nothing.
 //
-// The writer writes into memory; the file is written from it at the end.
+// The writer writes into memory. When it writes a GIF to a file or the output, what it holds goes
+// to that stream after each image once it is `SpillAt` bytes or more, as C's writes go into the
+// stream's buffer; when it compresses an image for `-O` or `--lossy`, the bytes stay in memory.
 
 const nint NodesSize = 4096
+// Bytes a writer to a stream holds before it hands them on.
+const nint SpillAt = 65536
 const nint LinksSize = 4096 + 256
 const nint NodeMask = NodesSize - 1
 // `links` is LinksSize long in C; here it is the next power of two, for the mask.
@@ -831,7 +835,19 @@ void writeGenericExtension(read Extension gfex, ref Writer grr) {
     gifPutByte(ref grr, 0)
 }
 
-void writeGif(ref Gt g, nint gfs, ref Writer grr) {
+// What the writer holds into `out`; after the first error, nothing more is written and the error is
+// kept in `failed`.
+void spill(ref Writer grr, ref StreamWriter out, ref IoError? failed) {
+    if failed is null && grr.v.length() > 0 {
+        match out.writeBytes(read grr.v) {
+            Ok => {}
+            Error(cause) => failed = cause
+        }
+    }
+    grr.v.clear()
+}
+
+void writeGif(ref Gt g, nint gfs, ref Writer grr, ref StreamWriter out, ref IoError? failed) {
     bool isgif89a = false
     if g.streams[gfs].endExtensions.length() > 0 || g.streams[gfs].loopcount > -1 {
         isgif89a = true
@@ -857,18 +873,23 @@ void writeGif(ref Gt g, nint gfs, ref Writer grr) {
     nint n = g.streams[gfs].images.length()
     for i in 0..n {
         gifIncrementalWriteImage(ref g, ref grr, gfs, g.streams[gfs].images[i])
+        if grr.v.length() >= SpillAt {
+            spill(ref grr, ref out, ref failed)
+        }
     }
     for gfex in read g.streams[gfs].endExtensions {
         writeGenericExtension(gfex, ref grr)
     }
     gifPutByte(ref grr, 0x3B)
+    spill(ref grr, ref out, ref failed)
 }
 
-// The GIF's bytes, as gifsicle writes them to a file.
-List<byte> gifFullWriteFile(ref Gt g, nint gfs, read CompressInfo? gcinfo) {
+// The GIF into `out`, as gifsicle writes it to a file: the first error the stream gave, if any.
+IoError? gifFullWriteFile(ref Gt g, nint gfs, read CompressInfo? gcinfo, ref StreamWriter out) {
     var grr = newWriter(read g.kc, gcinfo)
-    writeGif(ref g, gfs, ref grr)
-    return grr.v.replace(List<byte>())
+    IoError? failed = null
+    writeGif(ref g, gfs, ref grr, ref out, ref failed)
+    return failed
 }
 
 void gifIncrementalWriteImage(ref Gt g, ref Writer grr, nint gfs, nint gfi) {

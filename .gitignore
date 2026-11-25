@@ -2,3 +2,4 @@
 *.o
 /tests/corpus/
 __pycache__/
+/target/

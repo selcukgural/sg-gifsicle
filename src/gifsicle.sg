@@ -1235,21 +1235,33 @@ void doColormapChange(ref Gt g, nint gfs) {
 // ---- output ----
 
 void writeStream(ref Gt g, read string? outputName, nint gfs) {
+    var info = g.gifWriteInfo
     if outputName is null {
         if stdoutIsTerminal() {
             lerror(ref g, "<stdout>", "Is a terminal: try `-o OUTPUTFILE`", read List<string>())
             return
         }
-        var info = g.gifWriteInfo
-        var bytes = gifFullWriteFile(ref g, gfs, read info)
-        writeOutput(ref g, read bytes)
+        _ = gifFullWriteFile(ref g, gfs, read info, ref Stdout)
+        _ = Stdout.flush()
         g.anyOutputSuccessful = true
         return
     }
-    var info = g.gifWriteInfo
-    var bytes = gifFullWriteFile(ref g, gfs, read info)
-    match File.writeBytes(read outputName, read bytes) {
-        Ok => g.anyOutputSuccessful = true
+    // As C, the file is opened before the GIF is written, and nothing is done when it cannot be.
+    match File.createText(read outputName) {
+        Ok(opened) => {
+            var file = opened
+            var failed = gifFullWriteFile(ref g, gfs, read info, ref file)
+            match file.close() {
+                Ok => {}
+                Error(cause) => if failed is null {
+                    failed = cause
+                }
+            }
+            g.anyOutputSuccessful = true
+            if failed is not null {
+                lerror(ref g, outputName, "%s", read List<string> { ioErrorText(failed) })
+            }
+        }
         Error(cause) => lerror(ref g, outputName, "%s", read List<string> { ioErrorText(cause) })
     }
 }

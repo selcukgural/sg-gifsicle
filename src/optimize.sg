@@ -744,7 +744,11 @@ bool createSubimages(ref Gt g, ref Optimizer o, nint gfs, int optimizeFlags, boo
 
         // save previous data if necessary
         if disposal == GifDisposalPrevious {
-            previousData = o.thisData.clone()
+            if previousData.length() == 0 {
+                previousData = o.thisData.clone()
+            } else {
+                previousData.copyFrom(read o.thisData)
+            }
         }
 
         // set this_data equal to the current image
@@ -854,7 +858,11 @@ bool createSubimages(ref Gt g, ref Optimizer o, nint gfs, int optimizeFlags, boo
 
         // save last_data in case a retry changes this frame's disposal
         if disposal == GifDisposalPrevious {
-            previousLastData = o.lastData.clone()
+            if previousLastData.length() == 0 {
+                previousLastData = o.lastData.clone()
+            } else {
+                previousLastData.copyFrom(read o.lastData)
+            }
         }
 
         // Apply optimized disposal to last_data and unoptimized disposal to this_data.
