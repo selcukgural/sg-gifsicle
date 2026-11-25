@@ -1,2 +1,4 @@
 /gifsicle
 *.o
+/tests/corpus/
+__pycache__/

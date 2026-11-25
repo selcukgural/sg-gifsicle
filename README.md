@@ -50,3 +50,18 @@ The options are gifsicle's; its manual applies as it is.
 
 The tests compare the program with gifsicle 1.99 itself: gifsicle's own `testie` tests, and runs of
 both programs over generated GIFs with many options, where everything each writes is compared.
+They need Python 3, gifsicle 1.99 on the `PATH` (or named by `GIFSICLE`), with its `gifdiff`, and
+the program built as above (or named by `SG_GIFSICLE`):
+
+```
+python3 sg-gifsicle/tests/differ.py            # every GIF with every set of options
+python3 sg-gifsicle/tests/differ.py --quick    # without the GIF of 65535 by 65535 (8.6 GB a run)
+GIFSICLE_TESTS=gifsicle-1.99/test python3 sg-gifsicle/tests/testie.py
+```
+
+`differ.py` runs both programs, each in a folder of its own, with about seventy sets of options over
+GIFs made from a seed by `tests/gifs.py` (small and large, animated, interlaced, with local color
+tables, transparency, every disposal, and broken ones), the icons of the system where there are
+some, and any folder given with `--gifs DIR`. The exit code, the output, the standard error and
+every file written must be the same. `testie.py` runs gifsicle's own tests from its source; the
+tests that resize or reduce colors wait for those parts.
