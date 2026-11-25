@@ -44,7 +44,7 @@ The options are gifsicle's; its manual applies as it is.
 | Resizing (`--resize`, `--scale`, `--resize-colors` and every method) | Done |
 | Color reduction and dithering (`--colors`, `--color-method`, `--use-colormap`, `--dither`, `--gamma`) | Done |
 | `--lossy` | Done |
-| `--transform-colormap` | Not yet tested |
+| `--transform-colormap` | Done |
 | `-j` | Taken; resizing runs one frame after the other, which gives the same frames |
 
 ### The same bytes, and where they come from
@@ -82,7 +82,7 @@ python3 sg-gifsicle/tests/differ.py --quick    # without the GIF of 65535 by 655
 GIFSICLE_TESTS=gifsicle-1.99/test python3 sg-gifsicle/tests/testie.py
 ```
 
-`differ.py` runs both programs, each in a folder of its own, with two hundred sets of options over
+`differ.py` runs both programs, each in a folder of its own, with over two hundred sets of options over
 GIFs made from a seed by `tests/gifs.py` (small and large, animated, interlaced, with local color
 tables, transparency, every disposal, and broken ones), the icons of the system where there are
 some, and any folder given with `--gifs DIR`. The exit code, the output, the standard error and

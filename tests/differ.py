@@ -71,6 +71,12 @@ OPTIONS = [
     ["--lossy"], ["--lossy=0"], ["--lossy=1"], ["--lossy=80"], ["--lossy=400"], ["--lossy=80", "-O3"],
     ["--lossy=60", "-i"], ["--lossy=50", "--careful"], ["--lossy=30", "--colors", "32", "--dither"],
     ["--lossy=100", "-U", "-O2"], ["--lossy=200", "--gamma", "1.5"], ["--lossy=-1"],
+    # a shell command given the colormap
+    ["--transform-colormap", "cat"], ["--transform-colormap", "sed s/0/9/g", "--colors", "8"],
+    ["--transform-colormap", "awk '{print 255-$1, 255-$2, 255-$3}'"], ["--transform-colormap", "false"],
+    ["--transform-colormap", "head -n 1"], ["--transform-colormap", "cat; echo 1 2 3"], ["--transform-colormap", "true"],
+    ["--transform-colormap", "echo bad"], ["--transform-colormap", "cat >&2"], ["--transform-colormap", "exit 3"],
+    ["--transform-colormap", "cat", "--transform-colormap", "sort -r", "-O2"],
 ]
 HEAVY = {"e-bad-frame-too-large.gif"}
 HEAVY_OPTIONS = [[], ["-I"], ["-O2"], ["-U"], ["--crop", "3,3+20x15"], ["--colors", "8"], ["--lossy=80"]]
