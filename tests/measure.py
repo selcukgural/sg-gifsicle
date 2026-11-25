@@ -52,6 +52,29 @@ def photo(seed, width, height):
     return w.end()
 
 
+def photo_frames(seed, width, height, frames):
+    """`frames` frames of `width` by `height` in smooth shapes that move, each the whole screen, one
+    palette for all: an animation `-j` resizes on several threads."""
+    rng = random.Random(f"gif-photos-{seed}")
+    colors = [(rng.randrange(256), rng.randrange(256), rng.randrange(256)) for _ in range(256)]
+    colors.sort(key=lambda c: (c[0] // 32, c[1] // 32 if (c[0] // 32) % 2 == 0 else 7 - c[1] // 32, c[2]))
+    w = made.Writer(width, height, colors, loop=0)
+    for i in range(frames):
+        cx, cy = width * (0.2 + 0.6 * i / frames), height * (0.7 - 0.3 * i / frames)
+        rows = []
+        for y in range(height):
+            r = bytearray(width)
+            for x in range(width):
+                d = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
+                v = (x * 255 // max(1, width - 1) + int(d / 7) + (y // 9) * 3 + i) % 256
+                if (x ^ y ^ i) & 7 == 0:
+                    v = (v + rng.randrange(-6, 7)) % 256
+                r[x] = v
+            rows.append(bytes(r))
+        w.frame(0, 0, width, height, b"".join(rows), disposal=1, delay=5)
+    return w.end()
+
+
 INPUTS = {
     # name -> (how it is made, what it is)
     "small": (lambda: made.animation("measure-small", 120, 90, 40), "an animation of 40 frames of 120 by 90 (23 KB)"),
@@ -59,6 +82,7 @@ INPUTS = {
     "animation-full": (lambda: made.animation(2, 480, 270, 300, small=False), "an animation of 300 frames of 480 by 270, each up to the whole screen (4.3 MB)"),
     "photo-medium": (lambda: photo(1, 800, 600), "one frame of 800 by 600 in smooth shapes"),
     "photo-large": (lambda: photo(2, 4000, 3000), "one frame of 4000 by 3000 in smooth shapes"),
+    "photo-frames": (lambda: photo_frames(1, 800, 600, 40), "an animation of 40 frames of 800 by 600 in smooth shapes, each the whole screen"),
     "large": (lambda: made.large(1, 4000), "one frame of 4000 by 4000, stripes with noise"),
 }
 
@@ -77,6 +101,8 @@ CASES = [
     ("medium", "--scale 2", "photo-medium", ["--scale", "2", "{in}", "-o", "{out}"]),
     ("medium", "--colors 64", "photo-medium", ["--colors", "64", "{in}", "-o", "{out}"]),
     ("medium", "--colors 64 --dither", "photo-medium", ["--colors", "64", "--dither", "{in}", "-o", "{out}"]),
+    ("medium", "--scale 0.5 --resize-method lanczos3", "photo-frames", ["--scale", "0.5", "--resize-method", "lanczos3", "{in}", "-o", "{out}"]),
+    ("medium", "-j8 --scale 0.5 --resize-method lanczos3", "photo-frames", ["-j8", "--scale", "0.5", "--resize-method", "lanczos3", "{in}", "-o", "{out}"]),
     ("large", "read and written", "large", ["{in}", "-o", "{out}"]),
     ("large", "read and written", "photo-large", ["{in}", "-o", "{out}"]),
     ("large", "--rotate-90", "large", ["--rotate-90", "{in}", "-o", "{out}"]),

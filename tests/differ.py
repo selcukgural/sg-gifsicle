@@ -46,6 +46,11 @@ OPTIONS = [
     ["--resize-colors", "8", "--resize-method", "box", "--scale", "0.5"],
     ["-U", "--resize", "50x40"], ["--resize", "50x40", "-O3"], ["-j4", "--resize", "40x40"], ["-j4", "-U", "--resize", "40x40"],
     ["-j4", "-U", "--resize-colors", "128", "--resize-method", "catrom", "--resize", "40x40"],
+    ["-j2", "--scale", "0.6"], ["-j8", "--resize-method", "lanczos3", "--resize", "45x33"], ["-j", "--resize", "20x20"],
+    ["-j3", "--resize-colors", "40", "--resize-method", "mix", "--scale", "1.7"], ["--threads=5", "--resize-method", "box", "--scale", "0.5"],
+    ["-j4", "--resize-colors", "256", "--resize-method", "mitchell", "--scale", "0.4"], ["-j4", "--resize-method", "catrom", "--scale", "1.3", "-O2"],
+    ["-j200", "--resize-method", "lanczos2", "--resize", "30x70"], ["-j", "--no-threads", "--resize", "20x20"], ["-j2", "--colors", "8", "--resize", "40x30"],
+    ["-j16", "--resize-colors", "4", "--resize-method", "sample", "--scale", "0.7"], ["-j0", "--resize", "25x25"],
     ["--crop", "2,2+20x20", "--resize", "10x30"], ["--rotate-90", "--scale", "0.8"], ["-t", "#000000", "--scale", "0.7"],
     # colors: reducing, dithering, colormaps, gamma
     *[["--colors", n] for n in ("2", "3", "7", "16", "129", "255", "256")],
@@ -100,6 +105,13 @@ def corpus():
     put("test-animation.gif", made.animation("test", 120, 90, 40))
     put("own-colors.gif", made.animation("own", 100, 70, 30, colors=256, shared=False))
     put("many-colors.gif", made.many_colors())
+    # frames that cover the screen, as -j resizes on several threads
+    put("j-opaque.gif", made.full_frames("opaque", 64, 48, 30))
+    put("j-local.gif", made.full_frames("local", 50, 40, 24, local=0.4))
+    put("j-clear.gif", made.full_frames("clear", 40, 56, 24, transparency=0.4))
+    put("j-mixed.gif", made.full_frames("mixed", 90, 70, 40, colors=100, local=0.3, transparency=0.3))
+    put("j-damaged.gif", made.full_frames("damaged", 30, 30, 16, local=0.3, damaged=True))
+    put("j-large.gif", made.full_frames("large", 320, 240, 24, colors=256, local=0.2, transparency=0.2))
     rng = made.random.Random("port")
     for i in range(150):
         put(f"a{i:03d}.gif", made.animation(f"p{i}", rng.randrange(4, 80), rng.randrange(4, 80), rng.randrange(1, 12),

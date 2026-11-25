@@ -9,8 +9,11 @@
 // The frame buffers and the scaling context are values here, and the kd-tree in use is one of
 // the context's two, named by `local`. The scaled frame is built beside the frame it comes from
 // (`ScaledImage`), which takes its place at the end, as C copies `gfo` over `*gfi`.
-// gifsicle can resize the frames of an unoptimized GIF on several threads (`-j`); here they are
-// resized one after the other, which gives the same frames.
+// A frame is taken out of the program's state while it is resized (`ScaleFrame`), with its local
+// colormap; what all frames are resized with is taken out beside it (`ScaleEnv`). The frames of an
+// unoptimized GIF can then be resized on several threads (`-j`), as in gifsicle: each thread owns
+// the frames it is given and a copy of what they are resized with, so no lock is needed where C
+// has three.
 
 // ---- kcscreen: a frame buffer of kacolors, one per pixel ----
 
@@ -39,15 +42,9 @@ void kcscreenReset(ref Kcscreen kcs) {
 }
 
 // the background is transparent, as in browsers
-void kcscreenInit(ref Kcscreen kcs, read Stream gfs, nint sw, nint sh) {
+void kcscreenInit(ref Kcscreen kcs, nint sw, nint sh) {
     kcs.width = sw
-    if sw <= 0 {
-        kcs.width = (nint)gfs.screenWidth
-    }
     kcs.height = sh
-    if sh <= 0 {
-        kcs.height = (nint)gfs.screenHeight
-    }
     kcs.bg = kacTransparent()
     kcs.data = List<Kacolor>.repeat(kcs.bg, kcs.width * kcs.height)
     kcs.hasData = true
@@ -120,15 +117,9 @@ void ksscreenReset(ref Ksscreen kss) {
     }
 }
 
-void ksscreenInit(ref Ksscreen kss, read Stream gfs, nint sw, nint sh) {
+void ksscreenInit(ref Ksscreen kss, nint sw, nint sh) {
     kss.width = sw
-    if sw <= 0 {
-        kss.width = (nint)gfs.screenWidth
-    }
     kss.height = sh
-    if sh <= 0 {
-        kss.height = (nint)gfs.screenHeight
-    }
     kss.bg = scZero()
     kss.data = List<ScaleColor>.repeat(kss.bg, kss.width * kss.height)
     kss.hasData = true
@@ -222,8 +213,6 @@ struct ScaledImage {
 }
 
 struct ScaleContext {
-    nint gfs
-    nint gfi
     int imageno
     // which tree is in use: the local one (`localKd3`) or the global one
     bool local
@@ -243,11 +232,10 @@ struct ScaleContext {
     int scaleColors
 }
 
-ScaleContext sctxInit(read Stream gfs, nint stream, nint nw, nint nh) {
-    nint sw = (nint)gfs.screenWidth
-    nint sh = (nint)gfs.screenHeight
+// the context for a screen of `sw` x `sh` resized to `nw` x `nh`
+ScaleContext sctxInit(nint sw, nint sh, nint nw, nint nh) {
     return ScaleContext {
-        gfs = stream, gfi = None, imageno = 0, local = false,
+        imageno = 0, local = false,
         iscr = ksscreenClear(sw, sh), oscr = kcscreenClear(nw, nh), xscr = kcscreenClear(nw, nh),
         ixf = (float)((double)nw / (double)sw), iyf = (float)((double)nh / (double)sh),
         oxf = (float)((double)sw / (double)nw), oyf = (float)((double)sh / (double)nh),
@@ -271,11 +259,11 @@ int sctxClosest(ref ScaleContext sctx, Kcolor k, ref uint dist) {
     return kd3ClosestTransformed(ref sctx.globalKd3, k, ref dist)
 }
 
-void sctxAdd8g(ref Gt g, ref ScaleContext sctx, Color c) {
+void sctxAdd8g(read Kc kc, ref ScaleContext sctx, Color c) {
     if sctx.local {
-        kd3Add8g(read g.kc, ref sctx.localKd3, (int)c.red, (int)c.green, (int)c.blue)
+        kd3Add8g(read kc, ref sctx.localKd3, (int)c.red, (int)c.green, (int)c.blue)
     } else {
-        kd3Add8g(read g.kc, ref sctx.globalKd3, (int)c.red, (int)c.green, (int)c.blue)
+        kd3Add8g(read kc, ref sctx.globalKd3, (int)c.red, (int)c.green, (int)c.blue)
     }
 }
 
@@ -294,15 +282,14 @@ int sctxNitems(read ScaleContext sctx) {
     return sctx.globalKd3.nitems
 }
 
-void scaleImageDataPoint(ref Gt g, ref ScaleContext sctx, ref ScaledImage gfo) {
-    nint gfi = sctx.gfi
-    int gleft = (int)g.images[gfi].left
-    int gtop = (int)g.images[gfi].top
+void scaleImageDataPoint(read Image gfi, ref ScaleContext sctx, ref ScaledImage gfo) {
+    int gleft = (int)gfi.left
+    int gtop = (int)gfi.top
     var xoff = List<ushort>.repeat(0, (nint)gfo.width)
     for xo in 0..gfo.width {
         xoff[(nint)xo] = (ushort)((int)(((double)(gfo.left + xo) + 0.5) * (double)sctx.oxf) - gleft)
     }
-    pointRows(ref gfo.data, read g.images[gfi].data, read g.images[gfi].rows, read xoff, gfo.top, gfo.height, (double)sctx.oyf, gtop)
+    pointRows(ref gfo.data, read gfi.data, read gfi.rows, read xoff, gfo.top, gfo.height, (double)sctx.oyf, gtop)
 }
 
 // the rows of the frame, each pixel taken from its place in the input frame
@@ -319,32 +306,29 @@ void pointRows(ref List<byte> out, read List<byte> data, read List<nint> rows, r
     }
 }
 
-void scaleImageUpdateGlobalKd3(ref Gt g, ref ScaleContext sctx) {
-    nint gfcm = g.streams[sctx.gfs].global
-    while sctx.globalKd3.nitems < g.colormaps[gfcm].ncol {
-        var c = g.colormaps[gfcm].col[(nint)sctx.globalKd3.nitems]
-        kd3Add8g(read g.kc, ref sctx.globalKd3, (int)c.red, (int)c.green, (int)c.blue)
+void scaleImageUpdateGlobalKd3(read ScaleEnv env, ref ScaleContext sctx) {
+    while sctx.globalKd3.nitems < env.global.ncol {
+        var c = env.global.col[(nint)sctx.globalKd3.nitems]
+        kd3Add8g(read env.kc, ref sctx.globalKd3, (int)c.red, (int)c.green, (int)c.blue)
     }
 }
 
-void scaleImagePrepare(ref Gt g, ref ScaleContext sctx) {
-    nint gfi = sctx.gfi
-    nint local = g.images[gfi].local
-    if local != None {
+void scaleImagePrepare(read ScaleFrame f, read ScaleEnv env, ref ScaleContext sctx) {
+    if f.hasLocal {
         sctx.local = true
-        kd3InitBuild(read g.kc, ref sctx.localKd3, Kd3Gamma, g.colormaps[local])
+        kd3InitBuild(read env.kc, ref sctx.localKd3, Kd3Gamma, read f.local)
     } else {
         sctx.local = false
         if !sctx.globalKd3.live {
             kd3Init(ref sctx.globalKd3, Kd3Gamma)
         }
-        scaleImageUpdateGlobalKd3(ref g, ref sctx)
+        scaleImageUpdateGlobalKd3(read env, ref sctx)
         if !sctx.globalKd3.hasTree {
             kd3Build(ref sctx.globalKd3)
         }
         kd3EnableAll(ref sctx.globalKd3)
     }
-    int transparent = g.images[gfi].transparent
+    int transparent = f.image.transparent
     if transparent >= 0 && transparent < sctxNitems(sctx) {
         sctxDisable(ref sctx, transparent)
     }
@@ -352,24 +336,24 @@ void scaleImagePrepare(ref Gt g, ref ScaleContext sctx) {
     // apply image to sctx.iscr
     if !sctx.iscr.hasData {
         // first image, set up screens
-        ksscreenInit(ref sctx.iscr, g.streams[sctx.gfs], 0, 0)
-        kcscreenInit(ref sctx.oscr, g.streams[sctx.gfs], sctx.oscr.width, sctx.oscr.height)
-        kcscreenInit(ref sctx.xscr, g.streams[sctx.gfs], sctx.xscr.width, sctx.xscr.height)
+        ksscreenInit(ref sctx.iscr, sctx.iscr.width, sctx.iscr.height)
+        kcscreenInit(ref sctx.oscr, sctx.oscr.width, sctx.oscr.height)
+        kcscreenInit(ref sctx.xscr, sctx.xscr.width, sctx.xscr.height)
     }
     if sctx.local {
-        ksscreenApply(ref sctx.iscr, g.images[gfi], read sctx.localKd3.ks)
+        ksscreenApply(ref sctx.iscr, read f.image, read sctx.localKd3.ks)
     } else {
-        ksscreenApply(ref sctx.iscr, g.images[gfi], read sctx.globalKd3.ks)
+        ksscreenApply(ref sctx.iscr, read f.image, read sctx.globalKd3.ks)
     }
 }
 
-void scaleImageOutputRow(read Gt g, ref ScaleContext sctx, ref List<ScaleColor> sc, read ScaledImage gfo, int yo) {
+void scaleImageOutputRow(read Image gfi, ref ScaleContext sctx, ref List<ScaleColor> sc, read ScaledImage gfo, int yo) {
     nint oscr = sctx.xscr.width * (nint)(yo + gfo.top) + (nint)gfo.left
 
     // if the input image has no transparent color, output is opaque wherever any input pixel
     // contributed
     float minAlpha = 0.0
-    if g.images[sctx.gfi].transparent >= 0 {
+    if gfi.transparent >= 0 {
         minAlpha = (float)(KcMax / 4)
     }
     for xo in 0..(nint)gfo.width {
@@ -398,13 +382,8 @@ void scaleImageOutputRow(read Gt g, ref ScaleContext sctx, ref List<ScaleColor> 
     }
 }
 
-bool scaleImageAddColors(ref Gt g, ref ScaleContext sctx, read ScaledImage gfo) {
-    nint gfi = sctx.gfi
-    nint gfcm = g.images[gfi].local
-    if gfcm == None {
-        gfcm = g.streams[sctx.gfs].global
-    }
-    int transparent = g.images[gfi].transparent
+// `gfcm` is the frame's colormap, local or global; colors are added to it.
+bool scaleImageAddColors(ref Colormap gfcm, read Kc kc, int transparent, ref ScaleContext sctx, read ScaledImage gfo) {
 
     var kch = kchistInit()
     for yo in 0..(nint)gfo.height {
@@ -416,51 +395,50 @@ bool scaleImageAddColors(ref Gt g, ref ScaleContext sctx, read ScaledImage gfo) 
             }
         }
     }
-    for i in 0..(nint)g.colormaps[gfcm].ncol {
-        _ = kchistAdd(ref kch, kcMakegfcg(read g.kc, g.colormaps[gfcm].col[i]), 0xFFFFFFFF)
+    for i in 0..(nint)gfcm.ncol {
+        _ = kchistAdd(ref kch, kcMakegfcg(read kc, gfcm.col[i]), 0xFFFFFFFF)
     }
     kchistCompress(ref kch)
 
     var div = kcdiversityInit(ref kch, false)
     int i = 0
-    while i != kch.n && i != g.colormaps[gfcm].ncol && kch.h[(nint)i].count == 0xFFFFFFFF {
+    while i != kch.n && i != gfcm.ncol && kch.h[(nint)i].count == 0xFFFFFFFF {
         _ = kcdiversityChoose(ref div, read kch, i, false)
         i += 1
     }
 
     int nadded = 0
-    while g.colormaps[gfcm].ncol < sctx.scaleColors {
+    while gfcm.ncol < sctx.scaleColors {
         int chosen = kcdiversityFindDiverse(read div, read kch, 0.0)
         if chosen >= kch.n || div.minDist[(nint)chosen] <= sctx.maxDesiredDist {
             break
         }
         _ = kcdiversityChoose(ref div, read kch, chosen, false)
-        var gfc = kcTogfcg(read g.kc, kacK(kch.h[(nint)chosen].ka))
+        var gfc = kcTogfcg(read kc, kacK(kch.h[(nint)chosen].ka))
         // Rounding to 8 bits can yield a color already in the colormap (the rounding error can
         // exceed max_desired_dist); don't add it again.
-        if gifFindColor(g.colormaps[gfcm], gfc) >= 0 {
+        if gifFindColor(read gfcm, gfc) >= 0 {
             continue
         }
         // The transparent index can't hold an opaque color; give it a disabled placeholder.
-        if g.colormaps[gfcm].ncol == transparent {
-            _ = gifAddColor(ref g.colormaps[gfcm], gfc, g.colormaps[gfcm].ncol)
-            sctxAdd8g(ref g, ref sctx, gfc)
+        if gfcm.ncol == transparent {
+            _ = gifAddColor(ref gfcm, gfc, gfcm.ncol)
+            sctxAdd8g(read kc, ref sctx, gfc)
             sctxDisable(ref sctx, transparent)
-            if g.colormaps[gfcm].ncol == sctx.scaleColors {
+            if gfcm.ncol == sctx.scaleColors {
                 break
             }
         }
-        _ = gifAddColor(ref g.colormaps[gfcm], gfc, g.colormaps[gfcm].ncol)
-        sctxAdd8g(ref g, ref sctx, gfc)
+        _ = gifAddColor(ref gfcm, gfc, gfcm.ncol)
+        sctxAdd8g(read kc, ref sctx, gfc)
         nadded += 1
     }
     return nadded != 0
 }
 
-void scaleImageComplete(ref Gt g, ref ScaleContext sctx, ref ScaledImage gfo) {
-    nint gfi = sctx.gfi
-    int transparent = g.images[gfi].transparent
-    bool isLocal = g.images[gfi].local != None
+void scaleImageComplete(ref ScaleFrame f, ref ScaleEnv env, ref ScaleContext sctx, ref ScaledImage gfo) {
+    int transparent = f.image.transparent
+    bool isLocal = f.hasLocal
     while true {
         uint maxDist = 0
         uint dist = 0
@@ -498,9 +476,8 @@ void scaleImageComplete(ref Gt g, ref ScaleContext sctx, ref ScaledImage gfo) {
 
         // if the global colormap has changed, we must retry (in C only with threads)
         if !isLocal {
-            nint gfcm = g.streams[sctx.gfs].global
-            if g.colormaps[gfcm].ncol > sctx.globalKd3.nitems {
-                scaleImageUpdateGlobalKd3(ref g, ref sctx)
+            if env.global.ncol > sctx.globalKd3.nitems {
+                scaleImageUpdateGlobalKd3(read env, ref sctx)
                 if transparent >= 0 && transparent < sctx.globalKd3.nitems {
                     kd3Disable(ref sctx.globalKd3, transparent)
                 }
@@ -510,11 +487,11 @@ void scaleImageComplete(ref Gt g, ref ScaleContext sctx, ref ScaledImage gfo) {
 
         // maybe add some colors
         if maxDist > sctx.maxDesiredDist {
-            nint gfcm = g.images[gfi].local
-            if gfcm == None {
-                gfcm = g.streams[sctx.gfs].global
-            }
-            if g.colormaps[gfcm].ncol < sctx.scaleColors && scaleImageAddColors(ref g, ref sctx, gfo) {
+            if isLocal {
+                if f.local.ncol < sctx.scaleColors && scaleImageAddColors(ref f.local, read env.kc, transparent, ref sctx, gfo) {
+                    continue
+                }
+            } else if env.global.ncol < sctx.scaleColors && scaleImageAddColors(ref env.global, read env.kc, transparent, ref sctx, gfo) {
                 continue
             }
         }
@@ -522,9 +499,9 @@ void scaleImageComplete(ref Gt g, ref ScaleContext sctx, ref ScaledImage gfo) {
     }
 
     // apply disposal to sctx.iscr and sctx.oscr
-    if (nint)sctx.imageno != g.streams[sctx.gfs].images.length() - 1 {
-        ksscreenDispose(ref sctx.iscr, g.images[gfi])
-        int disposal = (int)g.images[gfi].disposal
+    if (nint)sctx.imageno != env.nimages - 1 {
+        ksscreenDispose(ref sctx.iscr, read f.image)
+        int disposal = (int)f.image.disposal
         if disposal == GifDisposalBackground {
             kcscreenDispose(ref sctx.oscr, gfo)
         } else if disposal != GifDisposalPrevious {
@@ -577,11 +554,11 @@ PixelRange2 makePixelRange2(int xi, int maxi, int maxo, float f) {
     return pr
 }
 
-void scaleImageDataBox(ref Gt g, ref ScaleContext sctx, ref ScaledImage gfo) {
+void scaleImageDataBox(ref ScaleFrame f, ref ScaleEnv env, ref ScaleContext sctx, ref ScaledImage gfo) {
     nint width = (nint)gfo.width
     var xpr = List<PixelRange>.repeat(PixelRange { lo = 0, hi = 0 }, width)
     var sc = List<ScaleColor>.repeat(scZero(), width)
-    scaleImagePrepare(ref g, ref sctx)
+    scaleImagePrepare(read f, read env, ref sctx)
 
     // input column range for each output column; ranges overlap when upscaling
     for xo in 0..width {
@@ -605,10 +582,10 @@ void scaleImageDataBox(ref Gt g, ref ScaleContext sctx, ref ScaledImage gfo) {
             sc[xo] = mix
         }
         // generate output
-        scaleImageOutputRow(g, ref sctx, ref sc, gfo, yo)
+        scaleImageOutputRow(read f.image, ref sctx, ref sc, gfo, yo)
     }
 
-    scaleImageComplete(ref g, ref sctx, ref gfo)
+    scaleImageComplete(ref f, ref env, ref sctx, ref gfo)
 }
 
 float mixFactor(int val, float b0, float b1) {
@@ -629,12 +606,12 @@ struct ScaleMixinfo : Copyable {
     float f
 }
 
-void scaleImageDataMix(ref Gt g, ref ScaleContext sctx, ref ScaledImage gfo) {
+void scaleImageDataMix(ref ScaleFrame f, ref ScaleEnv env, ref ScaleContext sctx, ref ScaledImage gfo) {
     nint width = (nint)gfo.width
     var sc = List<ScaleColor>.repeat(scZero(), width)
     var mix = List<ScaleMixinfo>.withCapacity(sctx.iscr.width * 2)
 
-    scaleImagePrepare(ref g, ref sctx)
+    scaleImagePrepare(read f, read env, ref sctx)
 
     // construct mixinfo
     for xo in 0..width {
@@ -659,10 +636,10 @@ void scaleImageDataMix(ref Gt g, ref ScaleContext sctx, ref ScaledImage gfo) {
             }
         }
         // generate output
-        scaleImageOutputRow(g, ref sctx, ref sc, gfo, yo)
+        scaleImageOutputRow(read f.image, ref sctx, ref sc, gfo, yo)
     }
 
-    scaleImageComplete(ref g, ref sctx, ref gfo)
+    scaleImageComplete(ref f, ref env, ref sctx, ref gfo)
 }
 
 void scaleWeightsetAdd(ref List<ScaleWeight> wset, int ipos, int opos, double w) {
@@ -764,7 +741,7 @@ void scaleWeightsetCreate(ref List<ScaleWeight> wset, int nin, int nout, int kin
     scaleWeightsetAdd(ref wset, nin, nout, 0.0)
 }
 
-void scaleImageDataWeighted(ref Gt g, ref ScaleContext sctx, ref ScaledImage gfo, int kind, double radius) {
+void scaleImageDataWeighted(ref ScaleFrame f, ref ScaleEnv env, ref ScaleContext sctx, ref ScaledImage gfo, int kind, double radius) {
     nint width = (nint)gfo.width
     var sc = List<ScaleColor>.repeat(scZero(), width)
     var kcx = List<ScaleColor>.repeat(scZero(), width * sctx.iscr.height)
@@ -774,7 +751,7 @@ void scaleImageDataWeighted(ref Gt g, ref ScaleContext sctx, ref ScaledImage gfo
         scaleWeightsetCreate(ref sctx.yweights, (int)sctx.iscr.height, (int)sctx.oscr.height, kind, radius)
     }
 
-    scaleImagePrepare(ref g, ref sctx)
+    scaleImagePrepare(read f, read env, ref sctx)
 
     // scale every input row by the X scaling factor
     double oyf = (double)sctx.oyf
@@ -827,10 +804,10 @@ void scaleImageDataWeighted(ref Gt g, ref ScaleContext sctx, ref ScaledImage gfo
             w += 1
         }
         // generate output
-        scaleImageOutputRow(g, ref sctx, ref sc, gfo, yo)
+        scaleImageOutputRow(read f.image, ref sctx, ref sc, gfo, yo)
     }
 
-    scaleImageComplete(ref g, ref sctx, ref gfo)
+    scaleImageComplete(ref f, ref env, ref sctx, ref gfo)
 }
 
 int scaleClipCoord(double v, int max) {
@@ -842,13 +819,12 @@ int scaleClipCoord(double v, int max) {
     return (int)v
 }
 
-void scaleImage(ref Gt g, ref ScaleContext sctx, int method) {
-    nint gfi = sctx.gfi
-    bool wasCompressed = !g.images[gfi].hasImg
-    int gleft = (int)g.images[gfi].left
-    int gtop = (int)g.images[gfi].top
-    int gwidth = (int)g.images[gfi].width
-    int gheight = (int)g.images[gfi].height
+void scaleImage(ref ScaleFrame f, ref ScaleEnv env, ref ScaleContext sctx, int method) {
+    bool wasCompressed = !f.image.hasImg
+    int gleft = (int)f.image.left
+    int gtop = (int)f.image.top
+    int gwidth = (int)f.image.width
+    int gheight = (int)f.image.height
     int ow = (int)sctx.oscr.width
     int oh = (int)sctx.oscr.height
 
@@ -882,7 +858,7 @@ void scaleImage(ref Gt g, ref ScaleContext sctx, int method) {
         top = bottom
     }
     var gfo = ScaledImage { left = left, top = top, width = right - left, height = bottom - top,
-        transparent = g.images[gfi].transparent, disposal = (int)g.images[gfi].disposal, data = List<byte>() }
+        transparent = f.image.transparent, disposal = (int)f.image.disposal, data = List<byte>() }
 
     // Point scaling method is special: rather than rendering the input image into a frame buffer,
     // it works on per-frame data. Thus we must verify that the output bounds completely fit into
@@ -921,40 +897,47 @@ void scaleImage(ref Gt g, ref ScaleContext sctx, int method) {
         gfo.disposal = GifDisposalAsis
     } else {
         if wasCompressed {
-            _ = gifUncompressImage(ref g, sctx.gfs, gfi)
+            // what is found is reported when the frame is back in the program's state
+            var gfc = newContext(None, None, HandlerDefault)
+            _ = uncompressFrame(ref f.image, ref gfc)
+            f.errors = gfc.errors
+            f.kept = gfc.kept.replace(List<KeptMessage>())
         }
         gfo.data = List<byte>.repeat(0, (nint)gfo.width * (nint)gfo.height)
         if method == ScaleMethodMix {
-            scaleImageDataMix(ref g, ref sctx, ref gfo)
+            scaleImageDataMix(ref f, ref env, ref sctx, ref gfo)
         } else if method == ScaleMethodBox {
-            scaleImageDataBox(ref g, ref sctx, ref gfo)
+            scaleImageDataBox(ref f, ref env, ref sctx, ref gfo)
         } else if method == ScaleMethodCatrom {
-            scaleImageDataWeighted(ref g, ref sctx, ref gfo, WeightCatrom, 2.0)
+            scaleImageDataWeighted(ref f, ref env, ref sctx, ref gfo, WeightCatrom, 2.0)
         } else if method == ScaleMethodLanczos2 {
-            scaleImageDataWeighted(ref g, ref sctx, ref gfo, WeightLanczos2, 2.0)
+            scaleImageDataWeighted(ref f, ref env, ref sctx, ref gfo, WeightLanczos2, 2.0)
         } else if method == ScaleMethodLanczos3 {
-            scaleImageDataWeighted(ref g, ref sctx, ref gfo, WeightLanczos3, 3.0)
+            scaleImageDataWeighted(ref f, ref env, ref sctx, ref gfo, WeightLanczos3, 3.0)
         } else if method == ScaleMethodMitchell {
-            scaleImageDataWeighted(ref g, ref sctx, ref gfo, WeightMitchell, 2.0)
+            scaleImageDataWeighted(ref f, ref env, ref sctx, ref gfo, WeightMitchell, 2.0)
         } else {
-            scaleImageDataPoint(ref g, ref sctx, ref gfo)
+            scaleImageDataPoint(read f.image, ref sctx, ref gfo)
         }
     }
 
     // the scaled frame takes the place of the frame
-    gifReleaseUncompressedImage(ref g, gfi)
-    gifReleaseCompressedImage(ref g, gfi)
-    g.images[gfi].left = u16(gfo.left)
-    g.images[gfi].top = u16(gfo.top)
-    g.images[gfi].width = u16(gfo.width)
-    g.images[gfi].height = u16(gfo.height)
-    g.images[gfi].transparent = gfo.transparent
-    g.images[gfi].disposal = (byte)gfo.disposal
-    gifSetUncompressedImage(ref g, gfi, gfo.data.replace(List<byte>()), false)
+    imageReleaseUncompressed(ref f.image)
+    imageReleaseCompressed(ref f.image)
+    f.image.left = u16(gfo.left)
+    f.image.top = u16(gfo.top)
+    f.image.width = u16(gfo.width)
+    f.image.height = u16(gfo.height)
+    f.image.transparent = gfo.transparent
+    f.image.disposal = (byte)gfo.disposal
+    imageSetUncompressed(ref f.image, gfo.data.replace(List<byte>()), false)
     if wasCompressed {
-        var info = g.gifWriteInfo
-        _ = gifFullCompressImage(ref g, sctx.gfs, gfi, read info)
-        gifReleaseUncompressedImage(ref g, gfi)
+        if f.hasLocal {
+            compressFrame(ref f.image, read f.local, scaleGlobalSize(read env), read env.kc, read env.info)
+        } else {
+            compressFrame(ref f.image, read env.global, scaleGlobalSize(read env), read env.kc, read env.info)
+        }
+        imageReleaseUncompressed(ref f.image)
     }
 }
 
@@ -1054,9 +1037,8 @@ int resizeStream(ref Gt g, nint gfs, double newWidth, double newHeight, int flag
     if (nint)nthreads > nimages {
         nthreads = (int)nimages
     }
-    var sctx = sctxInit(g.streams[gfs], gfs, (nint)nw, (nint)nh)
+    var sctx = sctxInit((nint)sw, (nint)sh, (nint)nw, (nint)nh)
     sctx.scaleColors = scaleColors
-    sctx.imageno = 0
     // Threaded resize only works if the input image is unoptimized.
     nint i = 0
     while nthreads > 1 && i < nimages {
@@ -1069,13 +1051,204 @@ int resizeStream(ref Gt g, nint gfs, double newWidth, double newHeight, int flag
         i += 1
     }
 
-    while (nint)sctx.imageno < nimages {
-        sctx.gfi = g.streams[gfs].images[(nint)sctx.imageno]
-        scaleImage(ref g, ref sctx, method)
-        sctx.imageno += 1
+    var env = takeScaleEnv(ref g, gfs)
+    nint imageno = 0
+    if nthreads > 1 && scaleColors > 0 && env.hasGlobal {
+        // Frames add colors to the global colormap in the order they finish, so the output would
+        // depend on thread timing. Resize frames in order until the colormap is full.
+        while imageno < nimages && env.global.ncol < scaleColors {
+            resizeInOrder(ref g, gfs, ref env, ref sctx, imageno, method)
+            imageno += 1
+        }
+        if (nint)nthreads > nimages - imageno {
+            nthreads = (int)(nimages - imageno)
+        }
     }
+    if nthreads > 1 {
+        var setup = ScaleSetup { sw = (nint)sw, sh = (nint)sh, nw = (nint)nw, nh = (nint)nh, scaleColors = scaleColors, method = method }
+        resizeOnThreads(ref g, gfs, read env, imageno, nthreads, setup)
+        imageno = nimages
+    }
+    while imageno < nimages {
+        resizeInOrder(ref g, gfs, ref env, ref sctx, imageno, method)
+        imageno += 1
+    }
+    putScaleEnv(ref g, gfs, env)
 
     g.streams[gfs].screenWidth = (ushort)nw
     g.streams[gfs].screenHeight = (ushort)nh
     return 0
+}
+
+// ---- frames out of the program's state ----
+
+// One frame being resized, out of the program's state while it is: the image, its local colormap
+// if it has one (every local colormap belongs to one image), and what uncompressing it found.
+// Whoever resizes it owns it.
+struct ScaleFrame {
+    nint imageno
+    nint handle
+    Image image
+    bool hasLocal
+    Colormap local
+    int[2] errors
+    List<KeptMessage> kept
+}
+
+// What every frame of a stream is resized with: its global colormap, out of the program's state
+// beside the frames, the gamma tables and how a frame is compressed again.
+struct ScaleEnv : Clonable {
+    bool hasGlobal
+    Colormap global
+    Kc kc
+    CompressInfo info
+    // the largest transparent index of the stream's frames, which the size of the global color
+    // table may count (`getColorTableSize`); resizing changes none that counts
+    int transparent
+    nint nimages
+}
+
+// The size of the global color table, as `getColorTableSize` gives it.
+int scaleGlobalSize(read ScaleEnv env) {
+    if !env.hasGlobal {
+        return 0
+    }
+    return colorTableSize(env.global.ncol, env.transparent, env.info.flags)
+}
+
+// What a thread needs to resize frames besides the frames.
+struct ScaleSetup : Copyable {
+    nint sw
+    nint sh
+    nint nw
+    nint nh
+    int scaleColors
+    int method
+}
+
+ScaleEnv takeScaleEnv(ref Gt g, nint gfs) {
+    nint global = g.streams[gfs].global
+    var env = ScaleEnv { hasGlobal = global != None, global = noColormap(), kc = g.kc.clone(),
+        info = g.gifWriteInfo, transparent = -1, nimages = g.streams[gfs].images.length() }
+    if global != None {
+        env.global = g.colormaps[global].replace(noColormap())
+    }
+    for h in read g.streams[gfs].images {
+        if g.images[h].transparent > env.transparent {
+            env.transparent = g.images[h].transparent
+        }
+    }
+    return env
+}
+
+void putScaleEnv(ref Gt g, nint gfs, ScaleEnv env) {
+    var e = env
+    if e.hasGlobal {
+        g.colormaps[g.streams[gfs].global] = e.global.replace(noColormap())
+    }
+}
+
+ScaleFrame takeFrame(ref Gt g, nint gfs, nint imageno) {
+    nint handle = g.streams[gfs].images[imageno]
+    var f = ScaleFrame { imageno = imageno, handle = handle, image = g.images[handle].replace(emptyImage()),
+        hasLocal = false, local = noColormap(), errors = int[2] { 0, 0 }, kept = List<KeptMessage>() }
+    if f.image.local != None {
+        f.hasLocal = true
+        f.local = g.colormaps[f.image.local].replace(noColormap())
+    }
+    return f
+}
+
+// The frame goes back to its place, and what uncompressing it found is reported.
+void putFrame(ref Gt g, nint gfs, ScaleFrame frame) {
+    var f = frame
+    nint local = f.image.local
+    g.images[f.handle] = f.image.replace(emptyImage())
+    if f.hasLocal {
+        g.colormaps[local] = f.local.replace(noColormap())
+    }
+    if f.errors[0] != 0 || f.errors[1] != 0 || f.kept.length() != 0 {
+        var gfc = newContext(gfs, f.handle, HandlerDefault)
+        gfc.errors = f.errors
+        gfc.kept = f.kept.replace(List<KeptMessage>())
+        reportUncompress(ref g, ref gfc)
+    }
+}
+
+void resizeInOrder(ref Gt g, nint gfs, ref ScaleEnv env, ref ScaleContext sctx, nint imageno, int method) {
+    var f = takeFrame(ref g, gfs, imageno)
+    sctx.imageno = (int)imageno
+    scaleImage(ref f, ref env, ref sctx, method)
+    putFrame(ref g, gfs, f)
+}
+
+// Resizes the frames from `from` on, on `nthreads` threads. Each thread takes frames from a
+// channel as it is ready for one, as C's threads take the next frame's number, and gives them back
+// when the channel ends. The global colormap is full by now, so no frame adds to it and each
+// thread's copy stays the same as the others'.
+void resizeOnThreads(ref Gt g, nint gfs, read ScaleEnv env, nint from, int nthreads, ScaleSetup setup) {
+    var frames = Channel<ScaleFrame>(2 * (nint)nthreads)
+    // The sender is made before the threads start: a channel with no sender has ended.
+    var giver = frames.sender()
+    var pool = List<Task<List<ScaleFrame>>>()
+    for _ in 0..nthreads {
+        pool.add(Task.run(resizeFrames, frames.clone(), env.clone(), setup))
+    }
+    giveFrames(ref g, gfs, from, giver)
+    var done = Task.whenAll(pool).wait()
+    // back in the order of the frames, as one thread would leave them
+    var byFrame = List<ScaleFrame?>()
+    for _ in from..env.nimages {
+        byFrame.add(null)
+    }
+    for t in 0..done.length() {
+        var resized = done[t].replace(List<ScaleFrame>())
+        for k in 0..resized.length() {
+            var f = resized[k].replace(emptyScaleFrame())
+            nint at = f.imageno - from
+            byFrame[at] = f
+        }
+    }
+    for k in 0..byFrame.length() {
+        var f = byFrame[k].take() ?? emptyScaleFrame()
+        putFrame(ref g, gfs, f)
+    }
+}
+
+ScaleFrame emptyScaleFrame() {
+    return ScaleFrame { imageno = 0, handle = None, image = emptyImage(), hasLocal = false, local = noColormap(),
+        errors = int[2] { 0, 0 }, kept = List<KeptMessage>() }
+}
+
+void giveFrames(ref Gt g, nint gfs, nint from, Sender<ScaleFrame> giver) {
+    for imageno in from..g.streams[gfs].images.length() {
+        if !giver.send(takeFrame(ref g, gfs, imageno)) {
+            return
+        }
+    }
+}
+
+// A thread's work: frames from `frames` until it ends, resized with its own context.
+List<ScaleFrame> resizeFrames(Channel<ScaleFrame> frames, ScaleEnv env0, ScaleSetup setup) {
+    var env = env0
+    var sctx = sctxInit(setup.sw, setup.sh, setup.nw, setup.nh)
+    sctx.scaleColors = setup.scaleColors
+    int previousDisposal = GifDisposalBackground
+    var resized = List<ScaleFrame>()
+    for frame in frames {
+        var f = frame
+        // Frames resized in threads don't depend on earlier frames (see resizeStream), except
+        // that a transparent frame always follows a frame with background disposal, but a frame
+        // followed by an opaque frame may have ASIS disposal. We may process frames out of order,
+        // so clear the screen if necessary.
+        if f.image.transparent >= 0 && previousDisposal != GifDisposalBackground {
+            ksscreenReset(ref sctx.iscr)
+            kcscreenReset(ref sctx.oscr)
+        }
+        sctx.imageno = (int)f.imageno
+        scaleImage(ref f, ref env, ref sctx, setup.method)
+        previousDisposal = (int)f.image.disposal
+        resized.add(f)
+    }
+    return resized
 }

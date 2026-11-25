@@ -137,7 +137,7 @@ class Writer:
         self.out += b"\x21\xFF\x0B" + name + sub_blocks(data)
 
     def frame(self, left, top, width, height, pixels, local=None, transparent=-1, disposal=0,
-              delay=0, interlace=False, min_code_size=None, mode="clear", rng=None, control=True):
+              delay=0, interlace=False, min_code_size=None, mode="clear", rng=None, control=True, cut=0):
         if control:
             packed = (disposal << 2) | (1 if transparent >= 0 else 0)
             self.out += b"\x21\xF9\x04" + struct.pack("<BHB", packed, delay, max(transparent, 0)) + b"\x00"
@@ -154,7 +154,8 @@ class Writer:
         if min_code_size is None:
             min_code_size = max(2, bits_for(max(pixels) + 1)) if pixels else 2
         data = interlaced(pixels, width, height) if interlace else pixels
-        self.out += bytes((min_code_size,)) + sub_blocks(lzw(data, min_code_size, mode, rng), rng)
+        code = lzw(data, min_code_size, mode, rng)
+        self.out += bytes((min_code_size,)) + sub_blocks(code[:len(code) - cut], rng)
 
     def end(self):
         return bytes(self.out) + b"\x3B"
@@ -232,6 +233,31 @@ def animation(seed, width, height, frames, colors=255, small=True, everything=Tr
                 rng=rng if everything else None)
     if everything:
         w.comment(b"the end")
+    return w.end()
+
+
+def full_frames(seed, width, height, frames, colors=255, local=0.0, transparency=0.0, damaged=False):
+    """An animation whose frames all cover the screen, as `gifsicle -j` resizes on several threads: a
+    frame that follows one whose disposal is not to the background is opaque. `local` is the share
+    of frames with a local table of their own colors, `transparency` the share with a transparent
+    index. With `damaged`, some frames lose the end of their data."""
+    rng = random.Random(f"full-{seed}")
+    gcolors = palette(rng, colors)
+    w = Writer(width, height, gcolors, background=rng.randrange(colors), loop=0)
+    clear = [i > 0 and rng.random() < transparency for i in range(frames)] + [False]
+    for i in range(frames):
+        own = None
+        n = colors
+        if rng.random() < local:
+            n = rng.choice((2, 3, 4, 7, 16, 100, 256))
+            own = palette(rng, n)
+        px = picture(rng, width, height, n)
+        transparent = rng.randrange(n) if clear[i] else -1
+        disposal = 2 if clear[i + 1] else rng.choice((0, 1, 2, 3))
+        mode = rng.choice(("clear", "clear", "deferred", "early"))
+        cut = rng.randrange(1, 40) if damaged and i > 0 and rng.random() < 0.3 else 0
+        w.frame(0, 0, width, height, px, own, transparent, disposal, delay=rng.choice((0, 5, 10)),
+                interlace=rng.random() < 0.15, mode=mode, rng=rng, cut=cut)
     return w.end()
 
 

@@ -64,7 +64,7 @@ bool colorEq(Color a, Color b) {
     return a.red == b.red && a.green == b.green && a.blue == b.blue
 }
 
-struct Colormap {
+struct Colormap : Clonable {
     int ncol
     int capacity
     uint userFlags
@@ -171,6 +171,11 @@ nint gifNewImage(ref Gt g) {
 
 nint gifNewColormap(ref Gt g) {
     return gifNewFullColormap(ref g, 0, 256)
+}
+
+// A colormap with no colors, for code that takes one where an image has none.
+Colormap noColormap() {
+    return Colormap { ncol = 0, capacity = 0, userFlags = 0, refcount = 0, col = List<Color>(), live = true }
 }
 
 nint gifNewFullColormap(ref Gt g, int count, int capacity) {
@@ -517,15 +522,23 @@ read byte[] cString(read byte[] s) {
 // ---- pixels ----
 
 void gifReleaseCompressedImage(ref Gt g, nint gfi) {
-    g.images[gfi].compressed = List<byte>()
-    g.images[gfi].hasCompressed = false
-    g.images[gfi].compressedErrors = 0
+    imageReleaseCompressed(ref g.images[gfi])
 }
 
 void gifReleaseUncompressedImage(ref Gt g, nint gfi) {
-    g.images[gfi].data = List<byte>()
-    g.images[gfi].rows = List<nint>()
-    g.images[gfi].hasImg = false
+    imageReleaseUncompressed(ref g.images[gfi])
+}
+
+void imageReleaseCompressed(ref Image image) {
+    image.compressed = List<byte>()
+    image.hasCompressed = false
+    image.compressedErrors = 0
+}
+
+void imageReleaseUncompressed(ref Image image) {
+    image.data = List<byte>()
+    image.rows = List<nint>()
+    image.hasImg = false
 }
 
 bool gifClipImage(ref Gt g, nint gfi, int left, int top, int width, int height) {
@@ -583,9 +596,13 @@ int gifInterlaceLine(int line, int height) {
 // The image's pixels become `data`, read in rows of its width; interlaced, in the order the rows of
 // an interlaced GIF come.
 void gifSetUncompressedImage(ref Gt g, nint gfi, List<byte> data, bool dataInterlaced) {
-    gifReleaseUncompressedImage(ref g, gfi)
-    nint width = (nint)g.images[gfi].width
-    int height = (int)g.images[gfi].height
+    imageSetUncompressed(ref g.images[gfi], data, dataInterlaced)
+}
+
+void imageSetUncompressed(ref Image image, List<byte> data, bool dataInterlaced) {
+    imageReleaseUncompressed(ref image)
+    nint width = (nint)image.width
+    int height = (int)image.height
     var rows = List<nint>.repeat(0, (nint)height)
     if dataInterlaced {
         for i in 0..height {
@@ -596,17 +613,21 @@ void gifSetUncompressedImage(ref Gt g, nint gfi, List<byte> data, bool dataInter
             rows[i] = width * i
         }
     }
-    g.images[gfi].data = data
-    g.images[gfi].rows = rows
-    g.images[gfi].hasImg = true
+    image.data = data
+    image.rows = rows
+    image.hasImg = true
 }
 
 void gifCreateUncompressedImage(ref Gt g, nint gfi, bool dataInterlaced) {
-    nint sz = (nint)g.images[gfi].width * (nint)g.images[gfi].height
+    imageCreateUncompressed(ref g.images[gfi], dataInterlaced)
+}
+
+void imageCreateUncompressed(ref Image image, bool dataInterlaced) {
+    nint sz = (nint)image.width * (nint)image.height
     if sz == 0 {
         sz = 1
     }
-    gifSetUncompressedImage(ref g, gfi, List<byte>.repeat(0, sz), dataInterlaced)
+    imageSetUncompressed(ref image, List<byte>.repeat(0, sz), dataInterlaced)
 }
 
 // A row of an image: where its pixels start in the image's data.

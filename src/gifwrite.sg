@@ -221,15 +221,10 @@ byte gfcPixel(read CodeTable gfc, read Image gfi, uint pos) {
 
 // ---- the lossy encoder: a code may stand for pixels whose colors are close to the image's ----
 
-void gfcLossyInit(ref Gt g, ref CodeTable gfc, nint gfs, read Image gfi) {
-    nint gfcm = gfi.local
-    if gfcm == None {
-        gfcm = g.streams[gfs].global
-    }
-    nint ncol = 0
-    if gfcm != None {
-        ncol = (nint)g.colormaps[gfcm].ncol
-    }
+// `gfcm` is the image's colormap: its local one, or else the stream's global one, or else none,
+// which has no colors.
+void gfcLossyInit(read Kc kc, ref CodeTable gfc, read Colormap gfcm, read Image gfi) {
+    nint ncol = (nint)gfcm.ncol
     bool isLocal = gfi.local != None
     int oldWhich = gfc.kcsWhich
     // The global colormap is the same for every image, but local colormaps differ, so recompute
@@ -241,10 +236,10 @@ void gfcLossyInit(ref Gt g, ref CodeTable gfc, nint gfs, read Image gfi) {
     if !has || isLocal {
         var kcs = List<Kcolor>.repeat(kcolor(0, 0, 0), 256)
         for i in 0..ncol {
-            kcs[i] = kcMakegfcg(read g.kc, g.colormaps[gfcm].col[i])
+            kcs[i] = kcMakegfcg(read kc, gfcm.col[i])
         }
         for i in ncol..256 {
-            kcs[i] = kcMake8g(read g.kc, 0, 0, 0)
+            kcs[i] = kcMake8g(read kc, 0, 0, 0)
         }
         if isLocal {
             gfc.localKcs = kcs
@@ -392,13 +387,27 @@ const uint RunEwmaScale = 19
 const uint RunInvThresh = 174
 
 void writeCompressedData(ref Gt g, nint gfs, nint gfi, int minCodeBits, ref Writer grr) {
-    // The image is taken out of the program's state while it is written, and put back after.
-    var image = g.images[gfi].replace(emptyImage())
-    writeCompressedImage(ref g, gfs, read image, minCodeBits, ref grr)
-    g.images[gfi] = image
+    nint gfcm = imageColormap(read g, gfs, gfi)
+    if gfcm == None {
+        var none = noColormap()
+        writeCompressedImage(read g.kc, read none, read g.images[gfi], minCodeBits, ref grr)
+    } else {
+        writeCompressedImage(read g.kc, read g.colormaps[gfcm], read g.images[gfi], minCodeBits, ref grr)
+    }
 }
 
-void writeCompressedImage(ref Gt g, nint gfs, read Image gfi, int minCodeBits, ref Writer grr) {
+// The colormap an image's pixels index: its local one, or else the stream's global one; None if
+// neither.
+nint imageColormap(read Gt g, nint gfs, nint gfi) {
+    nint gfcm = g.images[gfi].local
+    if gfcm == None {
+        gfcm = g.streams[gfs].global
+    }
+    return gfcm
+}
+
+// `gfcm` is the image's colormap (see `gfcLossyInit`); the lossy encoder alone reads it.
+void writeCompressedImage(read Kc kc, read Colormap gfcm, read Image gfi, int minCodeBits, ref Writer grr) {
     var buf = List<byte>.repeat(0, 512 - 24)
     uint bufpos = 0
     uint bufcap = (uint)(512 - 24) * 8
@@ -422,7 +431,7 @@ void writeCompressedImage(ref Gt g, nint gfs, read Image gfi, int minCodeBits, r
     grr.codeTable.maxpos = (uint)gfi.width * (uint)gfi.height
     grr.cleared = false
     if grr.codeTable.maxLoss > 0 {
-        gfcLossyInit(ref g, ref grr.codeTable, gfs, read gfi)
+        gfcLossyInit(read kc, ref grr.codeTable, read gfcm, read gfi)
     }
 
     outputCode = grr.codeTable.clearCode
@@ -585,7 +594,7 @@ void writeCompressedImage(ref Gt g, nint gfs, read Image gfi, int minCodeBits, r
     grr.v.addAll(buf[0..(nint)bufpos + 1])
 }
 
-int calculateMinCodeBits(read Gt g, nint gfi, read Writer grr) {
+int calculateMinCodeBits(read Image image, read Writer grr) {
     int colorsUsed = -1
     if (grr.gcinfo.flags & GifWriteCarefulMinCodeSize) != 0 {
         // calculate m_c_b based on colormap
@@ -594,15 +603,15 @@ int calculateMinCodeBits(read Gt g, nint gfi, read Writer grr) {
         } else if grr.globalSize > 0 {
             colorsUsed = grr.globalSize
         }
-    } else if g.images[gfi].hasImg {
+    } else if image.hasImg {
         // calculate m_c_b from uncompressed data
-        nint width = (nint)g.images[gfi].width
-        nint height = (nint)g.images[gfi].height
+        nint width = (nint)image.width
+        nint height = (nint)image.height
         colorsUsed = 0
         nint y = 0
         while y < height && colorsUsed < 128 {
-            nint at = g.images[gfi].rows[y]
-            for p in g.images[gfi].data[at..at + width] {
+            nint at = image.rows[y]
+            for p in image.data[at..at + width] {
                 if (int)p > colorsUsed {
                     colorsUsed = (int)p
                 }
@@ -610,9 +619,9 @@ int calculateMinCodeBits(read Gt g, nint gfi, read Writer grr) {
             y += 1
         }
         colorsUsed += 1
-    } else if g.images[gfi].hasCompressed {
+    } else if image.hasCompressed {
         // take m_c_b from compressed image
-        colorsUsed = 1 << (int)g.images[gfi].compressed[0]
+        colorsUsed = 1 << (int)image.compressed[0]
     } else {
         // should never happen
         colorsUsed = 256
@@ -626,56 +635,94 @@ int calculateMinCodeBits(read Gt g, nint gfi, read Writer grr) {
     return minCodeBits
 }
 
-void saveCompressionResult(ref Gt g, nint gfi, ref Writer grr, bool ok) {
+void saveCompressionResult(ref Image image, ref Writer grr, bool ok) {
     if (grr.gcinfo.flags & GifWriteShrink) == 0 ||
-        (ok && (!g.images[gfi].hasCompressed || (nint)g.images[gfi].compressed.length() > grr.v.length())) {
+        (ok && (!image.hasCompressed || (nint)image.compressed.length() > grr.v.length())) {
         if ok {
-            g.images[gfi].compressed = grr.v.replace(List<byte>())
-            g.images[gfi].hasCompressed = true
-            g.images[gfi].compressedErrors = 0
+            image.compressed = grr.v.replace(List<byte>())
+            image.hasCompressed = true
+            image.compressedErrors = 0
         } else {
-            g.images[gfi].compressed = List<byte>()
-            g.images[gfi].hasCompressed = false
+            image.compressed = List<byte>()
+            image.hasCompressed = false
         }
     }
     grr.v.clear()
 }
 
 bool gifFullCompressImage(ref Gt g, nint gfs, nint gfi, read CompressInfo? gcinfo) {
-    var grr = newWriter(read g.kc, gcinfo)
-    grr.globalSize = getColorTableSize(read g, gfs, None, read grr)
-    grr.localSize = getColorTableSize(read g, gfs, gfi, read grr)
-    int minCodeBits = calculateMinCodeBits(read g, gfi, read grr)
-    writeCompressedData(ref g, gfs, gfi, minCodeBits, ref grr)
-    saveCompressionResult(ref g, gfi, ref grr, true)
-    if (grr.gcinfo.flags & (GifWriteOptimize | GifWriteEagerClear)) == GifWriteOptimize && grr.cleared {
-        grr.gcinfo.flags |= GifWriteEagerClear | GifWriteShrink
-        writeCompressedData(ref g, gfs, gfi, minCodeBits, ref grr)
-        saveCompressionResult(ref g, gfi, ref grr, true)
+    int flags = 0
+    if gcinfo is not null {
+        flags = gcinfo.flags
     }
+    int globalSize = getColorTableSize(read g, gfs, None, flags)
+    nint gfcm = imageColormap(read g, gfs, gfi)
+    // The image is taken out of the program's state while it is compressed, and put back after.
+    var image = g.images[gfi].replace(emptyImage())
+    if gfcm == None {
+        var none = noColormap()
+        compressFrame(ref image, read none, globalSize, read g.kc, gcinfo)
+    } else {
+        compressFrame(ref image, read g.colormaps[gfcm], globalSize, read g.kc, gcinfo)
+    }
+    g.images[gfi] = image
     return true
 }
 
-int getColorTableSize(read Gt g, nint gfs, nint gfi, read Writer grr) {
+// Compresses `image`, which may be out of the program's state. `gfcm` is its colormap (see
+// `gfcLossyInit`), and `globalSize` the size of the stream's global color table as it is written.
+void compressFrame(ref Image image, read Colormap gfcm, int globalSize, read Kc kc, read CompressInfo? gcinfo) {
+    var grr = newWriter(read kc, gcinfo)
+    grr.globalSize = globalSize
+    grr.localSize = 0
+    if image.local != None {
+        grr.localSize = colorTableSize(gfcm.ncol, image.transparent, grr.gcinfo.flags)
+    }
+    int minCodeBits = calculateMinCodeBits(read image, read grr)
+    writeCompressedImage(read kc, read gfcm, read image, minCodeBits, ref grr)
+    saveCompressionResult(ref image, ref grr, true)
+    if (grr.gcinfo.flags & (GifWriteOptimize | GifWriteEagerClear)) == GifWriteOptimize && grr.cleared {
+        grr.gcinfo.flags |= GifWriteEagerClear | GifWriteShrink
+        writeCompressedImage(read kc, read gfcm, read image, minCodeBits, ref grr)
+        saveCompressionResult(ref image, ref grr, true)
+    }
+}
+
+// The size of the color table written for the global colormap (`gfi` None) or image `gfi`'s local
+// one; 0 if there is none. `flags` are the compression's.
+int getColorTableSize(read Gt g, nint gfs, nint gfi, int flags) {
     nint gfcm = g.streams[gfs].global
     if gfi != None {
         gfcm = g.images[gfi].local
     }
-    if gfcm == None || g.colormaps[gfcm].ncol <= 0 {
+    if gfcm == None {
         return 0
     }
-    int ncol = g.colormaps[gfcm].ncol
-    // Possibly bump up 'ncol' based on 'transparent' values, if careful_min_code_bits
-    if (grr.gcinfo.flags & GifWriteCarefulMinCodeSize) != 0 {
-        if gfi != None && g.images[gfi].transparent >= ncol {
-            ncol = g.images[gfi].transparent + 1
-        } else if gfi == None {
-            for h in read g.streams[gfs].images {
-                if g.images[h].transparent >= ncol {
-                    ncol = g.images[h].transparent + 1
-                }
+    if gfi != None {
+        return colorTableSize(g.colormaps[gfcm].ncol, g.images[gfi].transparent, flags)
+    }
+    // the largest transparent index of any image counts
+    int transparent = -1
+    if (flags & GifWriteCarefulMinCodeSize) != 0 {
+        for h in read g.streams[gfs].images {
+            if g.images[h].transparent > transparent {
+                transparent = g.images[h].transparent
             }
         }
+    }
+    return colorTableSize(g.colormaps[gfcm].ncol, transparent, flags)
+}
+
+// The size of the color table written for a colormap of `ncol0` colors, used by images whose
+// transparent index is at most `transparent`; 0 if it has no colors.
+int colorTableSize(int ncol0, int transparent, int flags) {
+    if ncol0 <= 0 {
+        return 0
+    }
+    int ncol = ncol0
+    // Possibly bump up 'ncol' based on 'transparent' values, if careful_min_code_bits
+    if (flags & GifWriteCarefulMinCodeSize) != 0 && transparent >= ncol {
+        ncol = transparent + 1
     }
     // Make sure the colormap is a power of two entries; GIF doesn't allow a colormap with 1 entry.
     if ncol > 256 {
@@ -710,7 +757,7 @@ void writeColorTable(read Colormap gfcm, int totalcol, ref Writer grr) {
 
 void writeImage(ref Gt g, nint gfs, nint gfi, ref Writer grr) {
     int packed = 0
-    grr.localSize = getColorTableSize(read g, gfs, gfi, read grr)
+    grr.localSize = getColorTableSize(read g, gfs, gfi, grr.gcinfo.flags)
 
     gifPutByte(ref grr, 0x2C)
     gifPutUnsigned(ref grr, (int)g.images[gfi].left)
@@ -737,7 +784,7 @@ void writeImage(ref Gt g, nint gfs, nint gfi, ref Writer grr) {
 
     // calculate min_code_bits here (because calculation may involve recompression, if
     // GIF_WRITE_CAREFUL_MIN_CODE_SIZE is true)
-    int minCodeBits = calculateMinCodeBits(read g, gfi, read grr)
+    int minCodeBits = calculateMinCodeBits(read g.images[gfi], read grr)
 
     // use existing compressed data if it exists.
     if g.images[gfi].hasCompressed &&
@@ -755,7 +802,7 @@ void writeImage(ref Gt g, nint gfs, nint gfi, ref Writer grr) {
 void writeLogicalScreenDescriptor(ref Gt g, nint gfs, ref Writer grr) {
     // high resolution colors
     int packed = 0x70
-    grr.globalSize = getColorTableSize(read g, gfs, None, read grr)
+    grr.globalSize = getColorTableSize(read g, gfs, None, grr.gcinfo.flags)
     gifCalculateScreenSize(ref g, gfs, false)
     gifPutUnsigned(ref grr, (int)g.streams[gfs].screenWidth)
     gifPutUnsigned(ref grr, (int)g.streams[gfs].screenHeight)

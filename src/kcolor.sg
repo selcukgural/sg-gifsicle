@@ -24,7 +24,7 @@ struct Wkcolor : Copyable {
     int[3] a
 }
 
-struct Kc {
+struct Kc : Clonable {
     int curType
     double curGamma
     List<ushort> gamma
