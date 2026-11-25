@@ -34,6 +34,20 @@ Linux and macOS.
 
 The options are gifsicle's; its manual applies as it is.
 
+## Examples
+
+Pasha, the cat of SG, turned into a GIF of 480 by 480 by macOS's `sips` ([`examples/pasha.gif`](examples/pasha.gif)),
+and what the port makes of it. `sh examples/make.sh` makes them again and checks that gifsicle 1.99 writes the
+same bytes.
+
+| | Options | Bytes |
+|---|---|---|
+| <img src="examples/small.gif" alt="Pasha, 160 pixels wide"> | `--resize 160x_ --resize-method lanczos3` | 13,988 |
+| <img src="examples/colors-8.gif" alt="Pasha in 8 colors"> | `--resize 240x_ --colors 8` | 5,574 |
+| <img src="examples/colors-8-dither.gif" alt="Pasha in 8 colors, dithered"> | `--resize 240x_ --colors 8 --dither` | 8,066 |
+| <img src="examples/face.gif" alt="Pasha's face, flipped"> | `--crop 45,60+240x220 --flip-horizontal` | 34,777 |
+| <img src="examples/turning-small.gif" alt="Pasha turning"> | Four frames, each turned a quarter more (`-l -d 40 turn.gif --rotate-90 turn.gif ...`), then resized on four threads: `-j4 --resize 120x_ --resize-method catrom -O3` | 33,203 |
+
 ## What is there
 
 | Part of gifsicle | State |
