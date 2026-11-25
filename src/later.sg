@@ -1,23 +1,9 @@
-// later.sg - What later steps of the port fill in: resizing (xform.c), color reduction and
-// dithering (quantize.c, kcolor.c), lossy compression (gifwrite.c), the optimizer (optimize.c,
+// later.sg - What later steps of the port fill in: color reduction and dithering (quantize.c,
+// kcolor.c), lossy compression (gifwrite.c), the optimizer (optimize.c,
 // opttemplate.c) and unoptimizing (gifunopt.c). Each stands here with its signature, so that the
 // rest is compiled and tested as it is written; none is called by the tests of this step.
 // SG translation of gifsicle 1.99. This file is part of sg-gifsicle, under the GNU General Public
 // License, version 2.
-
-int resizeStream(ref Gt g, nint gfs, double w, double h, int flags, int method, int scaleColors, int nthreads) {
-    fatalError(ref g, "resizing is not ported yet", read List<string>())
-    return -1
-}
-
-struct Kchist {
-    int n
-}
-
-Kchist kchistMake(ref Gt g, nint gfs, ref uint ntransp) {
-    fatalError(ref g, "color reduction is not ported yet", read List<string>())
-    return Kchist { n = 0 }
-}
 
 nint colormapFlatDiversity(ref Gt g, ref Kchist kch, ref OutputData od) {
     return None

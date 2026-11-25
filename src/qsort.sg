@@ -1,0 +1,281 @@
+// qsort.sg - The qsort and heapsort of the C library of macOS (Apple's libc, from FreeBSD).
+// Copyright (c) 1992, 1993 The Regents of the University of California. All rights reserved.
+// SG translation; this file is part of sg-gifsicle.
+//
+// Redistribution and use in source and binary forms, with or without modification, are permitted
+// provided that the following conditions are met:
+// 1. Redistributions of source code must retain the above copyright notice, this list of
+//    conditions and the following disclaimer.
+// 2. Redistributions in binary form must reproduce the above copyright notice, this list of
+//    conditions and the following disclaimer in the documentation and/or other materials provided
+//    with the distribution.
+// 3. Neither the name of the University nor the names of its contributors may be used to endorse
+//    or promote products derived from this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND ANY EXPRESS OR IMPLIED
+// WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+// FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+// FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+// BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+// OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+// STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//
+// gifsicle sorts with C's qsort, which does not keep the order of items that compare equal: which
+// of them comes first is the library's choice. To give the bytes gifsicle gives on macOS, the port
+// sorts as the library of macOS does, Bentley and McIlroy's quicksort, with an insertion sort for
+// small and nearly sorted ranges and a heapsort past a depth of recursion (Apple's
+// stdlib/FreeBSD/qsort.c and heapsort.c). The GNU library of Linux sorts in another order.
+//
+// Here the items are the numbers in `perm[lo..lo + n]`, ordered by `key[item]`; moving them as
+// qsort moves the items of an array leaves them in the order qsort leaves those items.
+
+int qsCmp(read List<long> key, int x, int y) {
+    long kx = key[(nint)x]
+    long ky = key[(nint)y]
+    if kx < ky {
+        return -1
+    } else if kx > ky {
+        return 1
+    }
+    return 0
+}
+
+void qsSwap(ref List<int> perm, nint a, nint b) {
+    int t = perm[a]
+    perm[a] = perm[b]
+    perm[b] = t
+}
+
+void qsVecswap(ref List<int> perm, nint a, nint b, nint n) {
+    for i in 0..n {
+        qsSwap(ref perm, a + i, b + i)
+    }
+}
+
+// the median of 3 items
+nint qsMed3(read List<int> perm, nint a, nint b, nint c, read List<long> key) {
+    if qsCmp(key, perm[a], perm[b]) < 0 {
+        if qsCmp(key, perm[b], perm[c]) < 0 {
+            return b
+        } else if qsCmp(key, perm[a], perm[c]) < 0 {
+            return c
+        }
+        return a
+    }
+    if qsCmp(key, perm[b], perm[c]) > 0 {
+        return b
+    } else if qsCmp(key, perm[a], perm[c]) < 0 {
+        return a
+    }
+    return c
+}
+
+// insertion sort; with a `swapLimit`, false once it has swapped more than that
+bool qsIsort(ref List<int> perm, nint a, nint n, read List<long> key, int swapLimit) {
+    int swapCnt = 0
+    for pm in a + 1..a + n {
+        nint pl = pm
+        while pl > a && qsCmp(key, perm[pl - 1], perm[pl]) > 0 {
+            qsSwap(ref perm, pl, pl - 1)
+            if swapLimit != 0 {
+                swapCnt += 1
+                if swapCnt > swapLimit {
+                    return false
+                }
+            }
+            pl -= 1
+        }
+    }
+    return true
+}
+
+void qsHeapsort(ref List<int> perm, nint a, nint n0, read List<long> key) {
+    nint nmemb = n0
+    if nmemb <= 1 {
+        return
+    }
+    // items are numbered from 1 to nmemb
+    nint base = a - 1
+    nint l = nmemb / 2 + 1
+    while true {
+        l -= 1
+        if l == 0 {
+            break
+        }
+        // CREATE
+        nint parI = l
+        while parI * 2 <= nmemb {
+            nint childI = parI * 2
+            nint child = base + childI
+            if childI < nmemb && qsCmp(key, perm[child], perm[child + 1]) < 0 {
+                child += 1
+                childI += 1
+            }
+            nint par = base + parI
+            if qsCmp(key, perm[child], perm[par]) <= 0 {
+                break
+            }
+            qsSwap(ref perm, par, child)
+            parI = childI
+        }
+    }
+    // each largest item into its final slot, the displaced one (k) kept, the heap made again
+    while nmemb > 1 {
+        int k = perm[base + nmemb]
+        perm[base + nmemb] = perm[base + 1]
+        nmemb -= 1
+        // SELECT
+        nint parI = 1
+        while parI * 2 <= nmemb {
+            nint childI = parI * 2
+            nint child = base + childI
+            if childI < nmemb && qsCmp(key, perm[child], perm[child + 1]) < 0 {
+                child += 1
+                childI += 1
+            }
+            perm[base + parI] = perm[child]
+            parI = childI
+        }
+        while true {
+            nint childI = parI
+            parI = childI / 2
+            nint child = base + childI
+            nint par = base + parI
+            if childI == 1 || qsCmp(key, k, perm[par]) < 0 {
+                perm[child] = k
+                break
+            }
+            perm[child] = perm[par]
+        }
+    }
+}
+
+void qsQsort(ref List<int> perm, nint a0, nint n0, read List<long> key, int depthLimit0) {
+    nint a = a0
+    nint n = n0
+    int depthLimit = depthLimit0
+    while true {
+        depthLimit -= 1
+        if depthLimit + 1 <= 0 {
+            // we've hit our recursion limit, switch to heapsort
+            qsHeapsort(ref perm, a, n, key)
+            return
+        }
+        if n <= 7 {
+            // for sufficiently small inputs, we'll just insertion sort
+            _ = qsIsort(ref perm, a, n, key, 0)
+            return
+        }
+
+        // compute the pseudomedian: small arrays use 3 samples, large ones use 9
+        nint pl = a
+        nint pm = a + n / 2
+        nint pn = a + n - 1
+        if n > 40 {
+            nint d = n / 8
+            pl = qsMed3(perm, pl, pl + d, pl + 2 * d, key)
+            pm = qsMed3(perm, pm - d, pm, pm + d, key)
+            pn = qsMed3(perm, pn - 2 * d, pn - d, pn, key)
+        }
+        pm = qsMed3(perm, pl, pm, pn, key)
+
+        // pull the median to the front
+        qsSwap(ref perm, a, pm)
+        nint pa = a + 1
+        nint pb = a + 1
+        nint pc = a + n - 1
+        nint pd = a + n - 1
+        bool swapped = false
+        while true {
+            // move b forward while it's less than the median, c backwards while it's greater;
+            // when equal to the median, swap to the outside
+            while pb <= pc {
+                int c = qsCmp(key, perm[pb], perm[a])
+                if c > 0 {
+                    break
+                }
+                if c == 0 {
+                    swapped = true
+                    qsSwap(ref perm, pa, pb)
+                    pa += 1
+                }
+                pb += 1
+            }
+            while pb <= pc {
+                int c = qsCmp(key, perm[pc], perm[a])
+                if c < 0 {
+                    break
+                }
+                if c == 0 {
+                    swapped = true
+                    qsSwap(ref perm, pc, pd)
+                    pd -= 1
+                }
+                pc -= 1
+            }
+            if pb > pc {
+                break
+            }
+            qsSwap(ref perm, pb, pc)
+            swapped = true
+            pb += 1
+            pc -= 1
+        }
+
+        // swap the equal ones into the middle
+        pn = a + n
+        nint d1 = (pa - a).min(pb - pa)
+        qsVecswap(ref perm, a, pb - d1, d1)
+        d1 = (pd - pc).min(pn - pd - 1)
+        qsVecswap(ref perm, pb, pn - d1, d1)
+
+        if !swapped {
+            // switch to insertion sort
+            int r = 1 + (int)(n / 4)
+            if qsIsort(ref perm, a, n, key, r) {
+                return
+            }
+        }
+
+        d1 = pb - pa
+        nint d2 = pd - pc
+        if d1 <= d2 {
+            // recurse on left partition, then iterate on right partition
+            if d1 > 1 {
+                qsQsort(ref perm, a, d1, key, depthLimit)
+            }
+            if d2 > 1 {
+                a = pn - d2
+                n = d2
+                continue
+            }
+        } else {
+            // recurse on right partition, then iterate on left partition
+            if d2 > 1 {
+                qsQsort(ref perm, pn - d2, d2, key, depthLimit)
+            }
+            if d1 > 1 {
+                n = d1
+                continue
+            }
+        }
+        return
+    }
+}
+
+// the place of the highest bit set, from 1; 0 for 0 (flsl)
+int qsFls(nint x) {
+    int i = 0
+    nint v = x
+    while v != 0 {
+        i += 1
+        v >>= 1
+    }
+    return i
+}
+
+// qsort of `perm[lo..lo + n]` by `key[item]`
+void sortPerm(ref List<int> perm, nint lo, nint n, read List<long> key) {
+    qsQsort(ref perm, lo, n, key, 2 * (qsFls(n) - 1))
+}

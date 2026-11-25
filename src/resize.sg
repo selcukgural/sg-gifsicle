@@ -1,0 +1,1081 @@
+// resize.sg - Resizing for gifsicle (the scaling part of xform.c).
+// Copyright (C) 1997-2025 Eddie Kohler, ekohler@gmail.com
+// SG translation of gifsicle 1.99. This file is part of sg-gifsicle.
+//
+// Gifsicle is free software. It is distributed under the GNU Public License, version 2; you can
+// copy, distribute, or alter it at will, as long as this notice is kept intact and this source
+// code is made available. There is no warranty, express or implied.
+//
+// The frame buffers and the scaling context are values here, and the kd-tree in use is one of
+// the context's two, named by `local`. The scaled frame is built beside the frame it comes from
+// (`ScaledImage`), which takes its place at the end, as C copies `gfo` over `*gfi`.
+// gifsicle can resize the frames of an unoptimized GIF on several threads (`-j`); here they are
+// resized one after the other, which gives the same frames.
+
+// ---- kcscreen: a frame buffer of kacolors, one per pixel ----
+
+struct Kcscreen {
+    List<Kacolor> data
+    bool hasData
+    List<Kacolor> scratch
+    bool hasScratch
+    nint width
+    nint height
+    Kacolor bg
+}
+
+Kcscreen kcscreenClear(nint width, nint height) {
+    return Kcscreen { data = List<Kacolor>(), hasData = false, scratch = List<Kacolor>(), hasScratch = false,
+        width = width, height = height, bg = kacTransparent() }
+}
+
+// set every pixel of `kcs` to the background
+void kcscreenReset(ref Kcscreen kcs) {
+    if kcs.hasData {
+        for i in 0..kcs.width * kcs.height {
+            kcs.data[i] = kcs.bg
+        }
+    }
+}
+
+// the background is transparent, as in browsers
+void kcscreenInit(ref Kcscreen kcs, read Stream gfs, nint sw, nint sh) {
+    kcs.width = sw
+    if sw <= 0 {
+        kcs.width = (nint)gfs.screenWidth
+    }
+    kcs.height = sh
+    if sh <= 0 {
+        kcs.height = (nint)gfs.screenHeight
+    }
+    kcs.bg = kacTransparent()
+    kcs.data = List<Kacolor>.repeat(kcs.bg, kcs.width * kcs.height)
+    kcs.hasData = true
+}
+
+// apply the scaled frame `gfo` to screen `kcs`, using the color array `ks`
+void kcscreenApply(ref Kcscreen kcs, read ScaledImage gfo, read List<Kcolor> ks) {
+    nint w = (nint)gfo.width
+    if gfo.disposal == GifDisposalPrevious {
+        if !kcs.hasScratch {
+            kcs.scratch = List<Kacolor>.repeat(kacTransparent(), kcs.width * kcs.height)
+            kcs.hasScratch = true
+        }
+        for y in (nint)gfo.top..(nint)(gfo.top + gfo.height) {
+            nint at = y * kcs.width + (nint)gfo.left
+            kcs.scratch[at..at + w].copyFrom(kcs.data[at..at + w])
+        }
+    }
+    for y in (nint)gfo.top..(nint)(gfo.top + gfo.height) {
+        nint linein = (y - (nint)gfo.top) * w
+        nint lineout = y * kcs.width + (nint)gfo.left
+        for x in 0..w {
+            int p = (int)gfo.data[linein + x]
+            if p != gfo.transparent {
+                kcs.data[lineout + x] = kacOf(ks[(nint)p], KcMax)
+            }
+        }
+    }
+}
+
+// dispose of the scaled frame `gfo`, which was applied by kcscreenApply
+void kcscreenDispose(ref Kcscreen kcs, read ScaledImage gfo) {
+    nint w = (nint)gfo.width
+    if gfo.disposal == GifDisposalPrevious {
+        for y in (nint)gfo.top..(nint)(gfo.top + gfo.height) {
+            nint at = y * kcs.width + (nint)gfo.left
+            kcs.data[at..at + w].copyFrom(kcs.scratch[at..at + w])
+        }
+    } else if gfo.disposal == GifDisposalBackground {
+        for y in (nint)gfo.top..(nint)(gfo.top + gfo.height) {
+            for x in (nint)gfo.left..(nint)(gfo.left + gfo.width) {
+                kcs.data[y * kcs.width + x] = kcs.bg
+            }
+        }
+    }
+}
+
+// ---- ksscreen: a frame buffer of scale colors, one per pixel ----
+
+struct Ksscreen {
+    List<ScaleColor> data
+    bool hasData
+    List<ScaleColor> scratch
+    bool hasScratch
+    nint width
+    nint height
+    ScaleColor bg
+}
+
+Ksscreen ksscreenClear(nint width, nint height) {
+    return Ksscreen { data = List<ScaleColor>(), hasData = false, scratch = List<ScaleColor>(), hasScratch = false,
+        width = width, height = height, bg = scZero() }
+}
+
+void ksscreenReset(ref Ksscreen kss) {
+    if kss.hasData {
+        for i in 0..kss.width * kss.height {
+            kss.data[i] = kss.bg
+        }
+    }
+}
+
+void ksscreenInit(ref Ksscreen kss, read Stream gfs, nint sw, nint sh) {
+    kss.width = sw
+    if sw <= 0 {
+        kss.width = (nint)gfs.screenWidth
+    }
+    kss.height = sh
+    if sh <= 0 {
+        kss.height = (nint)gfs.screenHeight
+    }
+    kss.bg = scZero()
+    kss.data = List<ScaleColor>.repeat(kss.bg, kss.width * kss.height)
+    kss.hasData = true
+}
+
+// the right and bottom edges of image `gfi`, clipped to the screen: frames can extend past the
+// logical screen, and those parts are invisible. False if no part of `gfi` is on the screen.
+bool ksscreenClip(read Ksscreen kss, read Image gfi, ref nint right, ref nint bottom) {
+    right = (nint)gfi.left + (nint)gfi.width
+    if right > kss.width {
+        right = kss.width
+    }
+    bottom = (nint)gfi.top + (nint)gfi.height
+    if bottom > kss.height {
+        bottom = kss.height
+    }
+    return (nint)gfi.left < right && (nint)gfi.top < bottom
+}
+
+// apply image `gfi` to screen `kss`, using the color array `ks`
+void ksscreenApply(ref Ksscreen kss, read Image gfi, read List<Kcolor> ks) {
+    nint right = 0
+    nint bottom = 0
+    if !ksscreenClip(kss, gfi, ref right, ref bottom) {
+        return
+    }
+    nint left = (nint)gfi.left
+    nint top = (nint)gfi.top
+    if (int)gfi.disposal == GifDisposalPrevious {
+        if !kss.hasScratch {
+            kss.scratch = List<ScaleColor>.repeat(scZero(), kss.width * kss.height)
+            kss.hasScratch = true
+        }
+        for y in top..bottom {
+            nint at = y * kss.width + left
+            kss.scratch[at..at + right - left].copyFrom(kss.data[at..at + right - left])
+        }
+    }
+    for y in top..bottom {
+        nint linein = gfi.rows[y - top]
+        nint lineout = y * kss.width + left
+        for x in 0..right - left {
+            int p = (int)gfi.data[linein + x]
+            if p != gfi.transparent {
+                kss.data[lineout + x] = scMakekc(ks[(nint)p])
+            }
+        }
+    }
+}
+
+// dispose of image `gfi`, which was applied by ksscreenApply
+void ksscreenDispose(ref Ksscreen kss, read Image gfi) {
+    nint right = 0
+    nint bottom = 0
+    if !ksscreenClip(kss, gfi, ref right, ref bottom) {
+        return
+    }
+    nint left = (nint)gfi.left
+    nint top = (nint)gfi.top
+    if (int)gfi.disposal == GifDisposalPrevious {
+        for y in top..bottom {
+            nint at = y * kss.width + left
+            kss.data[at..at + right - left].copyFrom(kss.scratch[at..at + right - left])
+        }
+    } else if (int)gfi.disposal == GifDisposalBackground {
+        for y in top..bottom {
+            for x in left..right {
+                kss.data[y * kss.width + x] = kss.bg
+            }
+        }
+    }
+}
+
+// ---- the scaling context ----
+
+struct ScaleWeight : Copyable {
+    float w
+    int ipos
+    int opos
+}
+
+// The frame being made: C's `gfo`, a copy of the input frame whose place and pixels change.
+struct ScaledImage {
+    int left
+    int top
+    int width
+    int height
+    int transparent
+    int disposal
+    List<byte> data
+}
+
+struct ScaleContext {
+    nint gfs
+    nint gfi
+    int imageno
+    // which tree is in use: the local one (`localKd3`) or the global one
+    bool local
+    Ksscreen iscr
+    Kcscreen oscr
+    Kcscreen xscr
+    // (input width) / (output width), (input height) / (output height), and the reverse
+    float oxf
+    float oyf
+    float ixf
+    float iyf
+    List<ScaleWeight> xweights
+    List<ScaleWeight> yweights
+    Kd3Tree globalKd3
+    Kd3Tree localKd3
+    uint maxDesiredDist
+    int scaleColors
+}
+
+ScaleContext sctxInit(read Stream gfs, nint stream, nint nw, nint nh) {
+    nint sw = (nint)gfs.screenWidth
+    nint sh = (nint)gfs.screenHeight
+    return ScaleContext {
+        gfs = stream, gfi = None, imageno = 0, local = false,
+        iscr = ksscreenClear(sw, sh), oscr = kcscreenClear(nw, nh), xscr = kcscreenClear(nw, nh),
+        ixf = (float)((double)nw / (double)sw), iyf = (float)((double)nh / (double)sh),
+        oxf = (float)((double)sw / (double)nw), oyf = (float)((double)sh / (double)nh),
+        xweights = List<ScaleWeight>(), yweights = List<ScaleWeight>(),
+        globalKd3 = kd3None(), localKd3 = kd3None(), maxDesiredDist = 16000, scaleColors = 0
+    }
+}
+
+// the colors of the tree in use
+List<Kcolor> sctxKs(read ScaleContext sctx) {
+    if sctx.local {
+        return sctx.localKd3.ks.clone()
+    }
+    return sctx.globalKd3.ks.clone()
+}
+
+int sctxClosest(ref ScaleContext sctx, Kcolor k, ref uint dist) {
+    if sctx.local {
+        return kd3ClosestTransformed(ref sctx.localKd3, k, ref dist)
+    }
+    return kd3ClosestTransformed(ref sctx.globalKd3, k, ref dist)
+}
+
+void sctxAdd8g(ref Gt g, ref ScaleContext sctx, Color c) {
+    if sctx.local {
+        kd3Add8g(read g.kc, ref sctx.localKd3, (int)c.red, (int)c.green, (int)c.blue)
+    } else {
+        kd3Add8g(read g.kc, ref sctx.globalKd3, (int)c.red, (int)c.green, (int)c.blue)
+    }
+}
+
+void sctxDisable(ref ScaleContext sctx, int i) {
+    if sctx.local {
+        kd3Disable(ref sctx.localKd3, i)
+    } else {
+        kd3Disable(ref sctx.globalKd3, i)
+    }
+}
+
+int sctxNitems(read ScaleContext sctx) {
+    if sctx.local {
+        return sctx.localKd3.nitems
+    }
+    return sctx.globalKd3.nitems
+}
+
+void scaleImageDataPoint(ref Gt g, ref ScaleContext sctx, ref ScaledImage gfo) {
+    nint gfi = sctx.gfi
+    int gleft = (int)g.images[gfi].left
+    int gtop = (int)g.images[gfi].top
+    var xoff = List<ushort>.repeat(0, (nint)gfo.width)
+    for xo in 0..gfo.width {
+        xoff[(nint)xo] = (ushort)((int)(((double)(gfo.left + xo) + 0.5) * (double)sctx.oxf) - gleft)
+    }
+    pointRows(ref gfo.data, read g.images[gfi].data, read g.images[gfi].rows, read xoff, gfo.top, gfo.height, (double)sctx.oyf, gtop)
+}
+
+// the rows of the frame, each pixel taken from its place in the input frame
+void pointRows(ref List<byte> out, read List<byte> data, read List<nint> rows, read List<ushort> xoff, int top, int height, double oyf, int gtop) {
+    nint width = xoff.length()
+    nint at = 0
+    for yo in 0..height {
+        int yi = (int)(((double)(top + yo) + 0.5) * oyf) - gtop
+        nint inLine = rows[(nint)yi]
+        for xo in 0..width {
+            out[at] = data[inLine + (nint)xoff[xo]]
+            at += 1
+        }
+    }
+}
+
+void scaleImageUpdateGlobalKd3(ref Gt g, ref ScaleContext sctx) {
+    nint gfcm = g.streams[sctx.gfs].global
+    while sctx.globalKd3.nitems < g.colormaps[gfcm].ncol {
+        var c = g.colormaps[gfcm].col[(nint)sctx.globalKd3.nitems]
+        kd3Add8g(read g.kc, ref sctx.globalKd3, (int)c.red, (int)c.green, (int)c.blue)
+    }
+}
+
+void scaleImagePrepare(ref Gt g, ref ScaleContext sctx) {
+    nint gfi = sctx.gfi
+    nint local = g.images[gfi].local
+    if local != None {
+        sctx.local = true
+        kd3InitBuild(read g.kc, ref sctx.localKd3, Kd3Gamma, g.colormaps[local])
+    } else {
+        sctx.local = false
+        if !sctx.globalKd3.live {
+            kd3Init(ref sctx.globalKd3, Kd3Gamma)
+        }
+        scaleImageUpdateGlobalKd3(ref g, ref sctx)
+        if !sctx.globalKd3.hasTree {
+            kd3Build(ref sctx.globalKd3)
+        }
+        kd3EnableAll(ref sctx.globalKd3)
+    }
+    int transparent = g.images[gfi].transparent
+    if transparent >= 0 && transparent < sctxNitems(sctx) {
+        sctxDisable(ref sctx, transparent)
+    }
+
+    // apply image to sctx.iscr
+    if !sctx.iscr.hasData {
+        // first image, set up screens
+        ksscreenInit(ref sctx.iscr, g.streams[sctx.gfs], 0, 0)
+        kcscreenInit(ref sctx.oscr, g.streams[sctx.gfs], sctx.oscr.width, sctx.oscr.height)
+        kcscreenInit(ref sctx.xscr, g.streams[sctx.gfs], sctx.xscr.width, sctx.xscr.height)
+    }
+    if sctx.local {
+        ksscreenApply(ref sctx.iscr, g.images[gfi], read sctx.localKd3.ks)
+    } else {
+        ksscreenApply(ref sctx.iscr, g.images[gfi], read sctx.globalKd3.ks)
+    }
+}
+
+void scaleImageOutputRow(read Gt g, ref ScaleContext sctx, ref List<ScaleColor> sc, read ScaledImage gfo, int yo) {
+    nint oscr = sctx.xscr.width * (nint)(yo + gfo.top) + (nint)gfo.left
+
+    // if the input image has no transparent color, output is opaque wherever any input pixel
+    // contributed
+    float minAlpha = 0.0
+    if g.images[sctx.gfi].transparent >= 0 {
+        minAlpha = (float)(KcMax / 4)
+    }
+    for xo in 0..(nint)gfo.width {
+        if sc[xo].a[3] <= minAlpha {
+            sctx.xscr.data[oscr + xo] = kacTransparent()
+        } else {
+            // don't effectively mix partially transparent pixels with black
+            if sc[xo].a[3] <= (float)(KcMax * 31 / 32) {
+                scMul(ref sc[xo], (float)KcMax / sc[xo].a[3])
+            }
+            // find closest color
+            var out = kacTransparent()
+            for k in 0..3 {
+                float v = sc[xo].a[k] + 0.5
+                if v <= 0.0 {
+                    out.a[k] = 0
+                } else if v >= (float)KcMax {
+                    out.a[k] = (short)KcMax
+                } else {
+                    out.a[k] = (short)(int)v
+                }
+            }
+            out.a[3] = (short)KcMax
+            sctx.xscr.data[oscr + xo] = out
+        }
+    }
+}
+
+bool scaleImageAddColors(ref Gt g, ref ScaleContext sctx, read ScaledImage gfo) {
+    nint gfi = sctx.gfi
+    nint gfcm = g.images[gfi].local
+    if gfcm == None {
+        gfcm = g.streams[sctx.gfs].global
+    }
+    int transparent = g.images[gfi].transparent
+
+    var kch = kchistInit()
+    for yo in 0..(nint)gfo.height {
+        nint xscr = sctx.xscr.width * (yo + (nint)gfo.top) + (nint)gfo.left
+        for xo in 0..(nint)gfo.width {
+            var ka = sctx.xscr.data[xscr + xo]
+            if ka.a[3] != 0 {
+                _ = kchistAdd(ref kch, kacK(ka), 1)
+            }
+        }
+    }
+    for i in 0..(nint)g.colormaps[gfcm].ncol {
+        _ = kchistAdd(ref kch, kcMakegfcg(read g.kc, g.colormaps[gfcm].col[i]), 0xFFFFFFFF)
+    }
+    kchistCompress(ref kch)
+
+    var div = kcdiversityInit(ref kch, false)
+    int i = 0
+    while i != kch.n && i != g.colormaps[gfcm].ncol && kch.h[(nint)i].count == 0xFFFFFFFF {
+        _ = kcdiversityChoose(ref div, read kch, i, false)
+        i += 1
+    }
+
+    int nadded = 0
+    while g.colormaps[gfcm].ncol < sctx.scaleColors {
+        int chosen = kcdiversityFindDiverse(read div, read kch, 0.0)
+        if chosen >= kch.n || div.minDist[(nint)chosen] <= sctx.maxDesiredDist {
+            break
+        }
+        _ = kcdiversityChoose(ref div, read kch, chosen, false)
+        var gfc = kcTogfcg(read g.kc, kacK(kch.h[(nint)chosen].ka))
+        // Rounding to 8 bits can yield a color already in the colormap (the rounding error can
+        // exceed max_desired_dist); don't add it again.
+        if gifFindColor(g.colormaps[gfcm], gfc) >= 0 {
+            continue
+        }
+        // The transparent index can't hold an opaque color; give it a disabled placeholder.
+        if g.colormaps[gfcm].ncol == transparent {
+            _ = gifAddColor(ref g.colormaps[gfcm], gfc, g.colormaps[gfcm].ncol)
+            sctxAdd8g(ref g, ref sctx, gfc)
+            sctxDisable(ref sctx, transparent)
+            if g.colormaps[gfcm].ncol == sctx.scaleColors {
+                break
+            }
+        }
+        _ = gifAddColor(ref g.colormaps[gfcm], gfc, g.colormaps[gfcm].ncol)
+        sctxAdd8g(ref g, ref sctx, gfc)
+        nadded += 1
+    }
+    return nadded != 0
+}
+
+void scaleImageComplete(ref Gt g, ref ScaleContext sctx, ref ScaledImage gfo) {
+    nint gfi = sctx.gfi
+    int transparent = g.images[gfi].transparent
+    bool isLocal = g.images[gfi].local != None
+    while true {
+        uint maxDist = 0
+        uint dist = 0
+        // look up palette for output screen
+        for yo in 0..(nint)gfo.height {
+            nint data = yo * (nint)gfo.width
+            nint xscr = sctx.xscr.width * (yo + (nint)gfo.top) + (nint)gfo.left
+            nint oscr = sctx.oscr.width * (yo + (nint)gfo.top) + (nint)gfo.left
+            for xo in 0..(nint)gfo.width {
+                var x = sctx.xscr.data[xscr + xo]
+                var o = sctx.oscr.data[oscr + xo]
+                if x.a[3] != 0 {
+                    gfo.data[data + xo] = (byte)sctxClosest(ref sctx, kacK(x), ref dist)
+                    // maybe previous color is actually closer to desired
+                    if transparent >= 0 && o.a[3] != 0 {
+                        uint dist2 = kcDistance(kacK(o), kacK(x))
+                        if dist2 <= dist {
+                            gfo.data[data + xo] = (byte)transparent
+                            dist = dist2
+                        }
+                    }
+                    if dist > maxDist {
+                        maxDist = dist
+                    }
+                } else if transparent >= 0 {
+                    gfo.data[data + xo] = (byte)transparent
+                } else if o.a[3] != 0 {
+                    // no input pixel contributed, but the image is opaque
+                    gfo.data[data + xo] = (byte)sctxClosest(ref sctx, kacK(o), ref dist)
+                } else {
+                    gfo.data[data + xo] = (byte)sctxClosest(ref sctx, kacK(x), ref dist)
+                }
+            }
+        }
+
+        // if the global colormap has changed, we must retry (in C only with threads)
+        if !isLocal {
+            nint gfcm = g.streams[sctx.gfs].global
+            if g.colormaps[gfcm].ncol > sctx.globalKd3.nitems {
+                scaleImageUpdateGlobalKd3(ref g, ref sctx)
+                if transparent >= 0 && transparent < sctx.globalKd3.nitems {
+                    kd3Disable(ref sctx.globalKd3, transparent)
+                }
+                continue
+            }
+        }
+
+        // maybe add some colors
+        if maxDist > sctx.maxDesiredDist {
+            nint gfcm = g.images[gfi].local
+            if gfcm == None {
+                gfcm = g.streams[sctx.gfs].global
+            }
+            if g.colormaps[gfcm].ncol < sctx.scaleColors && scaleImageAddColors(ref g, ref sctx, gfo) {
+                continue
+            }
+        }
+        break
+    }
+
+    // apply disposal to sctx.iscr and sctx.oscr
+    if (nint)sctx.imageno != g.streams[sctx.gfs].images.length() - 1 {
+        ksscreenDispose(ref sctx.iscr, g.images[gfi])
+        int disposal = (int)g.images[gfi].disposal
+        if disposal == GifDisposalBackground {
+            kcscreenDispose(ref sctx.oscr, gfo)
+        } else if disposal != GifDisposalPrevious {
+            var ks = sctxKs(sctx)
+            kcscreenApply(ref sctx.oscr, gfo, read ks)
+        }
+    }
+
+    if isLocal {
+        kd3Cleanup(ref sctx.localKd3)
+    }
+}
+
+struct PixelRange : Copyable {
+    int lo
+    int hi
+}
+
+struct PixelRange2 : Copyable {
+    float b0
+    float b1
+    int lo
+    int hi
+}
+
+PixelRange makePixelRange(int xi, int maxi, int maxo, float f) {
+    var pr = PixelRange { lo = (int)((float)xi * f), hi = 0 }
+    if xi + 1 == maxi {
+        pr.hi = maxo
+    } else {
+        pr.hi = (int)((float)(xi + 1) * f)
+    }
+    if pr.hi == pr.lo {
+        pr.hi += 1
+    }
+    return pr
+}
+
+PixelRange2 makePixelRange2(int xi, int maxi, int maxo, float f) {
+    var pr = PixelRange2 { b0 = (float)xi * f, b1 = (float)(xi + 1) * f, lo = 0, hi = 0 }
+    pr.lo = (int)pr.b0
+    if xi + 1 == maxi {
+        pr.hi = maxo
+    } else {
+        pr.hi = (int)((double)pr.b1).ceil()
+    }
+    if pr.hi == pr.lo {
+        pr.hi += 1
+    }
+    return pr
+}
+
+void scaleImageDataBox(ref Gt g, ref ScaleContext sctx, ref ScaledImage gfo) {
+    nint width = (nint)gfo.width
+    var xpr = List<PixelRange>.repeat(PixelRange { lo = 0, hi = 0 }, width)
+    var sc = List<ScaleColor>.repeat(scZero(), width)
+    scaleImagePrepare(ref g, ref sctx)
+
+    // input column range for each output column; ranges overlap when upscaling
+    for xo in 0..width {
+        xpr[xo] = makePixelRange((int)xo + gfo.left, (int)sctx.oscr.width, (int)sctx.iscr.width, sctx.oxf)
+    }
+
+    // walk over output image
+    for yo in 0..gfo.height {
+        var ypr = makePixelRange(yo + gfo.top, (int)sctx.oscr.height, (int)sctx.iscr.height, sctx.oyf)
+        for xo in 0..width {
+            // collect input mix
+            var mix = scZero()
+            for j in (nint)ypr.lo..(nint)ypr.hi {
+                nint indata = sctx.iscr.width * j
+                for i in (nint)xpr[xo].lo..(nint)xpr[xo].hi {
+                    scAdd(ref mix, sctx.iscr.data[indata + i])
+                }
+            }
+            // scale channels
+            scDiv(ref mix, (float)((ypr.hi - ypr.lo) * (xpr[xo].hi - xpr[xo].lo)))
+            sc[xo] = mix
+        }
+        // generate output
+        scaleImageOutputRow(g, ref sctx, ref sc, gfo, yo)
+    }
+
+    scaleImageComplete(ref g, ref sctx, ref gfo)
+}
+
+float mixFactor(int val, float b0, float b1) {
+    float v = (float)val
+    if v < b0 && b1 < v + 1.0 {
+        return b1 - b0
+    } else if v < b0 {
+        return 1.0 - (b0 - v)
+    } else if b1 < v + 1.0 {
+        return b1 - v
+    }
+    return 1.0
+}
+
+struct ScaleMixinfo : Copyable {
+    ushort xi
+    ushort xo
+    float f
+}
+
+void scaleImageDataMix(ref Gt g, ref ScaleContext sctx, ref ScaledImage gfo) {
+    nint width = (nint)gfo.width
+    var sc = List<ScaleColor>.repeat(scZero(), width)
+    var mix = List<ScaleMixinfo>.withCapacity(sctx.iscr.width * 2)
+
+    scaleImagePrepare(ref g, ref sctx)
+
+    // construct mixinfo
+    for xo in 0..width {
+        var xpr = makePixelRange2((int)xo + gfo.left, (int)sctx.oscr.width, (int)sctx.iscr.width, sctx.oxf)
+        for i in xpr.lo..xpr.hi {
+            mix.add(ScaleMixinfo { xi = (ushort)i, xo = (ushort)xo, f = mixFactor(i, xpr.b0, xpr.b1) })
+        }
+    }
+
+    for yo in 0..gfo.height {
+        var ypr = makePixelRange2(yo + gfo.top, (int)sctx.oscr.height, (int)sctx.iscr.height, sctx.oyf)
+        for xo in 0..width {
+            sc[xo] = scZero()
+        }
+        // collect input mixes
+        for j in ypr.lo..ypr.hi {
+            float jf = mixFactor(j, ypr.b0, ypr.b1) * sctx.ixf * sctx.iyf
+            nint indata = sctx.iscr.width * (nint)j
+            for mi in 0..mix.length() {
+                var m = mix[mi]
+                scAddTimes(ref sc[(nint)m.xo], sctx.iscr.data[indata + (nint)m.xi], m.f * jf)
+            }
+        }
+        // generate output
+        scaleImageOutputRow(g, ref sctx, ref sc, gfo, yo)
+    }
+
+    scaleImageComplete(ref g, ref sctx, ref gfo)
+}
+
+void scaleWeightsetAdd(ref List<ScaleWeight> wset, int ipos, int opos, double w) {
+    nint n = wset.length()
+    if n != 0 && wset[n - 1].ipos == ipos && wset[n - 1].opos == opos {
+        wset[n - 1].w = (float)((double)wset[n - 1].w + w)
+    } else {
+        wset.add(ScaleWeight { w = (float)w, ipos = ipos, opos = opos })
+    }
+}
+
+// The filters: C passes a function, here its number.
+const int WeightCatrom = 0
+const int WeightMitchell = 1
+const int WeightLanczos2 = 2
+const int WeightLanczos3 = 3
+
+// `a * b + c` rounded once. clang, which builds gifsicle on macOS, fuses a multiplication that is
+// an operand of an addition or a subtraction in the same expression (`-ffp-contract=on`), the
+// left operand first; SG never fuses on its own, so where gifsicle's arithmetic is fused it is
+// written out here, and the weights are gifsicle's to the last bit.
+double fmuladd(double a, double b, double c) {
+    return a.fusedMultiplyAdd(b, c)
+}
+
+// ((12 - 9*b - 6*c) * x*x*x + (-18 + 12*b + 6*c) * x*x + (6 - 2*b)) / 6 for x < 1,
+// ((-b - 6*c) * x*x*x + (6*b + 30*c) * x*x + (-12*b - 48*c) * x + (8*b + 24*c)) / 6 for x < 2,
+// fused as clang fuses them
+double scaleWeightCubic(double x0, double b, double c) {
+    double x = x0.abs()
+    if x < 1.0 {
+        double p = fmuladd(-6.0, c, fmuladd(-9.0, b, 12.0))
+        double q = fmuladd(6.0, c, fmuladd(12.0, b, -18.0))
+        return (fmuladd(p * x * x, x, q * x * x) + fmuladd(-2.0, b, 6.0)) / 6.0
+    } else if x < 2.0 {
+        double r1 = fmuladd(-6.0, c, -b)
+        double r2 = fmuladd(6.0, b, 30.0 * c)
+        double r3 = fmuladd(-12.0, b, -(48.0 * c))
+        double r4 = fmuladd(8.0, b, 24.0 * c)
+        return (fmuladd(r3, x, fmuladd(r1 * x * x, x, r2 * x * x)) + r4) / 6.0
+    }
+    return 0.0
+}
+
+double sinc(double x) {
+    if x <= 0.000000005 {
+        return 1.0
+    }
+    return (double.Pi * x).sin() / (double.Pi * x)
+}
+
+double scaleWeightLanczos(double x0, int lobes) {
+    double x = x0.abs()
+    if x < (double)lobes {
+        return sinc(x) * sinc(x / (double)lobes)
+    }
+    return 0.0
+}
+
+double scaleWeight(int kind, double x) {
+    return match kind {
+        WeightCatrom => scaleWeightCubic(x, 0.0, 0.5)
+        WeightMitchell => scaleWeightCubic(x, 1.0 / 3.0, 1.0 / 3.0)
+        WeightLanczos2 => scaleWeightLanczos(x, 2)
+        _ => scaleWeightLanczos(x, 3)
+    }
+}
+
+void scaleWeightsetCreate(ref List<ScaleWeight> wset, int nin, int nout, int kind, double radius) {
+    double of = (double)nin / (double)nout
+    double reduction = 1.0
+    if of > 1.0 {
+        reduction = of
+    }
+    for opos in 0..nout {
+        double icenter = fmuladd((double)opos + 0.5, of, -0.5)
+        int ipos0 = (int)(fmuladd(-radius, reduction, icenter) - 0.0001).ceil()
+        int ipos1 = (int)(fmuladd(radius, reduction, icenter) + 0.0001).floor() + 1
+        nint wset0 = wset.length()
+        double sum = 0.0
+        while ipos0 != ipos1 {
+            double w = scaleWeight(kind, ((double)ipos0 - icenter) / reduction)
+            if w != 0.0 {
+                int ripos = ipos0
+                if ipos0 < 0 {
+                    ripos = 0
+                } else if ipos0 >= nin {
+                    ripos = nin - 1
+                }
+                scaleWeightsetAdd(ref wset, ripos, opos, w)
+                sum += w
+            }
+            ipos0 += 1
+        }
+        for i in wset0..wset.length() {
+            wset[i].w = (float)((double)wset[i].w / sum)
+        }
+    }
+    scaleWeightsetAdd(ref wset, nin, nout, 0.0)
+}
+
+void scaleImageDataWeighted(ref Gt g, ref ScaleContext sctx, ref ScaledImage gfo, int kind, double radius) {
+    nint width = (nint)gfo.width
+    var sc = List<ScaleColor>.repeat(scZero(), width)
+    var kcx = List<ScaleColor>.repeat(scZero(), width * sctx.iscr.height)
+
+    if sctx.xweights.length() == 0 {
+        scaleWeightsetCreate(ref sctx.xweights, (int)sctx.iscr.width, (int)sctx.oscr.width, kind, radius)
+        scaleWeightsetCreate(ref sctx.yweights, (int)sctx.iscr.height, (int)sctx.oscr.height, kind, radius)
+    }
+
+    scaleImagePrepare(ref g, ref sctx)
+
+    // scale every input row by the X scaling factor
+    double oyf = (double)sctx.oyf
+    double ycmp = radius
+    if sctx.oyf > 1.0 {
+        ycmp = radius * oyf
+    }
+    int yi0 = (int)((double)((float)gfo.top * sctx.oyf) - ycmp - 0.0001).floor()
+    if yi0 < 0 {
+        yi0 = 0
+    }
+    int yi1 = (int)((double)((float)(gfo.top + gfo.height) * sctx.oyf) + ycmp + 0.0001).ceil() + 1
+    if yi1 > (int)sctx.iscr.height {
+        yi1 = (int)sctx.iscr.height
+    }
+
+    nint ww = 0
+    while sctx.xweights[ww].opos < gfo.left {
+        ww += 1
+    }
+    for yi in (nint)yi0..(nint)yi1 {
+        nint iscr = sctx.iscr.width * yi
+        nint oscr = width * yi
+        for xo in 0..width {
+            kcx[oscr + xo] = scZero()
+        }
+        nint w = ww
+        while sctx.xweights[w].opos < gfo.left + gfo.width {
+            var weight = sctx.xweights[w]
+            scAddTimes(ref kcx[oscr + (nint)(weight.opos - gfo.left)], sctx.iscr.data[iscr + (nint)weight.ipos], weight.w)
+            w += 1
+        }
+    }
+
+    // scale the resulting rows by the y factor
+    nint w = 0
+    while sctx.yweights[w].opos < gfo.top {
+        w += 1
+    }
+    for yo in 0..gfo.height {
+        for xo in 0..width {
+            sc[xo] = scZero()
+        }
+        while sctx.yweights[w].opos < gfo.top + yo + 1 {
+            var weight = sctx.yweights[w]
+            nint iscr = width * (nint)weight.ipos
+            for xo in 0..width {
+                scAddTimes(ref sc[xo], kcx[iscr + xo], weight.w)
+            }
+            w += 1
+        }
+        // generate output
+        scaleImageOutputRow(g, ref sctx, ref sc, gfo, yo)
+    }
+
+    scaleImageComplete(ref g, ref sctx, ref gfo)
+}
+
+int scaleClipCoord(double v, int max) {
+    if v <= 0.0 {
+        return 0
+    } else if v >= (double)max {
+        return max
+    }
+    return (int)v
+}
+
+void scaleImage(ref Gt g, ref ScaleContext sctx, int method) {
+    nint gfi = sctx.gfi
+    bool wasCompressed = !g.images[gfi].hasImg
+    int gleft = (int)g.images[gfi].left
+    int gtop = (int)g.images[gfi].top
+    int gwidth = (int)g.images[gfi].width
+    int gheight = (int)g.images[gfi].height
+    int ow = (int)sctx.oscr.width
+    int oh = (int)sctx.oscr.height
+
+    // Fri 9 Jan 1999: Fix problem with resizing animated GIFs: we scaled from left edge of the
+    // *subimage* to right edge of the subimage, causing consistency problems when several
+    // subimages overlap. Solution: always use scale factors relating to the *whole image* (the
+    // screen size).
+
+    // calculate new width and height based on the four edges (left, right, top, bottom). This is
+    // better than simply multiplying the width and height by the scale factors because it avoids
+    // roundoff inconsistencies between frames on animated GIFs. Don't allow 0-width or 0-height
+    // images; GIF doesn't support them well.
+
+    // clip to the output screen. Frames can extend past the logical screen; those parts are
+    // invisible, and their scaled coordinates might not fit in 16 bits (or an int).
+    int left = scaleClipCoord((double)((float)gleft * sctx.ixf), ow)
+    int top = scaleClipCoord((double)((float)gtop * sctx.iyf), oh)
+    int right = scaleClipCoord(((double)((float)(gleft + gwidth) * sctx.ixf)).ceil(), ow)
+    int bottom = scaleClipCoord(((double)((float)(gtop + gheight) * sctx.iyf)).ceil(), oh)
+    // account for floating point errors at bottom right edge
+    if (nint)(gleft + gwidth) == sctx.iscr.width {
+        right = ow
+    }
+    if (nint)(gtop + gheight) == sctx.iscr.height {
+        bottom = oh
+    }
+    if left > right {
+        left = right
+    }
+    if top > bottom {
+        top = bottom
+    }
+    var gfo = ScaledImage { left = left, top = top, width = right - left, height = bottom - top,
+        transparent = g.images[gfi].transparent, disposal = (int)g.images[gfi].disposal, data = List<byte>() }
+
+    // Point scaling method is special: rather than rendering the input image into a frame buffer,
+    // it works on per-frame data. Thus we must verify that the output bounds completely fit into
+    // the input image's per-frame data. Using pixel midpoints complicates this task.
+    if method == ScaleMethodPoint {
+        double oxf = (double)sctx.oxf
+        double oyf = (double)sctx.oyf
+        if gfo.width != 0 && (int)(((double)gfo.left + 0.5) * oxf) < gleft {
+            gfo.left += 1
+            gfo.width -= 1
+        }
+        if gfo.width != 0 && (int)(((double)(gfo.left + gfo.width) - 0.5) * oxf) >= gleft + gwidth {
+            gfo.width -= 1
+        }
+        if gfo.height != 0 && (int)(((double)gfo.top + 0.5) * oyf) < gtop {
+            gfo.top += 1
+            gfo.height -= 1
+        }
+        if gfo.height != 0 && (int)(((double)(gfo.top + gfo.height) - 0.5) * oyf) >= gtop + gheight {
+            gfo.height -= 1
+        }
+    }
+
+    if gfo.width == 0 || gfo.height == 0 {
+        // keep the placeholder on the screen
+        if gfo.left >= ow {
+            gfo.left = ow - 1
+        }
+        if gfo.top >= oh {
+            gfo.top = oh - 1
+        }
+        gfo.width = 1
+        gfo.height = 1
+        gfo.data = List<byte>.repeat(0, 1)
+        gfo.transparent = 0
+        gfo.disposal = GifDisposalAsis
+    } else {
+        if wasCompressed {
+            _ = gifUncompressImage(ref g, sctx.gfs, gfi)
+        }
+        gfo.data = List<byte>.repeat(0, (nint)gfo.width * (nint)gfo.height)
+        if method == ScaleMethodMix {
+            scaleImageDataMix(ref g, ref sctx, ref gfo)
+        } else if method == ScaleMethodBox {
+            scaleImageDataBox(ref g, ref sctx, ref gfo)
+        } else if method == ScaleMethodCatrom {
+            scaleImageDataWeighted(ref g, ref sctx, ref gfo, WeightCatrom, 2.0)
+        } else if method == ScaleMethodLanczos2 {
+            scaleImageDataWeighted(ref g, ref sctx, ref gfo, WeightLanczos2, 2.0)
+        } else if method == ScaleMethodLanczos3 {
+            scaleImageDataWeighted(ref g, ref sctx, ref gfo, WeightLanczos3, 3.0)
+        } else if method == ScaleMethodMitchell {
+            scaleImageDataWeighted(ref g, ref sctx, ref gfo, WeightMitchell, 2.0)
+        } else {
+            scaleImageDataPoint(ref g, ref sctx, ref gfo)
+        }
+    }
+
+    // the scaled frame takes the place of the frame
+    gifReleaseUncompressedImage(ref g, gfi)
+    gifReleaseCompressedImage(ref g, gfi)
+    g.images[gfi].left = u16(gfo.left)
+    g.images[gfi].top = u16(gfo.top)
+    g.images[gfi].width = u16(gfo.width)
+    g.images[gfi].height = u16(gfo.height)
+    g.images[gfi].transparent = gfo.transparent
+    g.images[gfi].disposal = (byte)gfo.disposal
+    gifSetUncompressedImage(ref g, gfi, gfo.data.replace(List<byte>()), false)
+    if wasCompressed {
+        var info = g.gifWriteInfo
+        _ = gifFullCompressImage(ref g, sctx.gfs, gfi, read info)
+        gifReleaseUncompressedImage(ref g, gfi)
+    }
+}
+
+// Set `w` and `h` to the dimensions of a `w` x `h` image resized as requested. Return -1 if the
+// result would be larger than a GIF allows.
+int resizeDimensions(ref int w, ref int h, double newWidth0, double newHeight0, int flags) {
+    double newWidth = newWidth0
+    double newHeight = newHeight0
+    if newWidth < 0.5 && newHeight < 0.5 {
+        // do nothing
+        return 0
+    } else if newWidth < 0.5 {
+        newWidth = (double)w * newHeight / (double)h
+    } else if newHeight < 0.5 {
+        newHeight = (double)h * newWidth / (double)w
+    }
+
+    if (flags & GtResizeFit) != 0 {
+        double xfactor = newWidth / (double)w
+        double yfactor = newHeight / (double)h
+        double factor = yfactor
+        if (xfactor < yfactor) == ((flags & GtResizeMinDimen) == 0) {
+            factor = xfactor
+        }
+        if ((flags & GtResizeFitDown) != 0 && factor >= 1.0) || ((flags & GtResizeFitUp) != 0 && factor <= 1.0) {
+            return 0
+        }
+        newWidth = (double)w * factor
+        newHeight = (double)h * factor
+    }
+
+    if newWidth >= (double)GifMaxScreenWidth + 0.5 || newHeight >= (double)GifMaxScreenHeight + 0.5 {
+        return -1
+    }
+
+    w = (int)(newWidth + 0.5)
+    h = (int)(newHeight + 0.5)
+
+    // refuse to create 0-pixel dimensions
+    if w == 0 {
+        w = 1
+    }
+    if h == 0 {
+        h = 1
+    }
+    return 0
+}
+
+// Resize `gfs`. Return -1, after reporting an error, if the result would be larger than a GIF
+// allows.
+int resizeStream(ref Gt g, nint gfs, double newWidth, double newHeight, int flags, int method0, int scaleColors, int nthreads0) {
+    gifCalculateScreenSize(ref g, gfs, false)
+    if g.streams[gfs].screenWidth == 0 || g.streams[gfs].screenHeight == 0 {
+        return 0
+    }
+    int sw = (int)g.streams[gfs].screenWidth
+    int sh = (int)g.streams[gfs].screenHeight
+    int nw = sw
+    int nh = sh
+    if resizeDimensions(ref nw, ref nh, newWidth, newHeight, flags) < 0 {
+        error(ref g, 1, "new image is too large (max size 65535x65535)", read List<string>())
+        return -1
+    }
+    if nw == sw && nh == sh {
+        return 0
+    }
+
+    // no point to MIX or BOX method if we're expanding the image in both dimens
+    int method = method0
+    if method == ScaleMethodBox && sw <= nw && sh <= nh {
+        method = ScaleMethodPoint
+    }
+    if method == ScaleMethodMix && sw <= nw && sh <= nh && nw % sw == 0 && nh % sh == 0 {
+        method = ScaleMethodPoint
+    }
+    // ensure we understand the method
+    if method != ScaleMethodMix && method != ScaleMethodBox && method != ScaleMethodCatrom &&
+        method != ScaleMethodLanczos2 && method != ScaleMethodLanczos3 && method != ScaleMethodMitchell {
+        method = ScaleMethodPoint
+    }
+
+    // Opaque output pixels need a color other than the transparent one.
+    nint nimages = g.streams[gfs].images.length()
+    for i in 0..nimages {
+        nint gfi = g.streams[gfs].images[i]
+        nint gfcm = g.images[gfi].local
+        if gfcm == None {
+            gfcm = g.streams[gfs].global
+        }
+        if gfcm != None && g.colormaps[gfcm].ncol == 1 && g.images[gfi].transparent == 0 {
+            var gfc = g.colormaps[gfcm].col[0]
+            _ = gifAddColor(ref g.colormaps[gfcm], gfc, -1)
+        }
+    }
+
+    int nthreads = nthreads0
+    if (nint)nthreads > nimages {
+        nthreads = (int)nimages
+    }
+    var sctx = sctxInit(g.streams[gfs], gfs, (nint)nw, (nint)nh)
+    sctx.scaleColors = scaleColors
+    sctx.imageno = 0
+    // Threaded resize only works if the input image is unoptimized.
+    nint i = 0
+    while nthreads > 1 && i < nimages {
+        nint gfi = g.streams[gfs].images[i]
+        if g.images[gfi].left != 0 || g.images[gfi].top != 0 || (int)g.images[gfi].width != sw || (int)g.images[gfi].height != sh ||
+            (i != nimages - 1 && (int)g.images[gfi].disposal != GifDisposalBackground && g.images[g.streams[gfs].images[i + 1]].transparent >= 0) {
+            warning(ref g, 1, "image too complex for multithreaded resize, using 1 thread\n  (Try running the GIF through %<gifsicle -U%>.)", read List<string>())
+            nthreads = 1
+        }
+        i += 1
+    }
+
+    while (nint)sctx.imageno < nimages {
+        sctx.gfi = g.streams[gfs].images[(nint)sctx.imageno]
+        scaleImage(ref g, ref sctx, method)
+        sctx.imageno += 1
+    }
+
+    g.streams[gfs].screenWidth = (ushort)nw
+    g.streams[gfs].screenHeight = (ushort)nh
+    return 0
+}

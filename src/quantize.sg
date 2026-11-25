@@ -1,0 +1,132 @@
+// quantize.sg - Color quantization for gifsicle (quantize.c).
+// Copyright (C) 1997-2025 Eddie Kohler, ekohler@gmail.com
+// SG translation of gifsicle 1.99. This file is part of sg-gifsicle.
+//
+// Gifsicle is free software. It is distributed under the GNU Public License, version 2; you can
+// copy, distribute, or alter it at will, as long as this notice is kept intact and this source
+// code is made available. There is no warranty, express or implied.
+//
+// So far the part resizing needs: choosing diverse colors from a histogram (kcdiversity).
+
+struct Kcdiversity {
+    List<int> closest
+    List<uint> minDist
+    bool dither
+    List<uint> minDitherDist
+    List<int> chosen
+    int nchosen
+}
+
+// sorts the histogram by popularity, most popular first
+Kcdiversity kcdiversityInit(ref Kchist kch, bool dodither) {
+    nint n = (nint)kch.n
+    var perm = List<int>.repeat(0, n)
+    var key = List<long>.repeat(0, n)
+    for i in 0..n {
+        perm[i] = (int)i
+        key[i] = -(long)kch.h[i].count
+    }
+    sortPerm(ref perm, 0, n, read key)
+    var sorted = List<KchistItem>.withCapacity(n)
+    for i in 0..n {
+        sorted.add(kch.h[(nint)perm[i]])
+    }
+    for i in 0..n {
+        kch.h[i] = sorted[i]
+    }
+    var minDitherDist = List<uint>()
+    if dodither {
+        minDitherDist = List<uint>.repeat(0xFFFFFFFF, n)
+    }
+    return Kcdiversity { closest = List<int>.repeat(0, n), minDist = List<uint>.repeat(0xFFFFFFFF, n), dither = dodither,
+        minDitherDist = minDitherDist, chosen = List<int>.repeat(0, n), nchosen = 0 }
+}
+
+int kcdiversityFindPopular(read Kcdiversity div, read Kchist kch) {
+    int i = 0
+    while i != kch.n && div.minDist[(nint)i] == 0 {
+        i += 1
+    }
+    return i
+}
+
+int kcdiversityFindDiverse(read Kcdiversity div, read Kchist kch, double ditherweight) {
+    int n = kch.n
+    int chosen = kcdiversityFindPopular(div, kch)
+    if chosen == n {
+        return chosen
+    }
+    if ditherweight == 0.0 || !div.dither {
+        for i in chosen + 1..n {
+            if div.minDist[(nint)i] > div.minDist[(nint)chosen] {
+                chosen = i
+            }
+        }
+    } else {
+        double maxDist = (double)div.minDist[(nint)chosen] + ditherweight * (double)div.minDitherDist[(nint)chosen]
+        for i in chosen + 1..n {
+            if div.minDist[(nint)i] != 0 {
+                double dist = (double)div.minDist[(nint)i] + ditherweight * (double)div.minDitherDist[(nint)i]
+                if dist > maxDist {
+                    chosen = i
+                    maxDist = dist
+                }
+            }
+        }
+    }
+    return chosen
+}
+
+int kcdiversityChoose(ref Kcdiversity div, read Kchist kch, int chosen, bool dodither) {
+    nint n = (nint)kch.n
+    nint c = (nint)chosen
+    div.minDist[c] = 0
+    if div.dither {
+        div.minDitherDist[c] = 0
+    }
+    div.closest[c] = chosen
+
+    // adjust the min_dist array
+    var at = kacK(kch.h[c].ka)
+    for i in 0..n {
+        if div.minDist[i] != 0 {
+            uint dist = kcDistance(kacK(kch.h[i].ka), at)
+            if dist < div.minDist[i] {
+                div.minDist[i] = dist
+                div.closest[i] = chosen
+            }
+        }
+    }
+
+    // also account for dither distances
+    if dodither && div.dither {
+        for i in 0..(nint)div.nchosen {
+            var x = at
+            var y = kacK(kch.h[(nint)div.chosen[i]].ka)
+            // penalize combinations with large luminance difference
+            double dL = (double)(kcLuminance(x) - kcLuminance(y)).abs()
+            if dL > 8192.0 {
+                dL = dL * 4.0 / 32767.0
+            } else {
+                dL = 1.0
+            }
+            // create combination
+            for k in 0..3 {
+                x.a[k] = (short)(((int)x.a[k] + (int)y.a[k]) >> 1)
+            }
+            // track closeness of combination to other colors
+            for j in 0..n {
+                if div.minDist[j] != 0 {
+                    double dist = (double)kcDistance(kacK(kch.h[j].ka), x) * dL
+                    if dist < (double)div.minDitherDist[j] {
+                        div.minDitherDist[j] = (uint)dist
+                    }
+                }
+            }
+        }
+    }
+
+    div.chosen[(nint)div.nchosen] = chosen
+    div.nchosen += 1
+    return chosen
+}

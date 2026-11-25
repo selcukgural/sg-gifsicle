@@ -2,7 +2,7 @@
 # each in a folder of its own; the exit code, the output, the standard error and every file written
 # must be the same.
 #
-#   python3 tests/differ.py [--quick] [--gifs DIR]... [WORD]...
+#   python3 tests/differ.py [--quick] [--show N] [--gifs DIR]... [WORD]...
 #
 # The GIFs: those `gifs.py` makes from a seed (written once into tests/corpus/), the icons of the
 # system where there are some (/usr/share/httpd/icons on macOS), and any folder given with --gifs.
@@ -36,6 +36,17 @@ OPTIONS = [
     ["-t", "#000000", "-O2"], ["--disposal=bg", "-O2"], ["-p", "10,10", "-S", "300x300"],
     ["--max-screen", "20x20", "-U"], ["-m", "{0}", "{0}"], ["--multifile", "{0}"], ["--no-ignore-errors", "-O1"],
     ["--optimize=keep-empty", "-O3"], ["-O3", "--unoptimize"],
+    # resizing
+    ["--resize", "20x20"], ["--resize", "200x150"], ["--scale", "0.5"], ["--scale", "2"], ["--scale", "1.5x0.7"],
+    ["--resize-width", "33"], ["--resize-height", "7"], ["--resize-fit", "40x40"], ["--resize-touch", "50x10"],
+    ["--resize-geometry", "30x30^"], ["--resize", "1x1"], ["--resize", "300x2"],
+    *[["--resize-method", m, size, value] for m in ("sample", "box", "mix", "catrom", "lanczos2", "lanczos3", "mitchell")
+      for size, value in (("--resize", "37x29"), ("--scale", "2.3"), ("--scale", "0.37"))],
+    ["--resize-colors", "64", "--resize", "30x30"], ["--resize-colors", "256", "--resize-method", "lanczos3", "--scale", "0.6"],
+    ["--resize-colors", "8", "--resize-method", "box", "--scale", "0.5"],
+    ["-U", "--resize", "50x40"], ["--resize", "50x40", "-O3"], ["-j4", "--resize", "40x40"], ["-j4", "-U", "--resize", "40x40"],
+    ["-j4", "-U", "--resize-colors", "128", "--resize-method", "catrom", "--resize", "40x40"],
+    ["--crop", "2,2+20x20", "--resize", "10x30"], ["--rotate-90", "--scale", "0.8"], ["-t", "#000000", "--scale", "0.7"],
 ]
 HEAVY = {"e-bad-frame-too-large.gif"}
 HEAVY_OPTIONS = [[], ["-I"], ["-O2"], ["-U"], ["--crop", "3,3+20x15"]]
@@ -84,12 +95,14 @@ def case(ref, new, gif, options, limit):
 
 
 def main():
-    words, folders, quick = [], [], False
+    words, folders, quick, show = [], [], False, 25
     argv = sys.argv[1:]
     while argv:
         word = argv.pop(0)
         if word == "--quick":
             quick = True
+        elif word == "--show":
+            show = int(argv.pop(0))
         elif word == "--gifs":
             folders.append(argv.pop(0))
         else:
@@ -112,7 +125,7 @@ def main():
         total += 1
         if a != b:
             differ += 1
-            if differ <= 25:
+            if differ <= show:
                 (ra, fa), (rb, fb) = a, b
                 print(f"DIFF {os.path.basename(gif)} {' '.join(options)}: code {ra[0]} {rb[0]}, "
                       f"output {len(ra[1])} {len(rb[1])} bytes, files {sorted(fa)} {sorted(fb)}"

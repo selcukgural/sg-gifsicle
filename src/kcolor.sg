@@ -142,8 +142,9 @@ void kcSetGamma(ref Gt g, int type, double gamma) {
         var g0 = List<ushort>.repeat(0, 256)
         var g1 = List<ushort>.repeat(0, 256)
         for j in 0..256 {
-            g0[j] = (ushort)(int)(((double)j / 255.0).pow(gamma) * 32767.0 + 0.5)
-            g1[j] = (ushort)(int)(((double)j / 256.0).pow(1.0 / gamma) * 32767.0 + 0.5)
+            // `pow(...) * 32767 + 0.5` is one fused multiply-add in gifsicle as clang builds it
+            g0[j] = (ushort)(int)((double)j / 255.0).pow(gamma).fusedMultiplyAdd(32767.0, 0.5)
+            g1[j] = (ushort)(int)((double)j / 256.0).pow(1.0 / gamma).fusedMultiplyAdd(32767.0, 0.5)
             // round-trip gamma correction always preserves the input colors
             if j != 0 {
                 while g0[j] <= g0[j - 1] && g0[j] < 32767 {
@@ -159,4 +160,561 @@ void kcSetGamma(ref Gt g, int type, double gamma) {
     }
     g.kc.curType = type
     g.kc.curGamma = gamma
+}
+
+// ---- kacolor: a kcolor with a fourth component, alpha ----
+
+struct Kacolor : Copyable {
+    short[4] a
+}
+
+Kacolor kacOf(Kcolor k, int alpha) {
+    return Kacolor { a = short[4] { k.a[0], k.a[1], k.a[2], (short)alpha } }
+}
+
+Kcolor kacK(Kacolor x) {
+    return Kcolor { a = short[3] { x.a[0], x.a[1], x.a[2] } }
+}
+
+// return transparency
+Kacolor kacTransparent() {
+    return Kacolor { a = short[4] { 0, 0, 0, 0 } }
+}
+
+bool kacEq(Kacolor x, Kacolor y) {
+    return x.a[0] == y.a[0] && x.a[1] == y.a[1] && x.a[2] == y.a[2] && x.a[3] == y.a[3]
+}
+
+bool kcEq(Kcolor x, Kcolor y) {
+    return x.a[0] == y.a[0] && x.a[1] == y.a[1] && x.a[2] == y.a[2]
+}
+
+// ---- scale_color: four floats, the components and alpha of a mix of pixels ----
+// C keeps them in a vector of four floats where the compiler has one; each lane is the same
+// arithmetic of floats, written here a lane at a time.
+
+struct ScaleColor : Copyable {
+    float[4] a
+}
+
+ScaleColor scZero() {
+    return ScaleColor { a = float[4] { 0.0, 0.0, 0.0, 0.0 } }
+}
+
+ScaleColor scMakekc(Kcolor k) {
+    return ScaleColor { a = float[4] { (float)(int)k.a[0], (float)(int)k.a[1], (float)(int)k.a[2], (float)KcMax } }
+}
+
+// SCVEC_ADDV
+void scAdd(ref ScaleColor x, ScaleColor y) {
+    for k in 0..4 {
+        x.a[k] += y.a[k]
+    }
+}
+
+// SCVEC_ADDVxF. clang, which builds gifsicle on macOS, makes `x += y * f` one fused multiply-add
+// (C lets a compiler fuse within an expression, `-ffp-contract=on`); SG never fuses on its own, so
+// the fusion is written out, and the pixels are gifsicle's.
+void scAddTimes(ref ScaleColor x, ScaleColor y, float f) {
+    for k in 0..4 {
+        x.a[k] = y.a[k].fusedMultiplyAdd(f, x.a[k])
+    }
+}
+
+// SCVEC_MULF
+void scMul(ref ScaleColor x, float f) {
+    for k in 0..4 {
+        x.a[k] *= f
+    }
+}
+
+// SCVEC_DIVF
+void scDiv(ref ScaleColor x, float f) {
+    for k in 0..4 {
+        x.a[k] /= f
+    }
+}
+
+// ---- kchist: a histogram of colors, hashed while it is made, then a list ----
+
+struct KchistItem : Copyable {
+    Kacolor ka
+    uint count
+}
+
+struct Kchist {
+    List<KchistItem> h
+    int n
+    int capacity
+}
+
+int kchistSize(int i) {
+    return match i {
+        0 => 4093
+        1 => 16381
+        2 => 65521
+        3 => 262139
+        4 => 1048571
+        5 => 4194301
+        6 => 16777213
+        7 => 67108859
+        8 => 268435459
+        _ => 1073741839
+    }
+}
+
+KchistItem kchistEmpty() {
+    return KchistItem { ka = kacTransparent(), count = 0 }
+}
+
+Kchist kchistInit() {
+    int capacity = kchistSize(0)
+    return Kchist { h = List<KchistItem>.repeat(kchistEmpty(), (nint)capacity), n = 0, capacity = capacity }
+}
+
+// adds `count` of color `k`; gives the place of its item
+nint kchistAdd(ref Kchist kch, Kcolor k, uint count) {
+    var ka = kacOf(k, 0)
+    if kch.capacity == 0 || kch.n > ((kch.capacity * 3) >> 4) {
+        kchistGrow(ref kch)
+    }
+    uint cap = (uint)kch.capacity
+    uint hash1 = (uint)((((int)ka.a[0] & 0x7FE0) << 15) | (((int)ka.a[1] & 0x7FE0) << 5) | (((int)ka.a[2] & 0x7FE0) >> 5)) % cap
+    uint hash2 = 0
+    while true {
+        var khi = kch.h[(nint)hash1]
+        if khi.count == 0 || kacEq(khi.ka, ka) {
+            break
+        }
+        if hash2 == 0 {
+            hash2 = (uint)((((int)ka.a[0] & 0x03FF) << 20) | (((int)ka.a[1] & 0x03FF) << 10) | ((int)ka.a[2] & 0x03FF)) % cap
+            if hash2 == 0 {
+                hash2 = 1
+            }
+        }
+        hash1 += hash2
+        if hash1 >= cap {
+            hash1 -= cap
+        }
+    }
+    nint at = (nint)hash1
+    if kch.h[at].count == 0 {
+        kch.h[at].ka = ka
+        kch.n += 1
+    }
+    kch.h[at].count = kch.h[at].count.wrappingAdd(count)
+    if kch.h[at].count < count {
+        kch.h[at].count = 0xFFFFFFFF
+    }
+    return at
+}
+
+void kchistGrow(ref Kchist kch) {
+    var oldh = kch.h.replace(List<KchistItem>())
+    int oldcapacity = kch.capacity
+    if oldcapacity == 0 {
+        oldcapacity = kch.n
+    }
+    int i = 0
+    while kchistSize(i) <= oldcapacity {
+        i += 1
+    }
+    kch.capacity = kchistSize(i)
+    kch.h = List<KchistItem>.repeat(kchistEmpty(), (nint)kch.capacity)
+    kch.n = 0
+    for j in 0..(nint)oldcapacity {
+        if oldh[j].count != 0 {
+            _ = kchistAdd(ref kch, kacK(oldh[j].ka), oldh[j].count)
+        }
+    }
+}
+
+// the items with a count move to the front: `kch.h[0..kch.n]`
+void kchistCompress(ref Kchist kch) {
+    nint i = 0
+    nint j = (nint)kch.n
+    while i != (nint)kch.n {
+        if kch.h[i].count != 0 {
+            i += 1
+        } else if kch.h[j].count != 0 {
+            kch.h[i] = kch.h[j]
+            i += 1
+            j += 1
+        } else {
+            j += 1
+        }
+    }
+    kch.capacity = 0
+}
+
+uint countOf(read List<uint> lcount, read List<uint> gcount, bool isLocal, nint i) {
+    if isLocal {
+        return lcount[i]
+    }
+    return gcount[i]
+}
+
+Kchist kchistMake(ref Gt g, nint gfs, ref uint ntranspStore) {
+    var gcount = List<uint>.repeat(0, 256)
+    var lcount = List<uint>.repeat(0, 256)
+    uint nbackground = 0
+    uint ntransparent = 0
+    var kch = kchistInit()
+    nint nimages = g.streams[gfs].images.length()
+    for imagei in 0..nimages {
+        nint gfi = g.streams[gfs].images[imagei]
+        nint gfcm = g.images[gfi].local
+        if gfcm == None {
+            gfcm = g.streams[gfs].global
+        }
+        bool isLocal = g.images[gfi].local != None
+        if gfcm == None {
+            continue
+        }
+        if isLocal {
+            for i in 0..256 {
+                lcount[i] = 0
+            }
+        }
+        int transparent = g.images[gfi].transparent
+        uint oldTransparentCount = 0
+        if transparent >= 0 {
+            oldTransparentCount = countOf(read lcount, read gcount, isLocal, (nint)transparent)
+        }
+        bool onlyCompressed = !g.images[gfi].hasImg
+        if onlyCompressed {
+            _ = gifUncompressImage(ref g, gfs, gfi)
+        }
+        nint width = (nint)g.images[gfi].width
+        for y in 0..(nint)g.images[gfi].height {
+            nint row = g.images[gfi].rows[y]
+            for x in 0..width {
+                nint p = (nint)g.images[gfi].data[row + x]
+                if isLocal {
+                    lcount[p] = lcount[p].wrappingAdd(1)
+                } else {
+                    gcount[p] = gcount[p].wrappingAdd(1)
+                }
+            }
+        }
+        if isLocal {
+            for i in 0..(nint)g.colormaps[gfcm].ncol {
+                if lcount[i] != 0 && (int)i != transparent {
+                    _ = kchistAdd(ref kch, kcMakegfcg(read g.kc, g.colormaps[gfcm].col[i]), lcount[i])
+                }
+            }
+        }
+        if transparent >= 0 {
+            nint t = (nint)transparent
+            uint now = countOf(read lcount, read gcount, isLocal, t)
+            if now != oldTransparentCount {
+                ntransparent = ntransparent.wrappingAdd(now.wrappingSubtract(oldTransparentCount))
+                if isLocal {
+                    lcount[t] = oldTransparentCount
+                } else {
+                    gcount[t] = oldTransparentCount
+                }
+            }
+        }
+        if (int)g.images[gfi].disposal == GifDisposalBackground {
+            nbackground = nbackground.wrappingAdd((uint)g.images[gfi].width * (uint)g.images[gfi].height)
+        }
+        if onlyCompressed {
+            gifReleaseUncompressedImage(ref g, gfi)
+        }
+    }
+    nint global = g.streams[gfs].global
+    nint first = g.streams[gfs].images[0]
+    if g.images[first].transparent < 0 && global != None && g.streams[gfs].background < g.colormaps[global].ncol {
+        nint b = (nint)g.streams[gfs].background
+        gcount[b] = gcount[b].wrappingAdd(nbackground)
+    } else {
+        ntransparent = ntransparent.wrappingAdd(nbackground)
+    }
+    if global != None {
+        for i in 0..(nint)g.colormaps[global].ncol {
+            if gcount[i] != 0 {
+                _ = kchistAdd(ref kch, kcMakegfcg(read g.kc, g.colormaps[global].col[i]), gcount[i])
+            }
+        }
+    }
+    kchistCompress(ref kch)
+    ntranspStore = ntransparent
+    return kch
+}
+
+// ---- kd3_tree: a kd-tree of 3 dimensions over kcolors ----
+
+struct Kd3Treepos : Copyable {
+    int pivot
+    int offset
+}
+
+// The transformations of an 8-bit color into a kcolor (C's function pointer).
+const int Kd3Gamma = 0
+const int Kd3Luminance = 1
+
+struct Kd3Tree {
+    bool live
+    bool hasTree
+    List<Kd3Treepos> tree
+    int ntree
+    int disabled
+    // the colors, with room as C allocates it: a pixel past the colormap reads one of these
+    List<Kcolor> ks
+    int nitems
+    int maxdepth
+    int transform
+    bool hasXradius
+    List<uint> xradius
+}
+
+Kd3Tree kd3None() {
+    return Kd3Tree { live = false, hasTree = false, tree = List<Kd3Treepos>(), ntree = 0, disabled = -1, ks = List<Kcolor>(),
+        nitems = 0, maxdepth = 0, transform = Kd3Gamma, hasXradius = false, xradius = List<uint>() }
+}
+
+void kd3Init(ref Kd3Tree kd3, int transform) {
+    kd3 = kd3None()
+    kd3.live = true
+    kd3.ks = List<Kcolor>.repeat(kcolor(0, 0, 0), 256)
+    kd3.transform = transform
+}
+
+void kd3Cleanup(ref Kd3Tree kd3) {
+    kd3 = kd3None()
+}
+
+Kcolor kd3Make8g(read Kc kc, read Kd3Tree kd3, int a0, int a1, int a2) {
+    if kd3.transform == Kd3Luminance {
+        return kcLuminanceTransform(kc, a0, a1, a2)
+    }
+    return kcMake8g(kc, a0, a1, a2)
+}
+
+void kd3AddTransformed(ref Kd3Tree kd3, Kcolor k) {
+    if (nint)kd3.nitems == kd3.ks.length() {
+        nint cap = kd3.ks.length() * 2
+        while kd3.ks.length() < cap {
+            kd3.ks.add(kcolor(0, 0, 0))
+        }
+    }
+    kd3.ks[(nint)kd3.nitems] = k
+    kd3.nitems += 1
+    if kd3.hasTree {
+        kd3.tree = List<Kd3Treepos>()
+        kd3.hasTree = false
+        kd3.xradius = List<uint>()
+        kd3.hasXradius = false
+    }
+}
+
+void kd3Add8g(read Kc kc, ref Kd3Tree kd3, int a0, int a1, int a2) {
+    kd3AddTransformed(ref kd3, kd3Make8g(kc, kd3, a0, a1, a2))
+}
+
+void kd3Disable(ref Kd3Tree kd3, int i) {
+    if kd3.disabled == i {
+        return
+    }
+    kd3.disabled = i
+    // if `i` has a duplicate, rebuild the tree so the duplicate stays findable
+    if kd3.hasTree {
+        for j in 0..(nint)kd3.nitems {
+            if (int)j != i && kcEq(kd3.ks[j], kd3.ks[(nint)i]) {
+                kd3.tree = List<Kd3Treepos>()
+                kd3.hasTree = false
+                break
+            }
+        }
+    }
+}
+
+void kd3EnableAll(ref Kd3Tree kd3) {
+    kd3.disabled = -1
+}
+
+// The order C's `memcmp` gives two kcolors: their bytes as they lie in memory, low byte first.
+long kd3MemKey(Kcolor k) {
+    long key = 0
+    for d in 0..3 {
+        int v = (int)k.a[d] & 0xFFFF
+        key = (key << 16) | (long)(((v & 0xFF) << 8) | (v >> 8))
+    }
+    return key
+}
+
+int kd3BuildRange(ref Kd3Tree kd3, ref List<int> perm, nint from, int nperm, int n, int depth) {
+    int aindex = depth % 3
+    if depth > kd3.maxdepth {
+        kd3.maxdepth = depth
+    }
+    while n >= kd3.ntree {
+        kd3.ntree *= 2
+    }
+    while kd3.tree.length() < (nint)kd3.ntree {
+        kd3.tree.add(Kd3Treepos { pivot = 0, offset = 0 })
+    }
+    if nperm <= 1 {
+        kd3.tree[(nint)n].pivot = -1
+        if nperm != 0 {
+            kd3.tree[(nint)n].pivot = perm[from]
+        }
+        kd3.tree[(nint)n].offset = -1
+        return 2
+    }
+    var key = List<long>.repeat(0, (nint)kd3.nitems)
+    for i in 0..(nint)kd3.nitems {
+        key[i] = (long)(int)kd3.ks[i].a[aindex]
+    }
+    sortPerm(ref perm, from, (nint)nperm, read key)
+
+    // pick pivot: a color component to split
+    int m = nperm >> 1
+    while m > 0 && kd3.ks[(nint)perm[from + (nint)m]].a[aindex] == kd3.ks[(nint)perm[from + (nint)m - 1]].a[aindex] {
+        m -= 1
+    }
+    if m == 0 {
+        // don't split entirely to the right (infinite loop)
+        m = nperm >> 1
+        // also, don't split entirely to the left
+        while m < nperm - 1 && kd3.ks[(nint)perm[from + (nint)m]].a[aindex] == kd3.ks[(nint)perm[from + (nint)m - 1]].a[aindex] {
+            m += 1
+        }
+    }
+    int at = (int)kd3.ks[(nint)perm[from + (nint)m]].a[aindex]
+    if m == 0 {
+        kd3.tree[(nint)n].pivot = at
+    } else {
+        int before = (int)kd3.ks[(nint)perm[from + (nint)m - 1]].a[aindex]
+        kd3.tree[(nint)n].pivot = before + ((at - before) >> 1)
+    }
+
+    // recurse
+    int nl = kd3BuildRange(ref kd3, ref perm, from, m, n + 1, depth + 1)
+    kd3.tree[(nint)n].offset = 1 + nl
+    int nr = kd3BuildRange(ref kd3, ref perm, from + (nint)m, nperm - m, n + 1 + nl, depth + 1)
+    return 1 + nl + nr
+}
+
+void kd3BuildXradius(ref Kd3Tree kd3) {
+    if kd3.hasXradius {
+        return
+    }
+    nint n = (nint)kd3.nitems
+    kd3.xradius = List<uint>.repeat(0xFFFFFFFF, n)
+    kd3.hasXradius = true
+    for i in 0..n {
+        for j in i + 1..n {
+            uint radius = kcDistance(kd3.ks[i], kd3.ks[j]) / 4
+            if radius < kd3.xradius[i] {
+                kd3.xradius[i] = radius
+            }
+            if radius < kd3.xradius[j] {
+                kd3.xradius[j] = radius
+            }
+        }
+    }
+}
+
+void kd3Build(ref Kd3Tree kd3) {
+    kd3.tree = List<Kd3Treepos>.repeat(Kd3Treepos { pivot = 0, offset = 0 }, 256)
+    kd3.hasTree = true
+    kd3.ntree = 256
+    kd3.maxdepth = 0
+
+    // create copy of items; remove duplicates
+    nint n = (nint)kd3.nitems
+    var perm = List<int>.repeat(0, n)
+    var key = List<long>.repeat(0, n)
+    for i in 0..n {
+        perm[i] = (int)i
+        // a disabled color sorts after its duplicates, so the build drops it
+        key[i] = kd3MemKey(kd3.ks[i]) * 2
+        if (int)i == kd3.disabled {
+            key[i] += 1
+        }
+    }
+    sortPerm(ref perm, 0, n, read key)
+    nint i = 0
+    nint delta = 1
+    while i + delta < n {
+        if kcEq(kd3.ks[(nint)perm[i]], kd3.ks[(nint)perm[i + delta]]) {
+            delta += 1
+            i -= 1
+        } else if delta > 1 {
+            perm[i + 1] = perm[i + delta]
+        }
+        i += 1
+    }
+    _ = kd3BuildRange(ref kd3, ref perm, 0, (int)(n - (delta - 1)), 0, 0)
+}
+
+// kd3_init + kd3_add8g for all colors in `gfcm` + kd3_build
+void kd3InitBuild(read Kc kc, ref Kd3Tree kd3, int transform, read Colormap gfcm) {
+    kd3Init(ref kd3, transform)
+    for i in 0..(nint)gfcm.ncol {
+        kd3Add8g(kc, ref kd3, (int)gfcm.col[i].red, (int)gfcm.col[i].green, (int)gfcm.col[i].blue)
+    }
+    kd3Build(ref kd3)
+}
+
+// the index of the color in `kd3` closest to `k`, and its distance in `distStore`
+int kd3ClosestTransformed(ref Kd3Tree kd3, Kcolor k, ref uint distStore) {
+    var stack = int[32](0)
+    var state = byte[32](0)
+    int stackpos = 0
+    int result = -1
+    uint mindist = 0xFFFFFFFF
+
+    if !kd3.hasTree {
+        kd3Build(ref kd3)
+    }
+    stack[0] = 0
+    state[0] = 0
+
+    while stackpos >= 0 {
+        nint s = (nint)stackpos
+        int p = stack[s]
+        var pos = kd3.tree[(nint)p]
+        if pos.offset < 0 {
+            if pos.pivot >= 0 && kd3.disabled != pos.pivot {
+                uint dist = kcDistance(kd3.ks[(nint)pos.pivot], k)
+                if dist < mindist {
+                    mindist = dist
+                    result = pos.pivot
+                }
+            }
+            stackpos -= 1
+            if stackpos >= 0 {
+                state[(nint)stackpos] += 1
+            }
+        } else if state[s] == 0 {
+            if (int)k.a[stackpos % 3] < pos.pivot {
+                stack[s + 1] = p + 1
+            } else {
+                stack[s + 1] = p + pos.offset
+            }
+            stackpos += 1
+            state[(nint)stackpos] = 0
+        } else {
+            int delta = (int)k.a[stackpos % 3] - pos.pivot
+            if state[s] == 1 && delta.wrappingToUint().wrappingMultiply(delta.wrappingToUint()) < mindist {
+                if delta < 0 {
+                    stack[s + 1] = p + pos.offset
+                } else {
+                    stack[s + 1] = p + 1
+                }
+                stackpos += 1
+                state[(nint)stackpos] = 0
+            } else {
+                stackpos -= 1
+                if stackpos >= 0 {
+                    state[(nint)stackpos] += 1
+                }
+            }
+        }
+    }
+    distStore = mindist
+    return result
 }
