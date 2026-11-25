@@ -1,0 +1,615 @@
+// gif.sg - The data of the LCDF GIF library: streams, images, colormaps and extensions,
+// and the general functions on them (giffunc.c).
+// Copyright (C) 1997-2021 Eddie Kohler, ekohler@gmail.com
+// SG translation of gifsicle 1.99. This file is part of sg-gifsicle.
+//
+// The GIF library is free software. It is distributed under the GNU General Public License,
+// version 2; you can copy, distribute, or alter it at will, as long as this notice is kept intact
+// and this source code is made available. There is no warranty, express or implied.
+//
+// C shares streams, images and colormaps by pointer and counts their references. Here each lives
+// in a list of the program's state (`Gt`), and a value holds its place there, its handle, where C
+// holds its address; `None` is the null pointer. The counts are kept as C keeps them, and what C
+// frees is let go here: its data is dropped, and its place is not taken again.
+
+const nint None = -1
+
+const int GifMaxCodeBits = 12
+const int GifMaxCode = 0x1000
+const int GifMaxBlock = 255
+
+const int GifMaxScreenWidth = 65535
+const int GifMaxScreenHeight = 65535
+const int GifUnoptimizeSimplestDisposal = 1
+
+const int GifDisposalNone = 0
+const int GifDisposalAsis = 1
+const int GifDisposalBackground = 2
+const int GifDisposalPrevious = 3
+
+const int GifMaxDelay = 65535
+
+const int GifExName = 0xCE
+const int GifExComment = 0xFE
+const int GifExApp = 0xFF
+const nint GifExAppIdSize = 11
+
+const int GifReadCompressed = 1
+const int GifReadUncompressed = 2
+const int GifReadConstRecord = 4
+const int GifReadTrailingGarbageOk = 8
+const int GifWriteCarefulMinCodeSize = 1
+const int GifWriteEagerClear = 2
+const int GifWriteOptimize = 4
+const int GifWriteShrink = 8
+
+struct Color : Copyable {
+    // `haspixel` and `pixel` mean what their user makes them mean.
+    byte haspixel
+    byte red
+    byte green
+    byte blue
+    uint pixel
+}
+
+Color color(int r, int g, int b) {
+    return Color { haspixel = 0, red = (byte)r, green = (byte)g, blue = (byte)b, pixel = 0 }
+}
+
+Color noColor() {
+    return Color { haspixel = 0, red = 0, green = 0, blue = 0, pixel = 0 }
+}
+
+bool colorEq(Color a, Color b) {
+    return a.red == b.red && a.green == b.green && a.blue == b.blue
+}
+
+struct Colormap {
+    int ncol
+    int capacity
+    uint userFlags
+    int refcount
+    // `capacity` colors: those past `ncol` are written by some code and read by none.
+    List<Color> col
+    bool live
+}
+
+struct Extension : Clonable {
+    int kind
+    // Eleven bytes, zeros for an extension that is not an application's.
+    List<byte> appname
+    // C tells data that is there from none (a null pointer); an empty extension has none.
+    bool hasData
+    List<byte> data
+    bool packetized
+}
+
+struct Image {
+    // The pixels, and where each row starts in them: C's `img[y]`. Rows are moved by
+    // `Gif_ClipImage`, and an interlaced image's rows are not in their order.
+    bool hasImg
+    List<byte> data
+    List<nint> rows
+
+    ushort width
+    ushort height
+    ushort left
+    ushort top
+    ushort delay
+    byte disposal
+    byte interlace
+
+    // -1 means no transparent index
+    int transparent
+    nint local
+
+    List<Extension> extensions
+
+    bool hasCompressed
+    List<byte> compressed
+    uint compressedErrors
+
+    uint userFlags
+    // The optimizer's data for the image (C's `user_data`), an index into its list; None if none.
+    nint userData
+    int refcount
+    bool live
+}
+
+struct Stream {
+    List<nint> images
+    nint global
+    // 256 means no background
+    int background
+    ushort screenWidth
+    ushort screenHeight
+    // -1 means no loop count
+    long loopcount
+    List<Extension> endExtensions
+    uint errors
+    uint userFlags
+    bool hasLandmark
+    string landmark
+    int refcount
+    bool live
+}
+
+struct CompressInfo : Copyable {
+    int flags
+    int loss
+}
+
+CompressInfo newCompressInfo() {
+    return CompressInfo { flags = 0, loss = 0 }
+}
+
+// ---- making ----
+
+nint gifNewStream(ref Gt g) {
+    g.streams.add(Stream {
+        images = List<nint>(), global = None, background = 256, screenWidth = 0, screenHeight = 0,
+        loopcount = -1, endExtensions = List<Extension>(), errors = 0, userFlags = 0,
+        hasLandmark = false, landmark = "", refcount = 0, live = true,
+    })
+    return g.streams.length() - 1
+}
+
+Image emptyImage() {
+    return Image {
+        hasImg = false, data = List<byte>(), rows = List<nint>(), width = 0, height = 0, left = 0,
+        top = 0, delay = 0, disposal = (byte)GifDisposalNone, interlace = 0, transparent = -1,
+        local = None, extensions = List<Extension>(), hasCompressed = false,
+        compressed = List<byte>(), compressedErrors = 0, userFlags = 0, userData = None,
+        refcount = 0, live = true,
+    }
+}
+
+nint gifNewImage(ref Gt g) {
+    g.images.add(emptyImage())
+    return g.images.length() - 1
+}
+
+nint gifNewColormap(ref Gt g) {
+    return gifNewFullColormap(ref g, 0, 256)
+}
+
+nint gifNewFullColormap(ref Gt g, int count, int capacity) {
+    int cap = capacity
+    if count > cap {
+        cap = count
+    }
+    if cap < 256 {
+        cap = 256
+    }
+    g.colormaps.add(Colormap {
+        ncol = count, capacity = cap, userFlags = 0, refcount = 0,
+        col = List<Color>.repeat(noColor(), (nint)cap), live = true,
+    })
+    return g.colormaps.length() - 1
+}
+
+Extension gifNewExtension(int kind, read byte[] appname) {
+    var name = List<byte>.repeat(0, GifExAppIdSize)
+    if kind == GifExApp && appname.length() >= GifExAppIdSize {
+        name.copyFrom(appname[0..GifExAppIdSize])
+    }
+    return Extension { kind = kind, appname = name, hasData = false, data = List<byte>(), packetized = false }
+}
+
+Extension gifNewExtensionData(int kind, read byte[] appname, read byte[] data) {
+    var gfex = gifNewExtension(kind, appname)
+    gfex.hasData = true
+    gfex.data.addAll(data)
+    return gfex
+}
+
+Extension gifCopyExtension(read Extension src) {
+    return Extension {
+        kind = src.kind, appname = src.appname.clone(), hasData = src.hasData, data = src.data.clone(),
+        packetized = src.packetized,
+    }
+}
+
+void gifAddImage(ref Gt g, nint gfs, nint gfi) {
+    g.streams[gfs].images.add(gfi)
+    g.images[gfi].refcount += 1
+}
+
+void gifRemoveImage(ref Gt g, nint gfs, nint inum) {
+    if inum < 0 || inum >= g.streams[gfs].images.length() {
+        return
+    }
+    gifDeleteImage(ref g, g.streams[gfs].images[inum])
+    nint n = g.streams[gfs].images.length()
+    for j in inum..n - 1 {
+        g.streams[gfs].images[j] = g.streams[gfs].images[j + 1]
+    }
+    _ = g.streams[gfs].images.removeLast()
+}
+
+int gifImageColorBound(read Image gfi) {
+    if gfi.hasCompressed && gfi.compressed[0] > 0 && gfi.compressed[0] < 8 {
+        return 1 << (int)gfi.compressed[0]
+    }
+    return 256
+}
+
+void gifCopyExtensions(ref List<Extension> dst, read List<Extension> src) {
+    for gfex in read src {
+        dst.add(gifCopyExtension(gfex))
+    }
+}
+
+// The image name stored in the extensions, which is the last name extension.
+List<byte>? gifExtensionListName(read List<Extension> gfexs) {
+    nint found = None
+    nint i = 0
+    for gfex in read gfexs {
+        if gfex.kind == GifExName {
+            found = i
+        }
+        i += 1
+    }
+    if found == None {
+        return null
+    }
+    return gfexs[found].data.clone()
+}
+
+List<byte>? gifImageName(read Gt g, nint gfi) {
+    return gifExtensionListName(read g.images[gfi].extensions)
+}
+
+void gifAppendExtensionNear(ref Gt g, nint gfs, nint gfi, Extension gfex) {
+    if gfi != None {
+        g.images[gfi].extensions.add(gfex)
+    } else {
+        g.streams[gfs].endExtensions.add(gfex)
+    }
+}
+
+int gifImageNumber(read Gt g, nint gfs, nint gfi) {
+    if gfs != None && gfi != None {
+        nint i = 0
+        for h in read g.streams[gfs].images {
+            if h == gfi {
+                return (int)i
+            }
+            i += 1
+        }
+    }
+    return -1
+}
+
+int gifImageCount(read Gt g, nint gfs) {
+    return (int)g.streams[gfs].images.length()
+}
+
+void gifCalculateScreenSize(ref Gt g, nint gfs, bool force) {
+    int screenWidth = 0
+    int screenHeight = 0
+    if !force {
+        screenWidth = (int)g.streams[gfs].screenWidth
+        screenHeight = (int)g.streams[gfs].screenHeight
+    }
+    nint n = g.streams[gfs].images.length()
+    nint i = 0
+    while i < n && (force || i == 0) {
+        nint gfi = g.streams[gfs].images[i]
+        int right = (int)g.images[gfi].left + (int)g.images[gfi].width
+        int bottom = (int)g.images[gfi].top + (int)g.images[gfi].height
+        if screenWidth < right {
+            screenWidth = right
+        }
+        if screenHeight < bottom {
+            screenHeight = bottom
+        }
+        i += 1
+    }
+    if screenWidth > 65535 {
+        screenWidth = 65535
+    }
+    if screenHeight > 65535 {
+        screenHeight = 65535
+    }
+    if (int)g.streams[gfs].screenWidth < screenWidth || force {
+        g.streams[gfs].screenWidth = (ushort)screenWidth
+    }
+    if (int)g.streams[gfs].screenHeight < screenHeight || force {
+        g.streams[gfs].screenHeight = (ushort)screenHeight
+    }
+}
+
+nint gifCopyStreamSkeleton(ref Gt g, nint gfs) {
+    var ngfs = gifNewStream(ref g)
+    g.streams[ngfs].global = gifCopyColormap(ref g, g.streams[gfs].global)
+    g.streams[ngfs].background = g.streams[gfs].background
+    g.streams[ngfs].screenWidth = g.streams[gfs].screenWidth
+    g.streams[ngfs].screenHeight = g.streams[gfs].screenHeight
+    g.streams[ngfs].loopcount = g.streams[gfs].loopcount
+    return ngfs
+}
+
+nint gifCopyColormap(ref Gt g, nint src) {
+    if src == None {
+        return None
+    }
+    var dest = gifNewFullColormap(ref g, g.colormaps[src].ncol, g.colormaps[src].capacity)
+    nint n = (nint)g.colormaps[src].ncol
+    for i in 0..n {
+        g.colormaps[dest].col[i] = g.colormaps[src].col[i]
+    }
+    return dest
+}
+
+nint gifCopyImage(ref Gt g, nint src) {
+    if src == None {
+        return None
+    }
+    var dest = gifNewImage(ref g)
+    var exts = List<Extension>()
+    gifCopyExtensions(ref exts, read g.images[src].extensions)
+    g.images[dest].extensions = exts
+    g.images[dest].local = gifCopyColormap(ref g, g.images[src].local)
+    g.images[dest].transparent = g.images[src].transparent
+    g.images[dest].delay = g.images[src].delay
+    g.images[dest].disposal = g.images[src].disposal
+    g.images[dest].left = g.images[src].left
+    g.images[dest].top = g.images[src].top
+    g.images[dest].width = g.images[src].width
+    g.images[dest].height = g.images[src].height
+    g.images[dest].interlace = g.images[src].interlace
+    if g.images[src].hasImg {
+        nint w = (nint)g.images[dest].width
+        nint h = (nint)g.images[dest].height
+        var data = List<byte>.withCapacity(w * h)
+        var rows = List<nint>.withCapacity(h)
+        for y in 0..h {
+            nint at = g.images[src].rows[y]
+            rows.add(y * w)
+            data.addAll(g.images[src].data[at..at + w])
+        }
+        g.images[dest].data = data
+        g.images[dest].rows = rows
+        g.images[dest].hasImg = true
+    }
+    if g.images[src].hasCompressed {
+        g.images[dest].compressed = g.images[src].compressed.clone()
+        g.images[dest].hasCompressed = true
+        g.images[dest].compressedErrors = g.images[src].compressedErrors
+    }
+    return dest
+}
+
+void gifMakeImageEmpty(ref Gt g, nint gfi) {
+    gifReleaseUncompressedImage(ref g, gfi)
+    gifReleaseCompressedImage(ref g, gfi)
+    if g.images[gfi].left >= 0xFFFE {
+        g.images[gfi].left = 0xFFFE
+    }
+    if g.images[gfi].top >= 0xFFFE {
+        g.images[gfi].top = 0xFFFE
+    }
+    g.images[gfi].width = 1
+    g.images[gfi].height = 1
+    g.images[gfi].transparent = 0
+    gifCreateUncompressedImage(ref g, gfi, false)
+    g.images[gfi].data[g.images[gfi].rows[0]] = 0
+}
+
+// ---- deleting ----
+
+void gifDeleteStream(ref Gt g, nint gfs) {
+    if gfs == None {
+        return
+    }
+    g.streams[gfs].refcount -= 1
+    if g.streams[gfs].refcount > 0 {
+        return
+    }
+    var images = g.streams[gfs].images.replace(List<nint>())
+    for gfi in read images {
+        gifDeleteImage(ref g, gfi)
+    }
+    gifDeleteColormap(ref g, g.streams[gfs].global)
+    g.streams[gfs].global = None
+    g.streams[gfs].endExtensions.clear()
+    g.streams[gfs].landmark = ""
+    g.streams[gfs].live = false
+}
+
+void gifDeleteImage(ref Gt g, nint gfi) {
+    if gfi == None {
+        return
+    }
+    g.images[gfi].refcount -= 1
+    if g.images[gfi].refcount > 0 {
+        return
+    }
+    g.images[gfi].extensions.clear()
+    gifDeleteColormap(ref g, g.images[gfi].local)
+    g.images[gfi].local = None
+    gifReleaseUncompressedImage(ref g, gfi)
+    gifReleaseCompressedImage(ref g, gfi)
+    g.images[gfi].userData = None
+    g.images[gfi].live = false
+}
+
+void gifDeleteColormap(ref Gt g, nint gfcm) {
+    if gfcm == None {
+        return
+    }
+    g.colormaps[gfcm].refcount -= 1
+    if g.colormaps[gfcm].refcount > 0 {
+        return
+    }
+    g.colormaps[gfcm].col.clear()
+    g.colormaps[gfcm].live = false
+}
+
+// ---- colors ----
+
+int gifFindColor(read Colormap gfcm, Color c) {
+    for i in 0..(nint)gfcm.ncol {
+        if colorEq(gfcm.col[i], c) {
+            return (int)i
+        }
+    }
+    return -1
+}
+
+int gifAddColor(ref Colormap gfcm, Color c, int lookFrom) {
+    if lookFrom >= 0 {
+        for i in (nint)lookFrom..(nint)gfcm.ncol {
+            if colorEq(gfcm.col[i], c) {
+                return (int)i
+            }
+        }
+    }
+    if gfcm.ncol >= gfcm.capacity {
+        gfcm.capacity *= 2
+        while gfcm.col.length() < (nint)gfcm.capacity {
+            gfcm.col.add(noColor())
+        }
+    }
+    int i = gfcm.ncol
+    gfcm.ncol += 1
+    gfcm.col[(nint)i] = c
+    return i
+}
+
+nint gifGetImage(read Gt g, nint gfs, int imagenumber) {
+    if imagenumber >= 0 && (nint)imagenumber < g.streams[gfs].images.length() {
+        return g.streams[gfs].images[(nint)imagenumber]
+    }
+    return None
+}
+
+nint gifGetNamedImage(read Gt g, nint gfs, read byte[]? name) {
+    if name is null {
+        if g.streams[gfs].images.length() > 0 {
+            return g.streams[gfs].images[0]
+        }
+        return None
+    }
+    for gfi in read g.streams[gfs].images {
+        var imagename = gifImageName(read g, gfi)
+        if imagename is not null && cStringEquals(read imagename, name) {
+            return gfi
+        }
+    }
+    return None
+}
+
+// C compares a name extension's data as a C string: it ends at its first zero byte.
+bool cStringEquals(read byte[] a, read byte[] b) {
+    return cString(a) == cString(b)
+}
+
+read byte[] cString(read byte[] s) {
+    var zero = s.indexOf(0)
+    if zero is not null {
+        return s[0..zero]
+    }
+    return s
+}
+
+// ---- pixels ----
+
+void gifReleaseCompressedImage(ref Gt g, nint gfi) {
+    g.images[gfi].compressed = List<byte>()
+    g.images[gfi].hasCompressed = false
+    g.images[gfi].compressedErrors = 0
+}
+
+void gifReleaseUncompressedImage(ref Gt g, nint gfi) {
+    g.images[gfi].data = List<byte>()
+    g.images[gfi].rows = List<nint>()
+    g.images[gfi].hasImg = false
+}
+
+bool gifClipImage(ref Gt g, nint gfi, int left, int top, int width, int height) {
+    if !g.images[gfi].hasImg {
+        return false
+    }
+    int newWidth = (int)g.images[gfi].width
+    int newHeight = (int)g.images[gfi].height
+    int h = (int)g.images[gfi].height
+    if (int)g.images[gfi].left < left {
+        int shift = left - (int)g.images[gfi].left
+        for y in 0..(nint)h {
+            g.images[gfi].rows[y] += (nint)shift
+        }
+        g.images[gfi].left = (ushort)((int)g.images[gfi].left + shift)
+        newWidth -= shift
+    }
+    if (int)g.images[gfi].top < top {
+        int shift = top - (int)g.images[gfi].top
+        for y in (nint)shift..(nint)h {
+            g.images[gfi].rows[y - (nint)shift] = g.images[gfi].rows[y]
+        }
+        g.images[gfi].top = (ushort)((int)g.images[gfi].top + shift)
+        newHeight -= shift
+    }
+    if (int)g.images[gfi].left + newWidth >= width {
+        newWidth = width - (int)g.images[gfi].left
+    }
+    if (int)g.images[gfi].top + newHeight >= height {
+        newHeight = height - (int)g.images[gfi].top
+    }
+    if newWidth < 0 {
+        newWidth = 0
+    }
+    if newHeight < 0 {
+        newHeight = 0
+    }
+    g.images[gfi].width = (ushort)newWidth
+    g.images[gfi].height = (ushort)newHeight
+    return true
+}
+
+int gifInterlaceLine(int line, int height) {
+    int h = height - 1
+    if line > h / 2 {
+        return line * 2 - (h | 1)
+    } else if line > h / 4 {
+        return line * 4 - ((h & ~1) | 2)
+    } else if line > h / 8 {
+        return line * 8 - ((h & ~3) | 4)
+    }
+    return line * 8
+}
+
+// The image's pixels become `data`, read in rows of its width; interlaced, in the order the rows of
+// an interlaced GIF come.
+void gifSetUncompressedImage(ref Gt g, nint gfi, List<byte> data, bool dataInterlaced) {
+    gifReleaseUncompressedImage(ref g, gfi)
+    nint width = (nint)g.images[gfi].width
+    int height = (int)g.images[gfi].height
+    var rows = List<nint>.repeat(0, (nint)height)
+    if dataInterlaced {
+        for i in 0..height {
+            rows[(nint)gifInterlaceLine(i, height)] = width * (nint)i
+        }
+    } else {
+        for i in 0..(nint)height {
+            rows[i] = width * i
+        }
+    }
+    g.images[gfi].data = data
+    g.images[gfi].rows = rows
+    g.images[gfi].hasImg = true
+}
+
+void gifCreateUncompressedImage(ref Gt g, nint gfi, bool dataInterlaced) {
+    nint sz = (nint)g.images[gfi].width * (nint)g.images[gfi].height
+    if sz == 0 {
+        sz = 1
+    }
+    gifSetUncompressedImage(ref g, gfi, List<byte>.repeat(0, sz), dataInterlaced)
+}
+
+// A row of an image: where its pixels start in the image's data.
+nint rowAt(read Image gfi, nint y) {
+    return gfi.rows[y]
+}

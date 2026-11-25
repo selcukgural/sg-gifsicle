@@ -1,0 +1,1220 @@
+// optimize.sg - Functions to optimize animated GIFs (optimize.c, opttemplate.c).
+// Copyright (C) 1997-2021 Eddie Kohler, ekohler@gmail.com
+// SG translation of gifsicle 1.99. This file is part of sg-gifsicle.
+//
+// Gifsicle is free software. It is distributed under the GNU Public License, version 2; you can
+// copy, distribute, or alter it at will, as long as this notice is kept intact and this source
+// code is made available. There is no warranty, express or implied.
+//
+// C compiles opttemplate.c twice, with 16-bit and with 32-bit palette indexes, and picks one by the
+// number of colors; both compute the same thing. Here there is one copy, with 32-bit indexes.
+// C's file-level statics are the fields of `Optimizer`.
+
+const uint Transp = 0
+const uint NotInOutGlobal = 256
+const byte Required = 2
+const byte ReplaceTransp = 1
+
+struct OptData {
+    int left
+    int top
+    int width
+    int height
+    byte disposal
+    int transparent
+    List<byte> neededColors
+    int requiredColorCount
+    int activePenalty
+    int globalPenalty
+    int colormapPenalty
+}
+
+OptData newOptData() {
+    return OptData {
+        left = 0, top = 0, width = 0, height = 0, disposal = 0, transparent = 0, neededColors = List<byte>(),
+        requiredColorCount = 0, activePenalty = 0, globalPenalty = 1, colormapPenalty = 0,
+    }
+}
+
+struct OptBounds : Copyable {
+    int left
+    int top
+    int width
+    int height
+}
+
+struct Optimizer {
+    int screenWidth
+    int screenHeight
+    // Colormap containing all colors in the image. May have >256 colors
+    nint allColormap
+    // The old global colormap, or a fake one we created if necessary
+    nint inGlobalMap
+    bool inGlobalMapMade
+    // The new global colormap
+    nint outGlobalMap
+    uint background
+    int imageIndex
+    List<uint> lastData
+    List<uint> thisData
+    List<uint> nextData
+}
+
+// all_colormap_add: each color of `src` is represented in `all_colormap`, src.col[i].pixel being its
+// place there; col[0] is reserved for transparency.
+void allColormapAdd(ref Gt g, ref Optimizer o, ref HashMap<uint, int> hist, nint src) {
+    for i in 0..(nint)g.colormaps[src].ncol {
+        var c = g.colormaps[src].col[i]
+        uint key = ((uint)c.red << 16) | ((uint)c.green << 8) | (uint)c.blue
+        int index = 0
+        var found = hist.get(key)
+        if found is not null {
+            index = found
+        } else {
+            index = g.colormaps[o.allColormap].ncol
+            var copy = c
+            copy.pixel = 0
+            addColorAt(ref g.colormaps[o.allColormap], index, copy)
+            g.colormaps[o.allColormap].ncol += 1
+            hist.add(key, index)
+        }
+        g.colormaps[src].col[i].pixel = (uint)index
+    }
+}
+
+// Puts a color at a place of a colormap, growing it as C's realloc does.
+void addColorAt(ref Colormap cm, int index, Color c) {
+    while cm.col.length() <= (nint)index {
+        cm.col.add(noColor())
+    }
+    if (int)cm.col.length() > cm.capacity {
+        cm.capacity = (int)cm.col.length()
+    }
+    cm.col[(nint)index] = c
+}
+
+// keep_out_global_map: out_global_map an unchanged copy of in_global_map, and all_colormap's
+// pixel values set to match. Colors not in in_global_map will go in local colormaps.
+void keepOutGlobalMap(ref Gt g, ref Optimizer o) {
+    // capacity 256: prepare_colormap_map may store a transparent color past ncol
+    int n = g.colormaps[o.inGlobalMap].ncol
+    o.outGlobalMap = gifNewFullColormap(ref g, n, 256)
+    for i in 0..(nint)n {
+        g.colormaps[o.outGlobalMap].col[i] = g.colormaps[o.inGlobalMap].col[i]
+    }
+    for i in 1..(nint)g.colormaps[o.allColormap].ncol {
+        g.colormaps[o.allColormap].col[i].pixel = NotInOutGlobal
+    }
+    // if a color appears more than once, use its lowest index
+    for i in (0..(nint)n).reversed() {
+        nint p = (nint)g.colormaps[o.inGlobalMap].col[i].pixel
+        g.colormaps[o.allColormap].col[p].pixel = (uint)i
+    }
+}
+
+// Bounds constrained to lie within the screen.
+OptBounds safeBounds(read Optimizer o, int left, int top, int width, int height) {
+    int bl = constrain(0, left, o.screenWidth)
+    int bt = constrain(0, top, o.screenHeight)
+    return OptBounds {
+        left = bl, top = bt, width = constrain(0, left + width, o.screenWidth) - bl,
+        height = constrain(0, top + height, o.screenHeight) - bt,
+    }
+}
+
+OptBounds imageBounds(read Optimizer o, read Image gfi) {
+    return safeBounds(o, (int)gfi.left, (int)gfi.top, (int)gfi.width, (int)gfi.height)
+}
+
+// make sure the image isn't 0x0
+void fixDifferenceBounds(ref OptData bounds) {
+    if bounds.width == 0 || bounds.height == 0 {
+        bounds.top = 0
+        bounds.left = 0
+        bounds.width = 1
+        bounds.height = 1
+    }
+}
+
+void incrementPenalties(read Optimizer o, int allNcol, read OptData opt, ref List<int> penalty, int delta) {
+    for i in 1..(nint)allNcol {
+        if opt.neededColors[i] == Required {
+            penalty[i] += delta
+        }
+    }
+}
+
+// prepare_colormap_map: a map from global pixel values to pixel values for this image. It may add
+// colormap cells to `into`; null if there isn't room. It sets the image's transparent index.
+List<byte>? prepareColormapMap(ref Gt g, read Optimizer o, nint gfi, nint into, read List<byte> need) {
+    bool isGlobal = into == o.outGlobalMap
+    int allNcol = g.colormaps[o.allColormap].ncol
+    int ncol = g.colormaps[into].ncol
+    var map = List<byte>.repeat(0, (nint)allNcol)
+    var intoUsed = List<bool>.repeat(false, 256)
+    // C writes into the colormap as it goes and gives up its count on failure: a copy is worked on
+    var col = g.colormaps[into].col.clone()
+
+    // go over all non-transparent global pixels which MUST appear and place them in 'into'
+    for i in 1..(nint)allNcol {
+        if need[i] != Required {
+            continue
+        }
+        int val = 0
+        if isGlobal {
+            val = (int)g.colormaps[o.allColormap].col[i].pixel
+            if val >= ncol {
+                g.colormaps[into].col = col
+                return null
+            }
+        } else {
+            // always place colors in a local colormap
+            if ncol == 256 {
+                g.colormaps[into].col = col
+                return null
+            }
+            val = ncol
+            col[(nint)val] = g.colormaps[o.allColormap].col[i]
+            col[(nint)val].pixel = (uint)i
+            ncol += 1
+        }
+        map[i] = (byte)val
+        intoUsed[(nint)val] = true
+    }
+
+    if !isGlobal {
+        // canonicalize local colormaps by arranging them in RGB order
+        var keys = List<ulong>.withCapacity((nint)ncol)
+        for i in 0..(nint)ncol {
+            var c = col[i]
+            ulong rgb = ((ulong)c.red << 16) | ((ulong)c.green << 8) | (ulong)c.blue
+            keys.add((rgb << 32) | (ulong)i)
+        }
+        keys.sort()
+        var sorted = List<Color>.withCapacity((nint)ncol)
+        for k in read keys {
+            sorted.add(col[(nint)(k & 0xFFFFFFFF)])
+        }
+        for i in 0..(nint)ncol {
+            col[i] = sorted[i]
+            map[(nint)col[i].pixel] = (byte)i
+        }
+    }
+
+    // now check for transparency
+    g.images[gfi].transparent = -1
+    if need[(nint)Transp] != 0 {
+        int transparent = -1
+        // first, look for an unused index in 'into'; the lowest one
+        for i in 0..(nint)ncol {
+            if !intoUsed[i] {
+                transparent = (int)i
+                break
+            }
+        }
+        // otherwise use a fake slot for the purely transparent color, without entering it into
+        // the colormap. If there's no room for it, give up
+        if transparent < 0 {
+            if ncol < 256 {
+                transparent = ncol
+                col[(nint)ncol] = g.colormaps[o.allColormap].col[(nint)Transp]
+            } else {
+                g.colormaps[into].col = col
+                return null
+            }
+        }
+        // change mapping
+        map[(nint)Transp] = (byte)transparent
+        for i in 1..(nint)allNcol {
+            if need[i] == ReplaceTransp {
+                map[i] = (byte)transparent
+            }
+        }
+        g.images[gfi].transparent = transparent
+    }
+
+    // it worked: commit the number of color cells in 'into' and return the map
+    g.colormaps[into].col = col
+    g.colormaps[into].ncol = ncol
+    return map
+}
+
+// a colormap up from the image data, by fitting any used colors into a colormap; may set a local
+// colormap on gfi.
+List<byte> prepareColormap(ref Gt g, read Optimizer o, nint gfi, read List<byte> need) {
+    // try to map pixel values into the global colormap
+    gifDeleteColormap(ref g, g.images[gfi].local)
+    g.images[gfi].local = None
+    var map = prepareColormapMap(ref g, o, gfi, o.outGlobalMap, need)
+    if map is null {
+        // that didn't work; add a local colormap.
+        g.images[gfi].local = gifNewFullColormap(ref g, 0, 256)
+        var local = prepareColormapMap(ref g, o, gfi, g.images[gfi].local, need)
+        if local is null {
+            return List<byte>.repeat(0, (nint)g.colormaps[o.allColormap].ncol)
+        }
+        return local
+    }
+    return map
+}
+
+bool initializeOptimizer(ref Gt g, ref Optimizer o, nint gfs, int optimizeFlags) {
+    nint n = g.streams[gfs].images.length()
+    if n < 1 {
+        return false
+    }
+    // combine colormaps
+    o.allColormap = gifNewFullColormap(ref g, 1, 384)
+    g.colormaps[o.allColormap].col[0] = color(255, 255, 255)
+
+    o.inGlobalMap = g.streams[gfs].global
+    o.inGlobalMapMade = false
+    if o.inGlobalMap == None {
+        o.inGlobalMap = gifNewFullColormap(ref g, 256, 256)
+        o.inGlobalMapMade = true
+        for i in 0..256 {
+            g.colormaps[o.inGlobalMap].col[i] = color((int)i, (int)i, (int)i)
+        }
+    }
+
+    bool anyGlobals = false
+    int firstTransparent = -1
+    var hist = HashMap<uint, int>()
+    for i in 0..n {
+        nint gfi = g.streams[gfs].images[i]
+        if g.images[gfi].local != None {
+            allColormapAdd(ref g, ref o, ref hist, g.images[gfi].local)
+        } else {
+            anyGlobals = true
+        }
+        if g.images[gfi].transparent >= 0 && firstTransparent < 0 {
+            firstTransparent = (int)i
+        }
+    }
+    if anyGlobals || ((optimizeFlags & GtOptKeepcolormap) != 0 && g.streams[gfs].global != None) {
+        allColormapAdd(ref g, ref o, ref hist, o.inGlobalMap)
+    }
+    // try and maintain transparency's pixel value
+    if firstTransparent >= 0 {
+        nint gfi = g.streams[gfs].images[(nint)firstTransparent]
+        nint gfcm = g.images[gfi].local
+        if gfcm == None {
+            gfcm = g.streams[gfs].global
+        }
+        g.colormaps[o.allColormap].col[(nint)Transp] = g.colormaps[gfcm].col[(nint)g.images[gfi].transparent]
+    }
+
+    // find screen_width and screen_height, and clip all images to screen
+    gifCalculateScreenSize(ref g, gfs, false)
+    o.screenWidth = (int)g.streams[gfs].screenWidth
+    o.screenHeight = (int)g.streams[gfs].screenHeight
+    for i in 0..n {
+        _ = gifClipImage(ref g, g.streams[gfs].images[i], 0, 0, o.screenWidth, o.screenHeight)
+    }
+
+    // choose background
+    nint first = g.streams[gfs].images[0]
+    if g.images[first].transparent < 0 && g.streams[gfs].global != None && g.streams[gfs].background < g.colormaps[o.inGlobalMap].ncol {
+        o.background = g.colormaps[o.inGlobalMap].col[(nint)g.streams[gfs].background].pixel
+    } else {
+        o.background = Transp
+    }
+    return true
+}
+
+void finalizeOptimizer(ref Gt g, ref Optimizer o, nint gfs, int optimizeFlags) {
+    if o.background == Transp {
+        g.streams[gfs].background = g.images[g.streams[gfs].images[0]].transparent & 0xFF
+    }
+    // remove entirely transparent frames
+    nint i = 1
+    while i < g.streams[gfs].images.length() && (optimizeFlags & GtOptKeepempty) == 0 {
+        nint gfi = g.streams[gfs].images[i]
+        nint prev = g.streams[gfs].images[i - 1]
+        int disposal = (int)g.images[gfi].disposal
+        if g.images[gfi].width == 1 && g.images[gfi].height == 1 && g.images[gfi].transparent >= 0 &&
+            g.images[gfi].extensions.length() == 0 &&
+            (disposal == GifDisposalAsis || disposal == GifDisposalNone || disposal == GifDisposalPrevious) &&
+            g.images[gfi].delay != 0 && g.images[prev].delay != 0 &&
+            (int)g.images[gfi].delay <= GifMaxDelay - (int)g.images[prev].delay {
+            _ = gifUncompressImage(ref g, gfs, gfi)
+            int prevDisposal = (int)g.images[prev].disposal
+            if (int)g.images[gfi].data[g.images[gfi].rows[0]] == g.images[gfi].transparent &&
+                (prevDisposal == GifDisposalAsis || prevDisposal == GifDisposalNone) {
+                g.images[prev].delay = u16((int)g.images[prev].delay + (int)g.images[gfi].delay)
+                gifDeleteImage(ref g, gfi)
+                nint n = g.streams[gfs].images.length()
+                for j in i..n - 1 {
+                    g.streams[gfs].images[j] = g.streams[gfs].images[j + 1]
+                }
+                _ = g.streams[gfs].images.removeLast()
+                i -= 1
+            }
+        }
+        i += 1
+    }
+    // prefer GIF_DISPOSAL_NONE to GIF_DISPOSAL_ASIS: the graphic control extension can be left off
+    for gfi in read g.streams[gfs].images {
+        if (int)g.images[gfi].disposal == GifDisposalAsis && g.images[gfi].delay == 0 && g.images[gfi].transparent < 0 {
+            g.images[gfi].disposal = (byte)GifDisposalNone
+        }
+    }
+    if o.inGlobalMapMade {
+        gifDeleteColormap(ref g, o.inGlobalMap)
+    } else {
+        // in_global_map is the stream's global colormap, which the stream no longer holds
+        gifDeleteColormap(ref g, o.inGlobalMap)
+    }
+    gifDeleteColormap(ref g, o.allColormap)
+}
+
+// ---- opttemplate.c ----
+
+// sort_permutation, down: the permutation ordered by `values` from the largest, ties by index
+// from the largest.
+void sortPermutationDown(ref List<uint> perm, nint size, read List<int> values) {
+    var keys = List<long>.withCapacity(size)
+    for i in 0..size {
+        uint p = perm[i]
+        keys.add(((long)values[(nint)p] << 32) | (long)p)
+    }
+    keys.sort()
+    for i in 0..size {
+        perm[i] = (uint)(keys[size - 1 - i] & 0xFFFFFFFF)
+    }
+}
+
+void copyDataArea(read Optimizer o, ref List<uint> dst, read List<uint> src, OptBounds area) {
+    var ob = safeBounds(o, area.left, area.top, area.width, area.height)
+    nint sw = (nint)o.screenWidth
+    for y in 0..(nint)ob.height {
+        nint at = ((nint)ob.top + y) * sw + (nint)ob.left
+        dst[at..at + (nint)ob.width].copyFrom(src[at..at + (nint)ob.width])
+    }
+}
+
+void eraseDataArea(read Optimizer o, ref List<uint> dst, OptBounds area) {
+    var ob = safeBounds(o, area.left, area.top, area.width, area.height)
+    nint sw = (nint)o.screenWidth
+    for y in 0..(nint)ob.height {
+        nint at = ((nint)ob.top + y) * sw + (nint)ob.left
+        for x in 0..(nint)ob.width {
+            dst[at + x] = Transp
+        }
+    }
+}
+
+OptBounds optBounds(read OptData d) {
+    return OptBounds { left = d.left, top = d.top, width = d.width, height = d.height }
+}
+
+OptBounds imageArea(read Image gfi) {
+    return OptBounds { left = (int)gfi.left, top = (int)gfi.top, width = (int)gfi.width, height = (int)gfi.height }
+}
+
+void eraseScreen(ref List<uint> dst) {
+    for i in 0..dst.length() {
+        dst[i] = Transp
+    }
+}
+
+void applyFrame(ref Gt g, read Optimizer o, ref List<uint> dst, nint gfs, nint gfi, bool replace0, bool saveUncompressed) {
+    bool replace = replace0
+    bool wasCompressed = false
+    nint colormap = g.images[gfi].local
+    if colormap == None {
+        colormap = o.inGlobalMap
+    }
+    var ob = imageBounds(o, read g.images[gfi])
+    if !g.images[gfi].hasImg {
+        wasCompressed = true
+        _ = gifUncompressImage(ref g, gfs, gfi)
+    }
+    // make sure transparency maps to TRANSP
+    var map = List<uint>.repeat(0, 256)
+    int ncol = g.colormaps[colormap].ncol
+    for i in 0..(nint)ncol {
+        map[i] = g.colormaps[colormap].col[i].pixel
+    }
+    // out-of-bounds colors map to 0, for the sake of argument
+    uint zero = 0
+    if ncol != 0 {
+        zero = g.colormaps[colormap].col[0].pixel
+    }
+    for i in (nint)ncol..256 {
+        map[i] = zero
+    }
+    int transparent = g.images[gfi].transparent
+    if transparent >= 0 && transparent < 256 {
+        map[(nint)transparent] = Transp
+    } else {
+        replace = true
+    }
+    // map the image
+    nint sw = (nint)o.screenWidth
+    for y in 0..(nint)ob.height {
+        nint at = (nint)ob.left + ((nint)ob.top + y) * sw
+        nint row = g.images[gfi].rows[y]
+        if replace {
+            for x in 0..(nint)ob.width {
+                dst[at + x] = map[(nint)g.images[gfi].data[row + x]]
+            }
+        } else {
+            for x in 0..(nint)ob.width {
+                uint p = map[(nint)g.images[gfi].data[row + x]]
+                if p != Transp {
+                    dst[at + x] = p
+                }
+            }
+        }
+    }
+    if wasCompressed && !saveUncompressed {
+        gifReleaseUncompressedImage(ref g, gfi)
+    }
+}
+
+void applyFrameDisposal(read Optimizer o, ref List<uint> intoData, read List<uint> fromData, read List<uint> previousData, read Image gfi) {
+    if (int)gfi.disposal == GifDisposalPrevious {
+        intoData.copyFrom(previousData)
+    } else {
+        intoData.copyFrom(fromData)
+        if (int)gfi.disposal == GifDisposalBackground {
+            eraseDataArea(o, ref intoData, imageArea(gfi))
+        }
+    }
+}
+
+bool rowsEqual(read List<uint> a, read List<uint> b, nint at, nint n) {
+    return a[at..at + n] == b[at..at + n]
+}
+
+// The smallest rectangular area containing all the changes, into `bounds`.
+void findDifferenceBounds(read Optimizer o, ref OptData bounds, read Image gfi, bool lastKeeps) {
+    int lfMin = 0
+    int rtMax = 0
+    int tp = 0
+    int bt = 0
+    if lastKeeps {
+        var ob = imageBounds(o, gfi)
+        lfMin = ob.left
+        rtMax = ob.left + ob.width - 1
+        tp = ob.top
+        bt = ob.top + ob.height - 1
+    } else {
+        lfMin = 0
+        rtMax = o.screenWidth - 1
+        tp = 0
+        bt = o.screenHeight - 1
+    }
+    nint sw = (nint)o.screenWidth
+    while tp < o.screenHeight {
+        if !rowsEqual(read o.lastData, read o.thisData, sw * (nint)tp, sw) {
+            break
+        }
+        tp += 1
+    }
+    while bt >= tp {
+        if !rowsEqual(read o.lastData, read o.thisData, sw * (nint)bt, sw) {
+            break
+        }
+        bt -= 1
+    }
+    int lf = o.screenWidth
+    int rt = 0
+    int y = tp
+    while y <= bt {
+        nint row = sw * (nint)y
+        int x = lfMin
+        while x < lf {
+            if o.lastData[row + (nint)x] != o.thisData[row + (nint)x] {
+                break
+            }
+            x += 1
+        }
+        lf = x
+        x = rtMax
+        while x > rt {
+            if o.lastData[row + (nint)x] != o.thisData[row + (nint)x] {
+                break
+            }
+            x -= 1
+        }
+        rt = x
+        y += 1
+    }
+    // handle case when there's no difference between frames
+    if tp > bt {
+        tp = constrain(0, (int)gfi.top, o.screenHeight - 1)
+        bt = tp
+        lf = constrain(0, (int)gfi.left, o.screenWidth - 1)
+        rt = lf
+    }
+    bounds.left = lf
+    bounds.top = tp
+    bounds.width = rt + 1 - lf
+    bounds.height = bt + 1 - tp
+}
+
+// expand_difference_bounds: with background disposal and a transparent background, the bounds
+// grow to include blanked pixels still transparent in the next image.
+bool expandDifferenceBounds(read Optimizer o, ref OptData bounds, read Image thisBounds) {
+    bool expanded = false
+    var ob = imageBounds(o, thisBounds)
+    if bounds.width <= 0 || bounds.height <= 0 {
+        bounds.left = 0
+        bounds.top = 0
+        bounds.width = o.screenWidth
+        bounds.height = o.screenHeight
+    }
+    // `bounds` might be larger than `this_bounds` because of a previous frame's background
+    // disposal. Don't accidentally shrink `this_bounds`.
+    if ob.left > bounds.left {
+        ob.width = (ob.left + ob.width) - bounds.left
+        ob.left = bounds.left
+    }
+    if ob.top > bounds.top {
+        ob.height = (ob.top + ob.height) - bounds.top
+        ob.top = bounds.top
+    }
+    if ob.left + ob.width < bounds.left + bounds.width {
+        ob.width = bounds.left + bounds.width - ob.left
+    }
+    if ob.top + ob.height < bounds.top + bounds.height {
+        ob.height = bounds.top + bounds.height - ob.top
+    }
+    nint sw = (nint)o.screenWidth
+
+    bool found = false
+    while !found && ob.top < bounds.top {
+        nint row = sw * (nint)ob.top
+        for x in (nint)ob.left..(nint)(ob.left + ob.width) {
+            if o.thisData[row + x] != Transp && o.nextData[row + x] == Transp {
+                expanded = true
+                found = true
+                break
+            }
+        }
+        if !found {
+            ob.top += 1
+            ob.height -= 1
+        }
+    }
+    found = false
+    while !found && ob.top + ob.height > bounds.top + bounds.height {
+        nint row = sw * (nint)(ob.top + ob.height - 1)
+        for x in (nint)ob.left..(nint)(ob.left + ob.width) {
+            if o.thisData[row + x] != Transp && o.nextData[row + x] == Transp {
+                expanded = true
+                found = true
+                break
+            }
+        }
+        if !found {
+            ob.height -= 1
+        }
+    }
+    found = false
+    while !found && ob.left < bounds.left {
+        nint col = (nint)ob.left
+        for y in (nint)ob.top..(nint)(ob.top + ob.height) {
+            if o.thisData[y * sw + col] != Transp && o.nextData[y * sw + col] == Transp {
+                expanded = true
+                found = true
+                break
+            }
+        }
+        if !found {
+            ob.left += 1
+            ob.width -= 1
+        }
+    }
+    found = false
+    while !found && ob.left + ob.width > bounds.left + bounds.width {
+        nint col = (nint)(ob.left + ob.width - 1)
+        for y in (nint)ob.top..(nint)(ob.top + ob.height) {
+            if o.thisData[y * sw + col] != Transp && o.nextData[y * sw + col] == Transp {
+                expanded = true
+                found = true
+                break
+            }
+        }
+        if !found {
+            ob.width -= 1
+        }
+    }
+    if !expanded {
+        scan: for y in (nint)ob.top..(nint)(ob.top + ob.height) {
+            nint row = y * sw
+            for x in (nint)ob.left..(nint)(ob.left + ob.width) {
+                if o.thisData[row + x] != Transp && o.nextData[row + x] == Transp {
+                    expanded = true
+                    // C breaks only the inner loop here
+                    continue scan
+                }
+            }
+        }
+    }
+    bounds.left = ob.left
+    bounds.top = ob.top
+    bounds.width = ob.width
+    bounds.height = ob.height
+    return expanded
+}
+
+// get_used_colors: which colors are needed by an image: REQUIRED if the output colormap must
+// include it, REPLACE_TRANSP if it may be replaced by transparency, 0 if not in the image.
+void getUsedColors(read Optimizer o, int allNcol, ref OptData bounds, int useTransparency0) {
+    int useTransparency = useTransparency0
+    var need = List<byte>.repeat(0, (nint)allNcol)
+    nint sw = (nint)o.screenWidth
+    for y in (nint)bounds.top..(nint)(bounds.top + bounds.height) {
+        nint at = sw * y + (nint)bounds.left
+        for x in 0..(nint)bounds.width {
+            uint d = o.thisData[at + x]
+            if d != o.lastData[at + x] {
+                need[(nint)d] = Required
+            } else if need[(nint)d] == 0 {
+                need[(nint)d] = ReplaceTransp
+            }
+        }
+    }
+    if need[(nint)Transp] != 0 {
+        need[(nint)Transp] = Required
+    }
+    // check for too many colors; also force transparency if needed
+    var count = int[3] { 0, 0, 0 }
+    for i in 0..(nint)allNcol {
+        count[(nint)need[i]] += 1
+    }
+    // If use_transparency is large and there's room, add transparency
+    if useTransparency > 1 && need[(nint)Transp] == 0 && count[2] < 256 {
+        need[(nint)Transp] = Required
+        count[2] += 1
+    }
+    // If too many "potentially transparent" pixels, force transparency
+    if count[1] + count[2] > 256 {
+        useTransparency = 1
+    }
+    // Make sure transparency is marked necessary if we use it
+    if count[1] > 0 && useTransparency != 0 && need[(nint)Transp] == 0 {
+        need[(nint)Transp] = Required
+        count[2] += 1
+    }
+    // If not using transparency, change "potentially transparent" pixels to "actually used"
+    if useTransparency == 0 {
+        for i in 0..(nint)allNcol {
+            if need[i] == ReplaceTransp {
+                need[i] = Required
+            }
+        }
+        count[2] += count[1]
+    }
+    // If we can afford to have transparency, and we want to use it, then include it
+    if count[2] < 256 && useTransparency != 0 && need[(nint)Transp] == 0 {
+        need[(nint)Transp] = Required
+        count[2] += 1
+    }
+    bounds.requiredColorCount = count[2]
+    bounds.neededColors = need
+}
+
+bool createSubimages(ref Gt g, ref Optimizer o, nint gfs, int optimizeFlags, bool saveUncompressed) {
+    nint screenSize = (nint)o.screenWidth * (nint)o.screenHeight
+    o.lastData = List<uint>.repeat(Transp, screenSize)
+    o.thisData = List<uint>.repeat(Transp, screenSize)
+    o.nextData = List<uint>.repeat(Transp, screenSize)
+    bool nextDataValid = false
+    var previousData = List<uint>()
+    var previousLastData = List<uint>()
+    bool localColorTables = false
+    bool ok = true
+    nint lastGfi = None
+    int allNcol = g.colormaps[o.allColormap].ncol
+    nint n = g.streams[gfs].images.length()
+    var made = List<nint>()
+
+    o.imageIndex = 0
+    while (nint)o.imageIndex < n {
+        nint gfi = g.streams[gfs].images[(nint)o.imageIndex]
+        var subimage = newOptData()
+        if g.images[gfi].local != None {
+            localColorTables = true
+        }
+        int disposal = (int)g.images[gfi].disposal
+
+        // save previous data if necessary
+        if disposal == GifDisposalPrevious {
+            previousData = o.thisData.clone()
+        }
+
+        // set this_data equal to the current image
+        if nextDataValid {
+            var temp = o.thisData.replace(List<uint>())
+            o.thisData = o.nextData.replace(List<uint>())
+            o.nextData = temp
+            nextDataValid = false
+        } else {
+            var data = o.thisData.replace(List<uint>())
+            applyFrame(ref g, read o, ref data, gfs, gfi, false, saveUncompressed)
+            o.thisData = data
+        }
+
+        bool retry = true
+        bool failed = false
+        while retry {
+            retry = false
+            // find minimum area of difference between this image and last image
+            subimage.disposal = (byte)GifDisposalAsis
+            if o.imageIndex > 0 {
+                int lastDisposal = (int)g.images[lastGfi].disposal
+                findDifferenceBounds(read o, ref subimage, read g.images[gfi], lastDisposal == GifDisposalNone || lastDisposal == GifDisposalAsis)
+            } else {
+                var ob = imageBounds(o, read g.images[gfi])
+                subimage.left = ob.left
+                subimage.top = ob.top
+                subimage.width = ob.width
+                subimage.height = ob.height
+            }
+
+            // might need to expand difference border on background disposal
+            if (disposal == GifDisposalBackground || disposal == GifDisposalPrevious) && (nint)o.imageIndex < n - 1 {
+                // set up next_data
+                nint nextGfi = g.streams[gfs].images[(nint)o.imageIndex + 1]
+                bool expanded = false
+                var next = o.nextData.replace(List<uint>())
+                applyFrameDisposal(read o, ref next, read o.thisData, read previousData, read g.images[gfi])
+                o.nextData = next
+                // If the next frame has PREVIOUS disposal, pixels blanked by this frame's disposal
+                // must stay blank even if the next frame covers them.
+                bool nextPrevious = (int)g.images[nextGfi].disposal == GifDisposalPrevious
+                if nextPrevious {
+                    expanded = expandDifferenceBounds(read o, ref subimage, read g.images[gfi])
+                }
+                next = o.nextData.replace(List<uint>())
+                applyFrame(ref g, read o, ref next, gfs, nextGfi, false, saveUncompressed)
+                o.nextData = next
+                nextDataValid = true
+                // expand border as necessary
+                if !nextPrevious {
+                    expanded = expandDifferenceBounds(read o, ref subimage, read g.images[gfi])
+                }
+                if expanded {
+                    subimage.disposal = (byte)GifDisposalBackground
+                }
+            }
+
+            fixDifferenceBounds(ref subimage)
+
+            // set map of used colors
+            int useTransparency = 0
+            if (optimizeFlags & GtOptMask) > 1 && o.imageIndex > 0 {
+                useTransparency = 1
+            }
+            if o.imageIndex == 0 && o.background == Transp {
+                useTransparency = 2
+            }
+            getUsedColors(read o, allNcol, ref subimage, useTransparency)
+            // A frame would require more than 256 colors: try to recover by redoing the previous
+            // frame's optimized disposal.
+            if subimage.requiredColorCount > 256 {
+                if o.imageIndex > 0 && localColorTables {
+                    nint lastIndex = (nint)g.images[lastGfi].userData
+                    int lastDisposal = (int)g.images[lastGfi].disposal
+                    if (lastDisposal == GifDisposalPrevious || lastDisposal == GifDisposalBackground) &&
+                        (int)g.optData[lastIndex].disposal != lastDisposal {
+                        g.optData[lastIndex].disposal = (byte)lastDisposal
+                        if lastDisposal == GifDisposalBackground {
+                            var b = optBounds(read g.optData[lastIndex])
+                            var last = o.lastData.replace(List<uint>())
+                            eraseDataArea(read o, ref last, b)
+                            o.lastData = last
+                        } else {
+                            o.lastData.copyFrom(read previousLastData)
+                        }
+                        subimage.neededColors = List<byte>()
+                        retry = true
+                        continue
+                    }
+                }
+                warning(ref g, 1, "frame #%d needs %d colors after optimization (256 is max)\n  (Leaving the animation unoptimized.)", read List<string> {
+                    $"{o.imageIndex}".toString(), $"{subimage.requiredColorCount}".toString(),
+                })
+                failed = true
+            }
+        }
+        if failed {
+            ok = false
+            break
+        }
+
+        g.optData.add(subimage)
+        g.images[gfi].userData = g.optData.length() - 1
+        made.add(gfi)
+        lastGfi = gfi
+
+        // save last_data in case a retry changes this frame's disposal
+        if disposal == GifDisposalPrevious {
+            previousLastData = o.lastData.clone()
+        }
+
+        // Apply optimized disposal to last_data and unoptimized disposal to this_data.
+        var sub = optBounds(read g.optData[(nint)g.images[gfi].userData])
+        var last = o.lastData.replace(List<uint>())
+        if (int)g.optData[(nint)g.images[gfi].userData].disposal == GifDisposalBackground {
+            eraseDataArea(read o, ref last, sub)
+        } else {
+            copyDataArea(read o, ref last, read o.thisData, sub)
+        }
+        o.lastData = last
+
+        if disposal == GifDisposalBackground {
+            var cur = o.thisData.replace(List<uint>())
+            eraseDataArea(read o, ref cur, imageArea(read g.images[gfi]))
+            o.thisData = cur
+        } else if disposal == GifDisposalPrevious {
+            var temp = previousData.replace(List<uint>())
+            previousData = o.thisData.replace(List<uint>())
+            o.thisData = temp
+        }
+        o.imageIndex += 1
+    }
+
+    o.nextData = List<uint>()
+    if !ok {
+        for gfi in read made {
+            g.images[gfi].userData = None
+        }
+        g.optData.clear()
+    }
+    return ok
+}
+
+// create_out_global_map: out_global_map, and pixel values on all_colormap: >= 256 means not in the
+// global colormap, otherwise the index there.
+void createOutGlobalMap(ref Gt g, ref Optimizer o, nint gfs, int optimizeFlags) {
+    int allNcol = g.colormaps[o.allColormap].ncol
+    int nglobalAll = 256
+    if allNcol <= 257 {
+        nglobalAll = allNcol - 1
+    }
+    if (optimizeFlags & GtOptKeepcolormap) != 0 && g.streams[gfs].global != None {
+        keepOutGlobalMap(ref g, ref o)
+        return
+    }
+    var penalty = List<int>.repeat(0, (nint)allNcol)
+    var permute = List<uint>.repeat(0, (nint)allNcol)
+    var ordering = List<uint>.repeat(0, (nint)allNcol)
+
+    // initial permutation is null
+    for i in 0..(nint)allNcol - 1 {
+        permute[i] = (uint)(i + 1)
+    }
+
+    // choose appropriate penalties for each image
+    var opts = List<nint>()
+    for gfi in read g.streams[gfs].images {
+        nint k = g.images[gfi].userData
+        opts.add(k)
+        g.optData[k].globalPenalty = 1
+        g.optData[k].colormapPenalty = 1
+        int pi = 2
+        while pi < g.optData[k].requiredColorCount {
+            g.optData[k].colormapPenalty *= 3
+            pi *= 2
+        }
+        if allNcol > 257 {
+            g.optData[k].activePenalty = g.optData[k].colormapPenalty
+        } else {
+            g.optData[k].activePenalty = g.optData[k].globalPenalty
+        }
+    }
+
+    // set initial penalties for each color
+    for k in read opts {
+        incrementPenalties(read o, allNcol, read g.optData[k], ref penalty, g.optData[k].activePenalty)
+    }
+    bool permutationChanged = true
+
+    // Loop, removing one color at a time.
+    int curNcol = allNcol - 1
+    while curNcol != 0 {
+        // sort permutation based on penalty
+        if permutationChanged {
+            sortPermutationDown(ref permute, (nint)curNcol, read penalty)
+        }
+        permutationChanged = false
+
+        // update reverse permutation
+        uint removed = permute[(nint)curNcol - 1]
+        ordering[(nint)removed] = (uint)(curNcol - 1)
+
+        // decrement penalties for colors that are out of the running
+        for k in read opts {
+            if g.optData[k].globalPenalty > 0 && g.optData[k].neededColors[(nint)removed] == Required {
+                incrementPenalties(read o, allNcol, read g.optData[k], ref penalty, -g.optData[k].activePenalty)
+                g.optData[k].globalPenalty = 0
+                if curNcol > 256 {
+                    g.optData[k].colormapPenalty = -1
+                } else {
+                    g.optData[k].colormapPenalty = 0
+                }
+                permutationChanged = true
+            }
+        }
+
+        // change colormap penalties if we're no longer working w/globalmap
+        if curNcol == 257 {
+            for i in 0..(nint)allNcol {
+                penalty[i] = 0
+            }
+            for k in read opts {
+                g.optData[k].activePenalty = g.optData[k].globalPenalty
+                incrementPenalties(read o, allNcol, read g.optData[k], ref penalty, g.optData[k].globalPenalty)
+            }
+            permutationChanged = true
+        }
+        curNcol -= 1
+    }
+
+    // make sure background is in the global colormap
+    if o.background != Transp && ordering[(nint)o.background] >= 256 {
+        uint other = permute[255]
+        ordering[(nint)other] = ordering[(nint)o.background]
+        ordering[(nint)o.background] = 255
+    }
+
+    // assign out_global_map based on permutation
+    o.outGlobalMap = gifNewFullColormap(ref g, nglobalAll, 256)
+    for i in 1..(nint)allNcol {
+        if ordering[i] < 256 {
+            g.colormaps[o.outGlobalMap].col[(nint)ordering[i]] = g.colormaps[o.allColormap].col[i]
+            g.colormaps[o.allColormap].col[i].pixel = ordering[i]
+        } else {
+            g.colormaps[o.allColormap].col[i].pixel = NotInOutGlobal
+        }
+    }
+
+    // set the stream's background color
+    if o.background != Transp {
+        g.streams[gfs].background = (int)ordering[(nint)o.background]
+    }
+}
+
+// simple_frame_data: the data from the image into the frame data, nothing else.
+void simpleFrameData(ref Gt g, read Optimizer o, nint gfi, read List<byte> map) {
+    var ob = imageBounds(o, read g.images[gfi])
+    nint scanWidth = (nint)g.images[gfi].width
+    nint sw = (nint)o.screenWidth
+    var data = g.images[gfi].data.replace(List<byte>())
+    for y in 0..(nint)ob.height {
+        nint from = sw * (y + (nint)ob.top) + (nint)ob.left
+        nint into = y * scanWidth
+        for x in 0..(nint)ob.width {
+            data[into + x] = map[(nint)o.thisData[from + x]]
+        }
+    }
+    g.images[gfi].data = data
+}
+
+// transp_frame_data: the frame data, using transparency to make runs where that may compress
+// better; the smallest of the versions tried is kept, compressed.
+void transpFrameData(ref Gt g, read Optimizer o, nint gfs, nint gfi, read List<byte> map, int optimizeFlags, ref CompressInfo gcinfo) {
+    var ob = imageBounds(o, read g.images[gfi])
+    int transparent = g.images[gfi].transparent
+    byte tbyte = (byte)(transparent & 0xFF)
+
+    // First, try w/o transparency.
+    simpleFrameData(ref g, o, gfi, map)
+    _ = gifFullCompressImage(ref g, gfs, gfi, read gcinfo)
+    gcinfo.flags |= GifWriteShrink
+
+    var data = g.images[gfi].data.replace(List<byte>())
+    nint d = 0
+    nint beginSame = 0
+    nint lastForT2 = 0
+    int nsame = 0
+    bool haveT2 = false
+    var t2Data = List<byte>()
+    nint sw = (nint)o.screenWidth
+    for y in 0..(nint)ob.height {
+        nint at = sw * (y + (nint)ob.top) + (nint)ob.left
+        for x in 0..(nint)ob.width {
+            uint cur = o.thisData[at + x]
+            uint last = o.lastData[at + x]
+            int mapped = (int)map[(nint)cur]
+            if cur != last && mapped != transparent {
+                if nsame == 1 && (int)data[d - 1] != transparent && (optimizeFlags & GtOptMask) > 2 {
+                    if !haveT2 {
+                        t2Data = List<byte>.repeat(0, (nint)ob.width * (nint)ob.height)
+                        haveT2 = true
+                    }
+                    t2Data[lastForT2..beginSame].copyFrom(data[lastForT2..beginSame])
+                    for k in beginSame..d {
+                        t2Data[k] = tbyte
+                    }
+                    lastForT2 = d
+                }
+                nsame = 0
+            } else if nsame == 0 {
+                beginSame = d
+                nsame += 1
+            } else if nsame == 1 && mapped != (int)data[d - 1] {
+                for k in beginSame..d {
+                    data[k] = tbyte
+                }
+                nsame += 1
+            }
+            if nsame > 1 {
+                data[d] = tbyte
+            } else {
+                data[d] = map[(nint)cur]
+            }
+            d += 1
+        }
+    }
+    if haveT2 {
+        t2Data[lastForT2..d].copyFrom(data[lastForT2..d])
+    }
+    g.images[gfi].data = data
+
+    // Now, try compressed transparent version(s) and pick the best.
+    _ = gifFullCompressImage(ref g, gfs, gfi, read gcinfo)
+    if haveT2 {
+        gifSetUncompressedImage(ref g, gfi, t2Data, false)
+        _ = gifFullCompressImage(ref g, gfs, gfi, read gcinfo)
+    }
+    gifReleaseUncompressedImage(ref g, gfi)
+    gcinfo.flags &= ~GifWriteShrink
+}
+
+void createNewImageData(ref Gt g, ref Optimizer o, nint gfs, int optimizeFlags) {
+    nint screenSize = (nint)o.screenWidth * (nint)o.screenHeight
+    var previousData = List<uint>()
+    var gcinfo = g.gifWriteInfo
+    if (optimizeFlags & GtOptMask) >= 3 {
+        gcinfo.flags |= GifWriteOptimize
+    }
+    g.streams[gfs].global = o.outGlobalMap
+
+    eraseScreen(ref o.lastData)
+    eraseScreen(ref o.thisData)
+
+    nint n = g.streams[gfs].images.length()
+    o.imageIndex = 0
+    while (nint)o.imageIndex < n {
+        nint curGfi = g.streams[gfs].images[(nint)o.imageIndex]
+        nint optIndex = g.images[curGfi].userData
+        bool wasCompressed = !g.images[curGfi].hasImg
+
+        // save previous data if necessary
+        if (int)g.images[curGfi].disposal == GifDisposalPrevious {
+            if previousData.length() == 0 {
+                previousData = List<uint>.repeat(0, screenSize)
+            }
+            copyDataArea(read o, ref previousData, read o.thisData, imageArea(read g.images[curGfi]))
+        }
+
+        // set up this_data to be equal to the current image
+        var cur = o.thisData.replace(List<uint>())
+        applyFrame(ref g, read o, ref cur, gfs, curGfi, false, false)
+        o.thisData = cur
+
+        // save actual bounds and disposal from unoptimized version so we can apply the disposal
+        // correctly next time through
+        var unoptArea = imageArea(read g.images[curGfi])
+        int unoptDisposal = (int)g.images[curGfi].disposal
+
+        // set bounds and disposal from optdata
+        gifReleaseUncompressedImage(ref g, curGfi)
+        g.images[curGfi].left = u16(g.optData[optIndex].left)
+        g.images[curGfi].top = u16(g.optData[optIndex].top)
+        g.images[curGfi].width = u16(g.optData[optIndex].width)
+        g.images[curGfi].height = u16(g.optData[optIndex].height)
+        g.images[curGfi].disposal = g.optData[optIndex].disposal
+        if o.imageIndex > 0 {
+            g.images[curGfi].interlace = 0
+        }
+
+        // find the new image's colormap and then make new data
+        var need = g.optData[optIndex].neededColors.replace(List<byte>())
+        var map = prepareColormap(ref g, read o, curGfi, read need)
+        nint size = (nint)g.images[curGfi].width * (nint)g.images[curGfi].height
+        gifSetUncompressedImage(ref g, curGfi, List<byte>.repeat(0, size), false)
+
+        // don't use transparency on first frame
+        if (optimizeFlags & GtOptMask) > 1 && o.imageIndex > 0 && g.images[curGfi].transparent >= 0 {
+            transpFrameData(ref g, read o, gfs, curGfi, read map, optimizeFlags, ref gcinfo)
+        } else {
+            simpleFrameData(ref g, read o, curGfi, read map)
+        }
+
+        if g.images[curGfi].hasImg {
+            if wasCompressed || (optimizeFlags & GtOptMask) > 1 {
+                _ = gifFullCompressImage(ref g, gfs, curGfi, read gcinfo)
+                gifReleaseUncompressedImage(ref g, curGfi)
+            } else {
+                // bug fix 22.May.2001
+                gifReleaseCompressedImage(ref g, curGfi)
+            }
+        }
+
+        g.images[curGfi].userData = None
+
+        // Set up last_data and this_data. last_data must contain this_data + new disposal.
+        // this_data must contain this_data + old disposal.
+        int newDisposal = (int)g.images[curGfi].disposal
+        var newArea = imageArea(read g.images[curGfi])
+        if newDisposal == GifDisposalNone || newDisposal == GifDisposalAsis {
+            var last = o.lastData.replace(List<uint>())
+            copyDataArea(read o, ref last, read o.thisData, newArea)
+            o.lastData = last
+        } else if newDisposal == GifDisposalBackground {
+            var last = o.lastData.replace(List<uint>())
+            eraseDataArea(read o, ref last, newArea)
+            o.lastData = last
+        }
+
+        if unoptDisposal == GifDisposalBackground {
+            var t = o.thisData.replace(List<uint>())
+            eraseDataArea(read o, ref t, unoptArea)
+            o.thisData = t
+        } else if unoptDisposal == GifDisposalPrevious {
+            var t = o.thisData.replace(List<uint>())
+            copyDataArea(read o, ref t, read previousData, unoptArea)
+            o.thisData = t
+        }
+        o.imageIndex += 1
+    }
+    g.optData.clear()
+}
+
+// the interface function
+void optimizeFragments(ref Gt g, nint gfs, read OutputData od, bool hugeStream) {
+    int optimizeFlags = od.optimizing
+    if od.colormapFixed != None && od.colormapFixedExact {
+        optimizeFlags |= GtOptKeepcolormap
+    }
+    var o = Optimizer {
+        screenWidth = 0, screenHeight = 0, allColormap = None, inGlobalMap = None, inGlobalMapMade = false,
+        outGlobalMap = None, background = 0, imageIndex = 0, lastData = List<uint>(), thisData = List<uint>(),
+        nextData = List<uint>(),
+    }
+    if !initializeOptimizer(ref g, ref o, gfs, optimizeFlags) {
+        return
+    }
+    bool ok = createSubimages(ref g, ref o, gfs, optimizeFlags, !hugeStream)
+    if ok {
+        createOutGlobalMap(ref g, ref o, gfs, optimizeFlags)
+        createNewImageData(ref g, ref o, gfs, optimizeFlags)
+    }
+    o.lastData = List<uint>()
+    o.thisData = List<uint>()
+    if ok {
+        finalizeOptimizer(ref g, ref o, gfs, optimizeFlags)
+    } else {
+        if o.inGlobalMap != g.streams[gfs].global {
+            gifDeleteColormap(ref g, o.inGlobalMap)
+        }
+        gifDeleteColormap(ref g, o.allColormap)
+    }
+}

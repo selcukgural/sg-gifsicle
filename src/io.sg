@@ -1,0 +1,285 @@
+// io.sg - What gifsicle asks of C's library: files read whole, the program's input, the text of
+// a system error, and C's strtod.
+// SG translation of gifsicle 1.99. This file is part of sg-gifsicle, under the GNU General Public
+// License, version 2.
+
+// C's BUFSIZ, the size of the buffers gifsicle builds its messages in.
+nint messageBufSize() {
+    if OperatingSystem.isMacOS() {
+        return 1024
+    }
+    return 8192
+}
+
+// A file's bytes. C opens a folder for reading and reads nothing from it: an empty file.
+Result<List<byte>, IoError> readFileBytes(read string name) {
+    match File.readBytes(name) {
+        Ok(d) => return Ok(d)
+        Error(cause) => {
+            if cause == IoError.IsDirectory {
+                return Ok(List<byte>())
+            }
+            return Error(cause)
+        }
+    }
+}
+
+List<byte> readStdinAll() {
+    var all = List<byte>()
+    var block = List<byte>.repeat(0, 65536)
+    while true {
+        match Stdin.readSome(ref block[0..65536]) {
+            Ok(got) => {
+                if got == 0 {
+                    break
+                }
+                all.addAll(block[0..got])
+            }
+            Error(_) => break
+        }
+    }
+    return all
+}
+
+// What is left of the program's input: what a GIF read from it did not take, and the rest.
+List<byte> readStdinRest(ref Gt g) {
+    if !g.stdinRead {
+        g.stdin = fileReader(readStdinAll())
+        g.stdinRead = true
+    }
+    var rest = List<byte>()
+    rest.addAll(g.stdin.v[g.stdin.pos..g.stdin.length])
+    g.stdin.pos = g.stdin.length
+    return rest
+}
+
+bool stdinIsTerminal() {
+    return false
+}
+
+bool stdoutIsTerminal() {
+    return false
+}
+
+// strerror's text for an error of the system.
+string ioErrorText(IoError cause) {
+    return match cause {
+        NotFound => "No such file or directory"
+        PermissionDenied => "Permission denied"
+        IsDirectory => "Is a directory"
+        NoSpace => "No space left on device"
+        Other(code) => strerrorText(code)
+        _ => $"{cause}".toString()
+    }
+}
+
+string strerrorText(int code) {
+    bool mac = OperatingSystem.isMacOS()
+    if code == 1 {
+        return "Operation not permitted"
+    } else if code == 2 {
+        return "No such file or directory"
+    } else if code == 5 {
+        return "Input/output error"
+    } else if code == 9 {
+        return "Bad file descriptor"
+    } else if code == 12 {
+        return "Cannot allocate memory"
+    } else if code == 13 {
+        return "Permission denied"
+    } else if code == 17 {
+        return "File exists"
+    } else if code == 20 {
+        return "Not a directory"
+    } else if code == 21 {
+        return "Is a directory"
+    } else if code == 22 {
+        return "Invalid argument"
+    } else if code == 23 {
+        return "Too many open files in system"
+    } else if code == 24 {
+        return "Too many open files"
+    } else if code == 26 {
+        return "Text file busy"
+    } else if code == 27 {
+        return "File too large"
+    } else if code == 28 {
+        return "No space left on device"
+    } else if code == 30 {
+        return "Read-only file system"
+    } else if (mac && code == 62) || (!mac && code == 40) {
+        return "Too many levels of symbolic links"
+    } else if (mac && code == 63) || (!mac && code == 36) {
+        return "File name too long"
+    } else if (mac && code == 69) || (!mac && code == 122) {
+        return "Disc quota exceeded"
+    }
+    if mac {
+        return $"Unknown error: {code}".toString()
+    }
+    return $"Unknown error {code}".toString()
+}
+
+// ---- C's strtod ----
+
+struct CDouble : Copyable {
+    double value
+    nint end
+}
+
+bool asciiEqualsIgnoreCase(read byte[] s, nint at, read string word) {
+    var w = word.asBytes()
+    for i in 0..w.length() {
+        int c = byteAt(s, at + i)
+        if c >= 0x41 && c <= 0x5A {
+            c += 32
+        }
+        if c != (int)w[i] {
+            return false
+        }
+    }
+    return true
+}
+
+CDouble cStrtod(read byte[] s, nint at) {
+    nint p = at
+    while isSpaceByte(byteAt(s, p)) {
+        p += 1
+    }
+    bool neg = false
+    if byteAt(s, p) == 0x2B || byteAt(s, p) == 0x2D {
+        neg = byteAt(s, p) == 0x2D
+        p += 1
+    }
+    double sign = 1.0
+    if neg {
+        sign = -1.0
+    }
+    // infinity and NaN
+    if asciiEqualsIgnoreCase(s, p, "infinity") {
+        return CDouble { value = sign * double.Infinity, end = p + 8 }
+    }
+    if asciiEqualsIgnoreCase(s, p, "inf") {
+        return CDouble { value = sign * double.Infinity, end = p + 3 }
+    }
+    if asciiEqualsIgnoreCase(s, p, "nan") {
+        nint e = p + 3
+        if byteAt(s, e) == 0x28 {
+            nint k = e + 1
+            while isDigitByte(byteAt(s, k)) || digitValue(byteAt(s, k)) < 36 || byteAt(s, k) == 0x5F {
+                k += 1
+            }
+            if byteAt(s, k) == 0x29 {
+                e = k + 1
+            }
+        }
+        return CDouble { value = double.NaN, end = e }
+    }
+    // hexadecimal
+    if byteAt(s, p) == 0x30 && (byteAt(s, p + 1) == 0x78 || byteAt(s, p + 1) == 0x58) &&
+        (digitValue(byteAt(s, p + 2)) < 16 || (byteAt(s, p + 2) == 0x2E && digitValue(byteAt(s, p + 3)) < 16)) {
+        nint k = p + 2
+        double v = 0.0
+        int exp2 = 0
+        while digitValue(byteAt(s, k)) < 16 {
+            v = v * 16.0 + (double)digitValue(byteAt(s, k))
+            k += 1
+        }
+        if byteAt(s, k) == 0x2E {
+            k += 1
+            while digitValue(byteAt(s, k)) < 16 {
+                v = v * 16.0 + (double)digitValue(byteAt(s, k))
+                exp2 -= 4
+                k += 1
+            }
+        }
+        if (byteAt(s, k) == 0x70 || byteAt(s, k) == 0x50) {
+            nint e = k + 1
+            bool eneg = false
+            if byteAt(s, e) == 0x2B || byteAt(s, e) == 0x2D {
+                eneg = byteAt(s, e) == 0x2D
+                e += 1
+            }
+            if isDigitByte(byteAt(s, e)) {
+                int ev = 0
+                while isDigitByte(byteAt(s, e)) {
+                    if ev < 100000 {
+                        ev = ev * 10 + (byteAt(s, e) - 0x30)
+                    }
+                    e += 1
+                }
+                if eneg {
+                    exp2 -= ev
+                } else {
+                    exp2 += ev
+                }
+                k = e
+            }
+        }
+        return CDouble { value = sign * v.scaleByPowerOfTwo(exp2), end = k }
+    }
+    // decimal
+    nint k = p
+    var text = string.withCapacity(32)
+    if neg {
+        text.write('-')
+    }
+    bool anyDigits = false
+    while isDigitByte(byteAt(s, k)) {
+        text.write((char)byteAt(s, k))
+        anyDigits = true
+        k += 1
+    }
+    if !anyDigits {
+        text.write('0')
+    }
+    if byteAt(s, k) == 0x2E {
+        bool frac = false
+        nint f = k + 1
+        var fracText = string.withCapacity(16)
+        while isDigitByte(byteAt(s, f)) {
+            fracText.write((char)byteAt(s, f))
+            frac = true
+            f += 1
+        }
+        if frac || anyDigits {
+            text.write('.')
+            if frac {
+                text.write(read fracText)
+            } else {
+                text.write('0')
+            }
+            anyDigits = true
+            k = f
+        }
+    }
+    if !anyDigits {
+        return CDouble { value = 0.0, end = at }
+    }
+    if byteAt(s, k) == 0x65 || byteAt(s, k) == 0x45 {
+        nint e = k + 1
+        var expText = string.withCapacity(8)
+        if byteAt(s, e) == 0x2B || byteAt(s, e) == 0x2D {
+            if byteAt(s, e) == 0x2D {
+                expText.write('-')
+            }
+            e += 1
+        }
+        if isDigitByte(byteAt(s, e)) {
+            // A huge exponent is cut where it no longer changes the value
+            int digits = 0
+            while isDigitByte(byteAt(s, e)) {
+                if digits < 6 {
+                    expText.write((char)byteAt(s, e))
+                }
+                digits += 1
+                e += 1
+            }
+            text.write('e')
+            text.write(read expText)
+            k = e
+        }
+    }
+    var value = double.parse(read text) ?? 0.0
+    return CDouble { value = value, end = k }
+}

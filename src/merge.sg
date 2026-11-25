@@ -1,0 +1,1155 @@
+// merge.sg - Functions which actually combine and manipulate GIF image data (merge.c), and the
+// merging of frames into an output stream (support.c's merge_frame_interval and its helpers).
+// Copyright (C) 1997-2025 Eddie Kohler, ekohler@gmail.com
+// SG translation of gifsicle 1.99. This file is part of sg-gifsicle.
+//
+// Gifsicle is free software. It is distributed under the GNU Public License, version 2; you can
+// copy, distribute, or alter it at will, as long as this notice is kept intact and this source
+// code is made available. There is no warranty, express or implied.
+
+// First merging stage: Mark the used colors in all colormaps.
+
+void unmarkColors(ref Gt g, nint gfcm) {
+    if gfcm != None {
+        for i in 0..(nint)g.colormaps[gfcm].ncol {
+            g.colormaps[gfcm].col[i].haspixel = 0
+        }
+    }
+}
+
+void unmarkColors2(ref Gt g, nint gfcm) {
+    for i in 0..(nint)g.colormaps[gfcm].ncol {
+        g.colormaps[gfcm].col[i].pixel = 256
+        g.colormaps[gfcm].col[i].haspixel = 0
+    }
+}
+
+void markUsedColors(ref Gt g, nint gfs, nint gfi, nint crop, int compressImmediately0) {
+    int compressImmediately = compressImmediately0
+    nint gfcm = g.images[gfi].local
+    if gfcm == None {
+        gfcm = g.streams[gfs].global
+    }
+    // There might not be a colormap.
+    if gfcm == None {
+        return
+    }
+    int ncol = g.colormaps[gfcm].ncol
+    int transp = g.images[gfi].transparent
+    // Mark color used for transparency.
+    if transp >= 0 && transp < ncol {
+        g.colormaps[gfcm].col[(nint)transp].haspixel |= 2
+    }
+    // Only mark colors until we've seen all of them.
+    int nleft = 0
+    for i in 0..ncol {
+        if (g.colormaps[gfcm].col[(nint)i].haspixel & 1) == 0 && i != transp {
+            nleft += 1
+        }
+    }
+    if nleft == 0 {
+        return
+    }
+    if g.images[gfi].hasImg || gifUncompressImage(ref g, gfs, gfi) == 2 {
+        compressImmediately = 0
+    }
+    // Loop over every pixel (until we've seen all colors)
+    int l = 0
+    int t = 0
+    int r = (int)g.images[gfi].width
+    int b = (int)g.images[gfi].height
+    if crop != None {
+        var c = combineCrop(read g.crops[crop], read g.images[gfi])
+        l = c.x
+        t = c.y
+        r = l + c.w
+        b = t + c.h
+    }
+    var col = g.colormaps[gfcm].col.replace(List<Color>())
+    done: for j in t..b {
+        nint row = g.images[gfi].rows[(nint)j]
+        for i in l..r {
+            int p = (int)g.images[gfi].data[row + (nint)i]
+            if p < ncol && (col[(nint)p].haspixel & 1) == 0 && p != transp {
+                col[(nint)p].haspixel |= 1
+                nleft -= 1
+                if nleft == 0 {
+                    break done
+                }
+            }
+        }
+    }
+    g.colormaps[gfcm].col = col
+    if compressImmediately > 0 {
+        gifReleaseUncompressedImage(ref g, gfi)
+    }
+}
+
+int findColorIndex(read List<Color> c, int nc, Color color) {
+    for index in 0..(nint)nc {
+        if colorEq(c[index], color) {
+            return (int)index
+        }
+    }
+    return -1
+}
+
+bool mergeColormapIfPossible(ref Gt g, nint dest, nint src) {
+    if src == None {
+        return true
+    }
+    var destcol = g.colormaps[dest].col.replace(List<Color>())
+    int destncol = g.colormaps[dest].ncol
+    var srccol = g.colormaps[src].col.replace(List<Color>())
+    int srcncol = g.colormaps[src].ncol
+    bool trivialMap = true
+    bool failed = false
+    nint i = 0
+    while i < (nint)srcncol {
+        if (srccol[i].haspixel & 1) != 0 {
+            // Store an image color cell's mapping to the global colormap in its 'pixel' slot.
+            int mapto = -1
+            if srccol[i].pixel < 256 {
+                mapto = (int)srccol[i].pixel
+            }
+            if mapto == -1 {
+                mapto = findColorIndex(read destcol, destncol, srccol[i])
+            }
+            if mapto == -1 && destncol < 256 {
+                // add the color
+                mapto = destncol
+                destcol[(nint)mapto] = srccol[i]
+                destncol += 1
+            }
+            if mapto == -1 {
+                // check for a pure-transparent color
+                for x in 0..(nint)destncol {
+                    if destcol[x].haspixel == 2 {
+                        mapto = (int)x
+                        destcol[x] = srccol[i]
+                        break
+                    }
+                }
+            }
+            if mapto == -1 {
+                // give up and require a local colormap
+                failed = true
+                break
+            }
+            srccol[i].pixel = (uint)mapto
+            destcol[(nint)mapto].haspixel = 1
+            if (nint)mapto != i {
+                trivialMap = false
+            }
+        } else if (srccol[i].haspixel & 2) != 0 {
+            // a dedicated transparent color; if trivial_map & at end of colormap insert it with
+            // haspixel == 2 (to try to keep the map trivial).
+            if trivialMap && i == (nint)destncol {
+                destcol[(nint)destncol] = srccol[i]
+                destncol += 1
+            }
+        }
+        i += 1
+    }
+    if !failed {
+        g.colormaps[dest].col = destcol
+        g.colormaps[src].col = srccol
+        g.colormaps[dest].ncol = destncol
+        return true
+    }
+    g.colormaps[dest].col = destcol
+    // failure: a local colormap is required
+    if g.msgs.warnLocalColormaps == 1 {
+        if !g.msgs.warnLocalColormapsContext {
+            warning(ref g, 1, "too many colors, using local colormaps\n  (You may want to try %<--colors 256%>.)", read List<string>())
+            g.msgs.warnLocalColormapsContext = true
+        } else {
+            warning(ref g, 1, "too many colors, using local colormaps", read List<string>())
+        }
+        g.msgs.warnLocalColormaps = 2
+    }
+    // Clear the cached mappings of any pixels in the source colormap we assigned this time
+    // through, since we are throwing those colors away.
+    int destNcolNow = g.colormaps[dest].ncol
+    for x in 0..i {
+        if (srccol[x].haspixel & 1) != 0 && srccol[x].pixel >= (uint)destNcolNow {
+            srccol[x].pixel = 256
+        }
+    }
+    g.colormaps[src].col = srccol
+    return false
+}
+
+void mergeStream(ref Gt g, nint dest, nint src, int noExtensionsFlag) {
+    // unmark colors in global and local colormaps -- 12/9
+    if g.streams[src].global != None {
+        unmarkColors2(ref g, g.streams[src].global)
+    }
+    for k in 0..g.streams[src].images.length() {
+        nint local = g.images[g.streams[src].images[k]].local
+        if local != None {
+            unmarkColors2(ref g, local)
+        }
+    }
+    if g.streams[dest].loopcount < 0 {
+        g.streams[dest].loopcount = g.streams[src].loopcount
+    }
+    for k in 0..g.streams[src].endExtensions.length() {
+        if (noExtensionsFlag & extensionFlag(read g.streams[src].endExtensions[k])) == 0 {
+            var copy = gifCopyExtension(read g.streams[src].endExtensions[k])
+            g.streams[dest].endExtensions.add(copy)
+        }
+    }
+}
+
+void mergeImageInputColors(ref byte[256] inused, read Image srci) {
+    int nleft = gifImageColorBound(read srci)
+    for i in 0..256 {
+        inused[i] = 0
+    }
+    nint y = 0
+    nint height = (nint)srci.height
+    nint width = (nint)srci.width
+    while y != height && nleft > 0 {
+        nint row = srci.rows[y]
+        for x in 0..width {
+            byte p = srci.data[row + x]
+            nleft -= 1 - (int)inused[(nint)p]
+            inused[(nint)p] = 1
+        }
+        y += 1
+    }
+    if srci.transparent >= 0 {
+        inused[(nint)srci.transparent] = 0
+    }
+}
+
+nint mergeImage(ref Gt g, nint dest, nint src, nint srci, read Frame srcfr, bool sameCompressedOk) {
+    var map = byte[256]
+    var inused = byte[256]
+    var used = byte[256]
+    nint destcm = g.streams[dest].global
+    nint localcm = None
+
+    // mark colors that were actually used in this image
+    nint imagecm = g.images[srci].local
+    if imagecm == None {
+        imagecm = g.streams[src].global
+    }
+    int imagecmNcol = 0
+    if imagecm != None {
+        imagecmNcol = g.colormaps[imagecm].ncol
+    }
+    mergeImageInputColors(ref inused, read g.images[srci])
+    for i in (nint)imagecmNcol..256 {
+        if inused[i] != 0 {
+            string? landmark = null
+            if srcfr.hasInputFilename {
+                landmark = srcfr.inputFilename.clone()
+            }
+            lwarning(ref g, read landmark, "some colors undefined by colormap", read List<string>())
+            break
+        }
+    }
+
+    // Merge the colormap
+    if mergeColormapIfPossible(ref g, g.streams[dest].global, imagecm) {
+        // Create 'map' and 'used' for global colormap.
+        for i in 0..(nint)imagecmNcol {
+            if inused[i] != 0 {
+                map[i] = (byte)(g.colormaps[imagecm].col[i].pixel & 0xFF)
+            }
+        }
+    } else {
+        // Need a local colormap.
+        localcm = gifNewFullColormap(ref g, 0, 256)
+        destcm = localcm
+        for i in 0..(nint)imagecmNcol {
+            if inused[i] != 0 {
+                map[i] = (byte)g.colormaps[localcm].ncol
+                g.colormaps[localcm].col[(nint)g.colormaps[localcm].ncol] = g.colormaps[imagecm].col[i]
+                g.colormaps[localcm].ncol += 1
+            }
+        }
+        // Undefined colors map to 0, so make sure color 0 exists.
+        nint i = (nint)imagecmNcol
+        while i != 256 && g.colormaps[localcm].ncol == 0 {
+            if inused[i] != 0 {
+                g.colormaps[localcm].col[0].red = 0
+                g.colormaps[localcm].col[0].green = 0
+                g.colormaps[localcm].col[0].blue = 0
+                g.colormaps[localcm].ncol = 1
+            }
+            i += 1
+        }
+    }
+
+    bool trivialMap = true
+    for i in 0..256 {
+        if inused[i] != 0 {
+            used[(nint)map[i]] = 1
+            trivialMap = trivialMap && (nint)map[i] == i
+        }
+    }
+
+    // Decide on a transparent index
+    int srcTransparent = g.images[srci].transparent
+    if srcTransparent >= 0 {
+        int foundTransparent = -1
+        // try to keep the map trivial -- prefer same transparent index
+        if trivialMap && used[(nint)srcTransparent] == 0 {
+            foundTransparent = srcTransparent
+        } else {
+            int k = g.colormaps[destcm].ncol - 1
+            while k >= 0 {
+                if used[(nint)k] == 0 {
+                    foundTransparent = k
+                }
+                k -= 1
+            }
+        }
+        // Allow for the case that the transparent index is bigger than the number of colors we've
+        // created thus far.
+        if foundTransparent < 0 || foundTransparent >= g.colormaps[destcm].ncol {
+            foundTransparent = g.colormaps[destcm].ncol
+            // Don't update destcm->ncol -- we want the output colormap to be as small as possible.
+            if imagecm != None && srcTransparent < g.colormaps[imagecm].ncol {
+                g.colormaps[destcm].col[(nint)foundTransparent] = g.colormaps[imagecm].col[(nint)srcTransparent]
+            }
+            g.colormaps[destcm].col[(nint)foundTransparent].haspixel = 2
+        }
+        map[(nint)srcTransparent] = (byte)foundTransparent
+        if srcTransparent != foundTransparent {
+            trivialMap = false
+        }
+    }
+
+    // Make the new image.
+    var desti = gifNewImage(ref g)
+    if srcTransparent > -1 {
+        g.images[desti].transparent = (int)map[(nint)srcTransparent]
+    }
+    g.images[desti].delay = g.images[srci].delay
+    g.images[desti].disposal = g.images[srci].disposal
+    g.images[desti].left = g.images[srci].left
+    g.images[desti].top = g.images[srci].top
+    g.images[desti].interlace = g.images[srci].interlace
+    g.images[desti].width = g.images[srci].width
+    g.images[desti].height = g.images[srci].height
+    g.images[desti].local = localcm
+
+    if trivialMap && sameCompressedOk && g.images[srci].hasCompressed && g.images[srci].compressedErrors == 0 {
+        g.images[desti].compressed = g.images[srci].compressed.clone()
+        g.images[desti].hasCompressed = true
+    } else {
+        gifCreateUncompressedImage(ref g, desti, g.images[desti].interlace != 0)
+        nint width = (nint)g.images[desti].width
+        nint height = (nint)g.images[desti].height
+        var data = g.images[desti].data.replace(List<byte>())
+        for j in 0..height {
+            nint srow = g.images[srci].rows[j]
+            nint drow = g.images[desti].rows[j]
+            if trivialMap {
+                data[drow..drow + width].copyFrom(g.images[srci].data[srow..srow + width])
+            } else {
+                for i in 0..width {
+                    data[drow + i] = map[(nint)g.images[srci].data[srow + i]]
+                }
+            }
+        }
+        g.images[desti].data = data
+    }
+
+    // comments and extensions
+    int noexf = srcfr.noExtensionsFlag | srcfr.frameNoExtensionsFlag
+    for k in 0..g.images[srci].extensions.length() {
+        if (noexf & extensionFlag(read g.images[srci].extensions[k])) == 0 {
+            var copy = gifCopyExtension(read g.images[srci].extensions[k])
+            g.images[desti].extensions.add(copy)
+        }
+    }
+    gifAddImage(ref g, dest, desti)
+    return desti
+}
+
+// ---- merging frames (support.c) ----
+
+void mergerAdd(ref Gt g, nint fset, nint i) {
+    g.mergerSets.add(fset)
+    g.mergerIndexes.add(i)
+}
+
+void mergerFlatten(ref Gt g, nint fset, int f1, int f2) {
+    int i = f1
+    while i <= f2 {
+        nint k = (nint)i
+        nint nest = g.framesets[fset].f[k].nest
+        if nest != None && g.framesets[nest].f.length() > 0 {
+            if g.framesets[fset].f[k].useFrame < 0 && g.framesets[nest].f.length() == 1 {
+                // use < 0 means use the frame's delay, disposal and name (if not explicitly
+                // overridden), but not the frame itself.
+                nint image = g.framesets[fset].f[k].image
+                if g.framesets[nest].f[0].delay < 0 {
+                    g.framesets[nest].f[0].delay = (int)g.images[image].delay
+                }
+                if g.framesets[nest].f[0].disposal < 0 {
+                    g.framesets[nest].f[0].disposal = (int)g.images[image].disposal
+                }
+                if (g.framesets[nest].f[0].noExtensionsFlag & NoexfName) == 0 &&
+                    gifExtensionListName(read g.framesets[nest].f[0].extensions) is null {
+                    var identifier = gifImageName(read g, image)
+                    if identifier is not null {
+                        g.framesets[nest].f[0].extensions.add(gifNewExtensionData(GifExName, "".asBytes(), cString(read identifier)))
+                        g.framesets[nest].f[0].frameNoExtensionsFlag |= NoexfName
+                    }
+                }
+            }
+            mergerFlatten(ref g, nest, 0, (int)g.framesets[nest].f.length() - 1)
+        }
+        if g.framesets[fset].f[k].useFrame > 0 {
+            mergerAdd(ref g, fset, k)
+        }
+        i += 1
+    }
+}
+
+int findColorOrError(ref Gt g, Color color, nint gfs, nint gfi, read string? colorContext) {
+    nint gfcm = g.streams[gfs].global
+    if gfi != None && g.images[gfi].local != None {
+        gfcm = g.images[gfi].local
+    }
+    string? landmark = null
+    if g.streams[gfs].hasLandmark {
+        landmark = g.streams[gfs].landmark.clone()
+    }
+    // have pixel value, not color
+    if color.haspixel == 2 {
+        if gfcm == None || color.pixel < (uint)g.colormaps[gfcm].ncol {
+            return (int)color.pixel
+        }
+        if colorContext is not null {
+            lwarning(ref g, read landmark, "%s color out of range", read List<string> { colorContext.clone() })
+        }
+        return -1
+    }
+    int index = -1
+    if gfcm != None {
+        index = gifFindColor(read g.colormaps[gfcm], color)
+    }
+    if index < 0 && colorContext is not null {
+        lwarning(ref g, read landmark, "%s color not in colormap", read List<string> { colorContext.clone() })
+    }
+    return index
+}
+
+void setBackground(ref Gt g, nint gfs) {
+    var bgOption = g.activeOutput.background
+    // If they specified the number, silently cooperate.
+    if bgOption.haspixel == 2 {
+        g.streams[gfs].background = (int)(bgOption.pixel & 0xFFFF)
+        return
+    }
+    var background = noColor()
+    if bgOption.haspixel != 0 {
+        // Otherwise, if they specified a color, search for it.
+        if g.images[g.streams[gfs].images[0]].transparent >= 0 {
+            if !g.msgs.irrelevantBackgroundContext {
+                warning(ref g, 1, "irrelevant background color\n  (The background will appear transparent because  the first image contains transparency.)", read List<string>())
+                g.msgs.irrelevantBackgroundContext = true
+            } else {
+                warning(ref g, 1, "irrelevant background color", read List<string>())
+            }
+        }
+        background = bgOption
+    } else {
+        // The user doesn't care about the background: search for required background colors.
+        int conflict = 0
+        bool wantTransparent = false
+        background.haspixel = 0
+        for i in 0..g.mergerSets.length() {
+            nint gfi = g.streams[gfs].images[i]
+            var fr = read g.framesets[g.mergerSets[i]].f[g.mergerIndexes[i]]
+            if (int)g.images[gfi].disposal == GifDisposalBackground ||
+                (i == 0 && (g.images[gfi].left != 0 || g.images[gfi].top != 0 ||
+                    g.images[gfi].width != g.streams[gfs].screenWidth ||
+                    g.images[gfi].height != g.streams[gfs].screenHeight)) {
+                // transparent.haspixel set in merge_frame_interval
+                bool originalBgTransparent = fr.transparent.haspixel == 2
+                if (originalBgTransparent && background.haspixel != 0) || (!originalBgTransparent && wantTransparent) {
+                    conflict = 2
+                } else if originalBgTransparent {
+                    wantTransparent = true
+                } else if fr.transparent.haspixel != 0 {
+                    if background.haspixel != 0 && !colorEq(background, fr.transparent) {
+                        conflict = 1
+                    } else {
+                        background = fr.transparent
+                        background.haspixel = 1
+                    }
+                }
+            }
+        }
+        // Report conflicts.
+        if conflict != 0 || (wantTransparent && g.images[g.streams[gfs].images[0]].transparent < 0) {
+            if !g.msgs.conflictingBackgroundContext {
+                warning(ref g, 1, "input images have conflicting background colors\n  (This means some animation frames may appear incorrect.)", read List<string>())
+                g.msgs.conflictingBackgroundContext = true
+            } else {
+                warning(ref g, 1, "input images have conflicting background colors", read List<string>())
+            }
+        }
+        // If no important background color, bag.
+        if background.haspixel == 0 {
+            g.streams[gfs].background = 0
+            return
+        }
+    }
+    int i = findColorOrError(ref g, background, gfs, None, "background")
+    if i >= 0 {
+        g.streams[gfs].background = i
+    } else {
+        g.streams[gfs].background = 0
+    }
+}
+
+void handleFlipAndRotate(ref Gt g, nint desti, ref Frame fr) {
+    int sw = (int)g.streams[fr.stream].screenWidth
+    int sh = (int)g.streams[fr.stream].screenHeight
+    g.images[desti].left = u16((int)g.images[desti].left + fr.leftOffset)
+    g.images[desti].top = u16((int)g.images[desti].top + fr.topOffset)
+    // Flips and rotations are relative to the logical screen. Parts of frames outside the screen
+    // are dropped; a frame entirely outside becomes a transparent 1x1 placeholder inside it.
+    _ = gifClipImage(ref g, desti, 0, 0, sw, sh)
+    if (g.images[desti].width == 0 || g.images[desti].height == 0) && sw > 0 && sh > 0 {
+        if (int)g.images[desti].left >= sw {
+            g.images[desti].left = u16(sw - 1)
+        }
+        if (int)g.images[desti].top >= sh {
+            g.images[desti].top = u16(sh - 1)
+        }
+        gifMakeImageEmpty(ref g, desti)
+    }
+    if fr.flipHorizontal {
+        flipImage(ref g, desti, ref fr, false)
+    }
+    if fr.flipVertical {
+        flipImage(ref g, desti, ref fr, true)
+    }
+    if fr.rotation == 1 {
+        rotateImage(ref g, desti, ref fr, 1)
+    } else if fr.rotation == 2 {
+        flipImage(ref g, desti, ref fr, false)
+        flipImage(ref g, desti, ref fr, true)
+    } else if fr.rotation == 3 {
+        rotateImage(ref g, desti, ref fr, 3)
+    }
+    // a placeholder for a frame outside an empty crop can land before the crop origin
+    if (int)g.images[desti].left > fr.leftOffset {
+        g.images[desti].left = u16((int)g.images[desti].left - fr.leftOffset)
+    } else {
+        g.images[desti].left = 0
+    }
+    if (int)g.images[desti].top > fr.topOffset {
+        g.images[desti].top = u16((int)g.images[desti].top - fr.topOffset)
+    } else {
+        g.images[desti].top = 0
+    }
+}
+
+int constrain(int low, int x, int high) {
+    if x < low {
+        return low
+    }
+    if x < high {
+        return x
+    }
+    return high
+}
+
+void analyzeCrop(ref Gt g, nint crop, int compressImmediately) {
+    int l = 0x7FFFFFFF
+    int r = 0
+    int t = 0x7FFFFFFF
+    int b = 0
+    nint croppedGfs = None
+    nint nmerger = g.mergerSets.length()
+    // find cropped stream
+    for i in 0..nmerger {
+        if g.framesets[g.mergerSets[i]].f[g.mergerIndexes[i]].crop == crop {
+            croppedGfs = g.framesets[g.mergerSets[i]].f[g.mergerIndexes[i]].stream
+        }
+    }
+    // find border of frames
+    for i in 0..nmerger {
+        nint fs = g.mergerSets[i]
+        nint fi = g.mergerIndexes[i]
+        if g.framesets[fs].f[fi].crop == crop {
+            nint stream = g.framesets[fs].f[fi].stream
+            nint image = g.framesets[fs].f[fi].image
+            int ll = 0
+            int tt = 0
+            int rr = 0
+            int bb = 0
+            if !g.framesets[fs].f[fi].positionIsOffset {
+                // only consider the part of the frame on the logical screen
+                int sw = (int)g.streams[stream].screenWidth
+                int sh = (int)g.streams[stream].screenHeight
+                ll = (int)g.images[image].left
+                tt = (int)g.images[image].top
+                rr = constrain(ll, (int)g.images[image].left + (int)g.images[image].width, sw)
+                bb = constrain(tt, (int)g.images[image].top + (int)g.images[image].height, sh)
+                if ll >= rr || tt >= bb {
+                    continue
+                }
+            } else {
+                rr = (int)g.streams[stream].screenWidth
+                bb = (int)g.streams[stream].screenHeight
+            }
+            if ll < l {
+                l = ll
+            }
+            if tt < t {
+                t = tt
+            }
+            if rr > r {
+                r = rr
+            }
+            if bb > b {
+                b = bb
+            }
+        }
+    }
+    if t > b {
+        // total crop
+        l = 0
+        r = 0
+        t = 0
+        b = 0
+    }
+    var c = g.crops[crop]
+    c.x = c.specX + l
+    c.y = c.specY + t
+    c.w = c.specW
+    if c.specW <= 0 {
+        c.w += r - c.x
+    }
+    c.h = c.specH
+    if c.specH <= 0 {
+        c.h += b - c.y
+    }
+    c.leftOffset = c.x
+    c.topOffset = c.y
+    if c.x < 0 || c.y < 0 || c.w <= 0 || c.h <= 0 || c.x + c.w > r || c.y + c.h > b {
+        g.crops[crop] = c
+        string? landmark = null
+        if croppedGfs != None && g.streams[croppedGfs].hasLandmark {
+            landmark = g.streams[croppedGfs].landmark.clone()
+        }
+        lerror(ref g, read landmark, "cropping dimensions don%,t fit image", read List<string>())
+        c.ready = 2
+        // clip the crop to the image so later computations stay sane
+        if c.w < 0 {
+            c.w = 0
+        }
+        if c.h < 0 {
+            c.h = 0
+        }
+        c.w = constrain(l, c.x + c.w, r)
+        c.x = constrain(l, c.x, r)
+        if c.w > c.x {
+            c.w = c.w - c.x
+        } else {
+            c.w = 0
+        }
+        c.h = constrain(t, c.y + c.h, b)
+        c.y = constrain(t, c.y, b)
+        if c.h > c.y {
+            c.h = c.h - c.y
+        } else {
+            c.h = 0
+        }
+        c.leftOffset = c.x
+        c.topOffset = c.y
+    } else {
+        c.ready = 1
+    }
+    g.crops[crop] = c
+
+    // Remove transparent edges.
+    if c.transparentEdges && c.ready == 1 {
+        int haveL = c.x
+        int haveT = c.y
+        int haveR = c.x + c.w
+        int haveB = c.y + c.h
+        l = 0x7FFFFFFF
+        t = 0x7FFFFFFF
+        r = 0
+        b = 0
+        nint i = 0
+        while i < nmerger && (l > haveL || t > haveT || r < haveR || b < haveB) {
+            nint fs = g.mergerSets[i]
+            nint fi = g.mergerIndexes[i]
+            if g.framesets[fs].f[fi].crop == crop {
+                nint stream = g.framesets[fs].f[fi].stream
+                nint srci = g.framesets[fs].f[fi].image
+                int sleft = (int)g.images[srci].left
+                int stop = (int)g.images[srci].top
+                int swidth = (int)g.images[srci].width
+                int sheight = (int)g.images[srci].height
+                int ll = constrain(haveL, sleft, haveR)
+                int tt = constrain(haveT, stop, haveB)
+                int rr = constrain(haveL, sleft + swidth, haveR)
+                int bb = constrain(haveT, stop + sheight, haveB)
+                int transparent = g.images[srci].transparent
+                if transparent >= 0 {
+                    _ = gifUncompressImage(ref g, stream, srci)
+                    // Move top edge down over transparency
+                    bool found = false
+                    while tt < bb && tt < t && !found {
+                        nint row = g.images[srci].rows[(nint)(tt - stop)]
+                        for x in 0..(nint)swidth {
+                            if (int)g.images[srci].data[row + x] != transparent {
+                                found = true
+                                break
+                            }
+                        }
+                        if !found {
+                            tt += 1
+                        }
+                    }
+                    // Move bottom edge up over transparency
+                    found = false
+                    while bb > tt + 1 && bb > b && !found {
+                        nint row = g.images[srci].rows[(nint)(bb - 1 - stop)]
+                        for x in 0..(nint)swidth {
+                            if (int)g.images[srci].data[row + x] != transparent {
+                                found = true
+                                break
+                            }
+                        }
+                        if !found {
+                            bb -= 1
+                        }
+                    }
+                    if tt < bb {
+                        // Move left edge right over transparency
+                        found = false
+                        while ll < rr && ll < l && !found {
+                            for y in (tt - stop)..(bb - stop) {
+                                if (int)g.images[srci].data[g.images[srci].rows[(nint)y] + (nint)(ll - sleft)] != transparent {
+                                    found = true
+                                    break
+                                }
+                            }
+                            if !found {
+                                ll += 1
+                            }
+                        }
+                        // Move right edge left over transparency
+                        found = false
+                        while rr > ll + 1 && rr > r && !found {
+                            for y in (tt - stop)..(bb - stop) {
+                                if (int)g.images[srci].data[g.images[srci].rows[(nint)y] + (nint)(rr - 1 - sleft)] != transparent {
+                                    found = true
+                                    break
+                                }
+                            }
+                            if !found {
+                                rr -= 1
+                            }
+                        }
+                    }
+                    if compressImmediately > 0 && g.images[srci].hasCompressed {
+                        gifReleaseUncompressedImage(ref g, srci)
+                    }
+                }
+                // a frame outside the crop horizontally contributes nothing
+                if tt < bb && ll < rr {
+                    if ll < l {
+                        l = ll
+                    }
+                    if tt < t {
+                        t = tt
+                    }
+                    if rr > r {
+                        r = rr
+                    }
+                    if bb > b {
+                        b = bb
+                    }
+                }
+            }
+            i += 1
+        }
+        if t >= b || l >= r {
+            // everything is transparent; keep a 1x1 crop, since later code assumes a nonempty crop
+            g.crops[crop].w = 1
+            g.crops[crop].h = 1
+        } else {
+            g.crops[crop].x = l
+            g.crops[crop].y = t
+            g.crops[crop].w = r - l
+            g.crops[crop].h = b - t
+            g.crops[crop].leftOffset = l
+            g.crops[crop].topOffset = t
+        }
+    }
+}
+
+int applyFrameTransparent(ref Gt g, nint gfi, ref Frame fr) {
+    int oldTransparent = g.images[gfi].transparent
+    if fr.transparent.haspixel == 255 {
+        g.images[gfi].transparent = -1
+    } else if fr.transparent.haspixel != 0 {
+        g.images[gfi].transparent = findColorOrError(ref g, fr.transparent, fr.stream, gfi, "transparent")
+        if g.images[gfi].transparent < 0 {
+            fr.transparent.haspixel = 0
+        }
+    }
+    return oldTransparent
+}
+
+void markUsedBackgroundColor(ref Gt g, read Frame fr) {
+    nint gfs = fr.stream
+    nint gfi = fr.image
+    bool opaque = g.images[gfi].transparent < 0
+    if fr.transparent.haspixel != 0 {
+        opaque = fr.transparent.haspixel != 255
+    }
+    int disposal = (int)g.images[gfi].disposal
+    if fr.disposal >= 0 {
+        disposal = fr.disposal
+    }
+    nint global = g.streams[gfs].global
+    if opaque &&
+        (disposal == GifDisposalBackground || g.images[gfi].left != 0 || g.images[gfi].top != 0 ||
+            g.images[gfi].width != g.streams[gfs].screenWidth || g.images[gfi].height != g.streams[gfs].screenHeight) &&
+        global != None && g.streams[gfs].background < g.colormaps[global].ncol {
+        g.colormaps[global].col[(nint)g.streams[gfs].background].haspixel |= 1
+    }
+}
+
+// The frame of the merger at `i`, taken out of its frameset while it is worked on.
+Frame takeMergerFrame(ref Gt g, nint i) {
+    return g.framesets[g.mergerSets[i]].f[g.mergerIndexes[i]].replace(blankFrame())
+}
+
+void putMergerFrame(ref Gt g, nint i, Frame fr) {
+    g.framesets[g.mergerSets[i]].f[g.mergerIndexes[i]] = fr
+}
+
+nint mergeFrameInterval(ref Gt g, nint fset, int f1, int f2In, int compressImmediately0, ref bool hugeStream) {
+    int compressImmediately = compressImmediately0
+    var dest = gifNewStream(ref g)
+    var global = gifNewFullColormap(ref g, 256, 256)
+    g.colormaps[global].ncol = 0
+    g.streams[dest].global = global
+    if g.activeOutput.hasActiveOutputName {
+        g.streams[dest].hasLandmark = true
+        g.streams[dest].landmark = g.activeOutput.activeOutputName.clone()
+    }
+    int f2 = f2In
+    if f2 < 0 {
+        f2 = (int)g.framesets[fset].f.length() - 1
+    }
+    g.mergerSets.clear()
+    g.mergerIndexes.clear()
+    mergerFlatten(ref g, fset, f1, f2)
+    nint nmerger = g.mergerSets.length()
+    if nmerger == 0 {
+        error(ref g, 1, "empty output GIF not written", read List<string>())
+        gifDeleteStream(ref g, dest)
+        return None
+    }
+
+    // decide whether stream is huge
+    ulong s = 0
+    for i in 0..nmerger {
+        nint image = g.framesets[g.mergerSets[i]].f[g.mergerIndexes[i]].image
+        s += (((ulong)g.images[image].width * (ulong)g.images[image].height) / 1024) + 1
+    }
+    hugeStream = s > 200 * 1024
+    if hugeStream && compressImmediately == 0 {
+        warning(ref g, 1, "huge GIF, conserving memory (processing may take a while)", read List<string>())
+        compressImmediately = 1
+    }
+
+    // merge stream-specific info and clear colormaps
+    for i in 0..nmerger {
+        g.streams[g.framesets[g.mergerSets[i]].f[g.mergerIndexes[i]].stream].userFlags = 1
+    }
+    for i in 0..nmerger {
+        nint src = g.framesets[g.mergerSets[i]].f[g.mergerIndexes[i]].stream
+        if g.streams[src].userFlags != 0 {
+            gifCalculateScreenSize(ref g, src, false)
+            // merge_stream() unmarks the global colormap
+            mergeStream(ref g, dest, src, g.framesets[g.mergerSets[i]].f[g.mergerIndexes[i]].noExtensionsFlag)
+            g.streams[src].userFlags = 0
+        }
+        nint local = g.images[g.framesets[g.mergerSets[i]].f[g.mergerIndexes[i]].image].local
+        if local != None {
+            unmarkColors2(ref g, local)
+        }
+    }
+
+    // is it ok to save the same compressed image? Only if we will recompress later from scratch.
+    bool allSameCompressedOk = g.activeOutput.colormapSize > 0 || g.activeOutput.colormapFixed != None ||
+        (g.activeOutput.optimizing & GtOptMask) != 0 || g.activeOutput.scaling > 0
+
+    // analyze crops
+    for i in 0..nmerger {
+        nint crop = g.framesets[g.mergerSets[i]].f[g.mergerIndexes[i]].crop
+        if crop != None {
+            g.crops[crop].ready = 0
+            allSameCompressedOk = false
+        }
+    }
+    for i in 0..nmerger {
+        nint crop = g.framesets[g.mergerSets[i]].f[g.mergerIndexes[i]].crop
+        if crop != None && g.crops[crop].ready == 0 {
+            analyzeCrop(ref g, crop, compressImmediately)
+        }
+    }
+
+    // mark used colors
+    for i in 0..nmerger {
+        var fr = takeMergerFrame(ref g, i)
+        int oldTransp = applyFrameTransparent(ref g, fr.image, ref fr)
+        markUsedColors(ref g, fr.stream, fr.image, fr.crop, compressImmediately)
+        g.images[fr.image].transparent = oldTransp
+        markUsedBackgroundColor(ref g, read fr)
+        putMergerFrame(ref g, i, fr)
+    }
+
+    // copy stream-wide information from output_data
+    if g.activeOutput.loopcount > -2 {
+        g.streams[dest].loopcount = (long)g.activeOutput.loopcount
+    }
+    g.streams[dest].screenWidth = 0
+    g.streams[dest].screenHeight = 0
+
+    // ACTUALLY MERGE FRAMES INTO THE NEW STREAM
+    for i in 0..nmerger {
+        var fr = takeMergerFrame(ref g, i)
+        nint cropCopy = None
+        nint srci = None
+        // Make a copy of the image and crop it if we're cropping
+        fr.leftOffset = 0
+        fr.topOffset = 0
+        if fr.crop != None {
+            cropCopy = gifCopyImage(ref g, fr.image)
+            srci = cropCopy
+            _ = gifUncompressImage(ref g, fr.stream, srci)
+            cropImage(ref g, srci, ref fr)
+        } else {
+            srci = fr.image
+            _ = gifUncompressImage(ref g, fr.stream, srci)
+        }
+
+        int oldTransp = applyFrameTransparent(ref g, srci, ref fr)
+
+        // Is it ok to use the old image's compressed version? Not if the image will be flipped or
+        // rotated.
+        bool sameCompressedOk = allSameCompressedOk
+        if (fr.interlacing >= 0 && fr.interlacing != (int)g.images[srci].interlace) || fr.flipHorizontal ||
+            fr.flipVertical || fr.rotation != 0 {
+            sameCompressedOk = false
+        }
+
+        var desti = mergeImage(ref g, dest, fr.stream, srci, read fr, sameCompressedOk)
+
+        // restore real transparent value
+        g.images[srci].transparent = oldTransp
+
+        // Flipping and rotating
+        if fr.flipHorizontal || fr.flipVertical || fr.rotation != 0 {
+            handleFlipAndRotate(ref g, desti, ref fr)
+        }
+
+        // Extensions
+        if fr.extensions.length() > 0 {
+            var exts = fr.extensions.replace(List<Extension>())
+            for ex in exts {
+                g.images[desti].extensions.add(ex)
+            }
+        }
+
+        if fr.interlacing >= 0 {
+            g.images[desti].interlace = (byte)fr.interlacing
+        }
+        string failMessage = ""
+        int failValue = 0
+        if fr.left >= 0 {
+            int left = fr.left
+            if fr.positionIsOffset {
+                left += (int)g.images[desti].left
+            }
+            if left + (int)g.images[desti].width > 65535 {
+                failMessage = "left position %d out of range"
+                failValue = left
+            } else {
+                g.images[desti].left = u16(left)
+            }
+        }
+        if failMessage.length() == 0 && fr.top >= 0 {
+            int top = fr.top
+            if fr.positionIsOffset {
+                top += (int)g.images[desti].top
+            }
+            if top + (int)g.images[desti].height > 65535 {
+                failMessage = "top position %d out of range"
+                failValue = top
+            } else {
+                g.images[desti].top = u16(top)
+            }
+        }
+        if failMessage.length() > 0 {
+            putMergerFrame(ref g, i, fr)
+            error(ref g, 1, read failMessage, read List<string> { $"{failValue}".toString() })
+            // Frames not yet merged keep their references; blank_frameset() releases them.
+            gifDeleteImage(ref g, cropCopy)
+            gifDeleteStream(ref g, dest)
+            return None
+        }
+
+        if fr.delay >= 0 {
+            g.images[desti].delay = u16(fr.delay)
+        }
+        if fr.disposal >= 0 {
+            g.images[desti].disposal = (byte)fr.disposal
+        }
+
+        // logical screen
+        if g.activeOutput.screenMode <= 0 {
+            int w = 0
+            int h = 0
+            if g.activeOutput.screenMode < 0 || fr.crop != None || ((fr.left >= 0 || fr.top >= 0) && !fr.positionIsOffset) {
+                w = (int)g.images[desti].left + (int)g.images[desti].width
+                h = (int)g.images[desti].top + (int)g.images[desti].height
+            } else {
+                if fr.rotation == 1 || fr.rotation == 3 {
+                    w = (int)g.streams[fr.stream].screenHeight
+                    h = (int)g.streams[fr.stream].screenWidth
+                } else {
+                    w = (int)g.streams[fr.stream].screenWidth
+                    h = (int)g.streams[fr.stream].screenHeight
+                }
+                if fr.left >= 0 {
+                    w += fr.left
+                }
+                if fr.top >= 0 {
+                    h += fr.top
+                }
+            }
+            if w > 65535 {
+                w = 65535
+            }
+            if h > 65535 {
+                h = 65535
+            }
+            if w > (int)g.streams[dest].screenWidth {
+                g.streams[dest].screenWidth = u16(w)
+            }
+            if h > (int)g.streams[dest].screenHeight {
+                g.streams[dest].screenHeight = u16(h)
+            }
+        }
+
+        // compress immediately if possible to save on memory
+        if g.images[desti].hasImg {
+            if compressImmediately > 0 {
+                var info = g.gifWriteInfo
+                _ = gifFullCompressImage(ref g, dest, desti, read info)
+                gifReleaseUncompressedImage(ref g, desti)
+            } else if g.images[desti].hasCompressed {
+                gifReleaseCompressedImage(ref g, desti)
+            }
+        } else if compressImmediately <= 0 {
+            _ = gifUncompressImage(ref g, dest, desti)
+            gifReleaseCompressedImage(ref g, desti)
+        }
+
+        // store information about image's background
+        nint first = g.streams[fr.stream].images[0]
+        nint sglobal = g.streams[fr.stream].global
+        if g.images[first].transparent >= 0 {
+            fr.transparent.haspixel = 2
+        } else if sglobal != None && g.streams[fr.stream].background < g.colormaps[sglobal].ncol {
+            fr.transparent = g.colormaps[sglobal].col[(nint)g.streams[fr.stream].background]
+            fr.transparent.haspixel = 1
+        } else {
+            fr.transparent.haspixel = 0
+        }
+
+        // Destroy the copied, cropped image if necessary
+        gifDeleteImage(ref g, cropCopy)
+
+        // if we can, delete the image's data right now to save memory
+        srci = fr.image
+        g.images[srci].refcount -= 1
+        if g.images[srci].refcount == 1 {
+            // only 1 reference ==> the reference is from the input stream itself
+            gifReleaseUncompressedImage(ref g, srci)
+            gifReleaseCompressedImage(ref g, srci)
+        }
+        fr.image = None
+
+        // Destroy the stream now to help with memory.
+        gifDeleteStream(ref g, fr.stream)
+        fr.stream = None
+        putMergerFrame(ref g, i, fr)
+    }
+
+    if g.activeOutput.screenMode == 1 {
+        g.streams[dest].screenWidth = u16(g.activeOutput.screenWidth)
+        g.streams[dest].screenHeight = u16(g.activeOutput.screenHeight)
+    }
+
+    // Check the screen size limit, of the screen grown to fit the first image.
+    int maxW = g.activeOutput.maxScreenWidth
+    int maxH = g.activeOutput.maxScreenHeight
+    if g.activeOutput.screenMode == 1 {
+        if g.activeOutput.screenWidth > maxW {
+            maxW = g.activeOutput.screenWidth
+        }
+        if g.activeOutput.screenHeight > maxH {
+            maxH = g.activeOutput.screenHeight
+        }
+    }
+    gifCalculateScreenSize(ref g, dest, false)
+    int dw = (int)g.streams[dest].screenWidth
+    int dh = (int)g.streams[dest].screenHeight
+    if dw > maxW || dh > maxH {
+        var args = List<string> { $"{dw}".toString(), $"{dh}".toString(), $"{maxW}".toString(), $"{maxH}".toString() }
+        if g.activeOutput.screenMode == 1 {
+            error(ref g, 1, "output screen size %dx%d too large\n  (Frames extend past the logical screen, and the limit is %dx%d.\n  Change it with %<--max-screen%>.)", read args)
+        } else {
+            error(ref g, 1, "output screen size %dx%d too large\n  (The limit is %dx%d. Change it with %<--max-screen%>, or\n  set the screen size with %<--logical-screen%>.)", read args)
+        }
+        gifDeleteStream(ref g, dest)
+        return None
+    }
+    if g.activeOutput.screenMode == 1 && (dw > g.activeOutput.screenWidth || dh > g.activeOutput.screenHeight) {
+        warning(ref g, 1, "logical screen grown from %dx%d to %dx%d to fit first frame", read List<string> {
+            $"{g.activeOutput.screenWidth}".toString(), $"{g.activeOutput.screenHeight}".toString(),
+            $"{dw}".toString(), $"{dh}".toString(),
+        })
+    }
+
+    // Find the background color in the colormap, or add it if we can
+    setBackground(ref g, dest)
+
+    // The global colormap might be empty even given images that use it, if those images are
+    // entirely transparent: assign a black-and-white colormap.
+    if g.colormaps[global].ncol == 0 {
+        for gfi in read g.streams[dest].images {
+            if g.images[gfi].local == None {
+                g.colormaps[global].col[0] = color(0, 0, 0)
+                g.colormaps[global].col[1] = color(255, 255, 255)
+                g.colormaps[global].ncol = 2
+                break
+            }
+        }
+    }
+    return dest
+}

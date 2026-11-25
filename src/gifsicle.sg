@@ -1,0 +1,2471 @@
+// gifsicle.sg - gifsicle's main loop (gifsicle.c).
+// Copyright (C) 1997-2025 Eddie Kohler, ekohler@gmail.com
+// SG translation of gifsicle 1.99. This file is part of sg-gifsicle.
+//
+// Gifsicle is free software. It is distributed under the GNU Public License, version 2; you can
+// copy, distribute, or alter it at will, as long as this notice is kept intact and this source
+// code is made available. There is no warranty, express or implied.
+//
+// C keeps gifsicle's state in globals (`gtst`, `gtmsgs`, `def_frame`, `active_output_data`, the
+// parser, the input). Here it is one value, `Gt`, which every function that reads or changes it
+// is lent; the streams, images and colormaps live in its lists (see gif.sg).
+
+const string Version = "1.99"
+
+const int BlankMode = 0
+const int Merging = 1
+const int Batching = 2
+const int Exploding = 3
+const int Infoing = 4
+const int Deleting = 5
+const int Inserting = 6
+const int FrameSelectionModeMask = 0x1F
+
+const int NoexfName = 1
+const int NoexfComment = 2
+const int NoexfGeneric = 4
+const int NoexfApp = 8
+
+const int InfoColormaps = 1
+const int InfoExtensions = 2
+const int InfoSizes = 4
+
+const int GtScalingNone = 0
+const int GtScalingResize = 1
+const int GtScalingScale = 2
+
+const int GtResizeFit = 1
+const int GtResizeFitDown = 2
+const int GtResizeFitUp = 4
+const int GtResizeMinDimen = 8
+
+const int ScaleMethodPoint = 0
+const int ScaleMethodBox = 1
+const int ScaleMethodMix = 2
+const int ScaleMethodCatrom = 3
+const int ScaleMethodLanczos2 = 4
+const int ScaleMethodLanczos3 = 5
+const int ScaleMethodMitchell = 6
+
+const int GtOptMask = 0xFFFF
+const int GtOptKeepempty = 0x10000
+const int GtOptKeepcolormap = 0x20000
+
+const int KcGammaSrgb = 0
+const int KcGammaNumeric = 1
+const int KcGammaOklab = 2
+
+const int ColormapDiversity = 0
+const int ColormapBlendDiversity = 1
+const int ColormapMedianCut = 2
+
+const int DitherNone = 0
+const int DitherDefault = 1
+const int DitherFloydSteinberg = 2
+const int DitherOrdered = 3
+const int DitherOrderedNew = 4
+const int DitherAtkinson = 5
+
+const int GifsicleDefaultThreadCount = 8
+
+// frame option types
+const int ChInterlace = 0
+const int ChDisposal = 1
+const int ChDelay = 2
+const int ChTransparent = 3
+const int ChComment = 4
+const int ChName = 5
+const int ChPosition = 6
+const int ChCrop = 7
+const int ChExtension = 8
+const int ChFlip = 9
+const int ChRotate = 10
+string frameOptionType(int i) {
+    return match i {
+        0 => "interlace"
+        1 => "disposal"
+        2 => "delay"
+        3 => "transparency"
+        4 => "comment"
+        5 => "name"
+        6 => "position"
+        7 => "crop"
+        8 => "extension"
+        9 => "flip"
+        10 => "rotation"
+        _ => ""
+    }
+}
+
+// input option types
+const int ChUnoptimize = 0
+const int ChChangeColor = 1
+string inputOptionType(int i) {
+    return match i {
+        0 => "unoptimization"
+        1 => "color change"
+        _ => ""
+    }
+}
+
+// output option types
+const int ChLoopcount = 0
+const int ChLogicalScreen = 1
+const int ChOptimize = 2
+const int ChOutput = 3
+const int ChColormap = 4
+const int ChDither = 5
+const int ChUseColormap = 6
+const int ChColormapMethod = 7
+const int ChBackground = 8
+const int ChColorTransform = 9
+const int ChResize = 10
+const int ChMemory = 11
+const int ChGamma = 12
+const int ChResizeMethod = 13
+const int ChScaleColors = 14
+string outputOptionType(int i) {
+    return match i {
+        0 => "loopcount"
+        1 => "logical screen"
+        2 => "optimization"
+        3 => "output file"
+        4 => "colormap size"
+        5 => "dither"
+        6 => "colormap"
+        7 => "colormap method"
+        8 => "background"
+        9 => "color transformation"
+        10 => "resize"
+        11 => "memory conservation"
+        12 => "gamma"
+        13 => "resize method"
+        14 => "resize colors"
+        _ => ""
+    }
+}
+
+const int SameInterlaceOpt = 300
+const int InfoOpt = 301
+const int DisposalOpt = 302
+const int SameLoopcountOpt = 303
+const int SameDisposalOpt = 304
+const int SameDelayOpt = 305
+const int SameTransparentOpt = 308
+const int LogicalScreenOpt = 309
+const int CommentOpt = 310
+const int UnoptimizeOpt = 311
+const int CarefulOpt = 312
+const int OptimizeOpt = 313
+const int SameLogicalScreenOpt = 314
+const int DeleteOpt = 315
+const int ReplaceOpt = 316
+const int InsertOpt = 317
+const int AlterDoneOpt = 318
+const int AppendOpt = 319
+const int ColorInfoOpt = 320
+const int VerboseOpt = 321
+const int NoCommentsOpt = 322
+const int SameCommentsOpt = 323
+const int NameOpt = 324
+const int SameNameOpt = 325
+const int NoNameOpt = 326
+const int PositionOpt = 327
+const int SamePositionOpt = 328
+const int VersionOpt = 329
+const int HelpOpt = 330
+const int OutputOpt = 331
+const int CropOpt = 332
+const int SameCropOpt = 333
+const int ChangeColorOpt = 334
+const int ColormapOpt = 335
+const int ColormapAlgorithmOpt = 336
+const int DitherOpt = 337
+const int UseColormapOpt = 338
+const int NoExtensionsOpt = 339
+const int SameExtensionsOpt = 340
+const int ExtensionInfoOpt = 341
+const int BackgroundOpt = 342
+const int SameBackgroundOpt = 343
+const int FlipHorizOpt = 344
+const int FlipVertOpt = 345
+const int NoFlipOpt = 346
+const int Rotate90Opt = 347
+const int Rotate180Opt = 348
+const int Rotate270Opt = 349
+const int NoRotateOpt = 350
+const int AppExtensionOpt = 351
+const int ExtensionOpt = 352
+const int ColorTransformOpt = 353
+const int ResizeOpt = 354
+const int ScaleOpt = 355
+const int NoWarningsOpt = 356
+const int WarningsOpt = 357
+const int ResizeWidthOpt = 358
+const int ResizeHeightOpt = 359
+const int CropTransparencyOpt = 360
+const int ConserveMemoryOpt = 361
+const int MultifileOpt = 362
+const int NextfileOpt = 363
+const int ResizeFitOpt = 364
+const int ResizeFitWidthOpt = 365
+const int ResizeFitHeightOpt = 366
+const int SizeInfoOpt = 367
+const int GammaOpt = 368
+const int GrayOpt = 369
+const int ResizeMethodOpt = 370
+const int ResizeColorsOpt = 371
+const int NoAppExtensionsOpt = 372
+const int SameAppExtensionsOpt = 373
+const int IgnoreErrorsOpt = 374
+const int ThreadsOpt = 375
+const int ResizeGeometryOpt = 376
+const int ResizeTouchOpt = 377
+const int ResizeTouchWidthOpt = 378
+const int ResizeTouchHeightOpt = 379
+const int LossyOpt = 380
+const int UseExactColormapOpt = 381
+const int MaxScreenOpt = 382
+
+const int LoopType = 10
+const int DisposalType = 11
+const int DimensionsType = 12
+const int FrameSpecType = 13
+const int ColorType = 14
+const int PositionType = 15
+const int RectangleType = 16
+const int TwoColorsType = 17
+const int ColormapAlgType = 18
+const int ScaleFactorType = 19
+const int OptimizeType = 20
+const int ResizeMethodType = 21
+
+struct Crop : Copyable {
+    int ready
+    bool transparentEdges
+    int specX
+    int specY
+    int specW
+    int specH
+    int x
+    int y
+    int w
+    int h
+    int leftOffset
+    int topOffset
+}
+
+Crop noCrop() {
+    return Crop {
+        ready = 0, transparentEdges = false, specX = 0, specY = 0, specW = 0, specH = 0, x = 0, y = 0,
+        w = 0, h = 0, leftOffset = 0, topOffset = 0,
+    }
+}
+
+struct Frame {
+    nint stream
+    nint image
+    int useFrame
+
+    // also background
+    Color transparent
+    int interlacing
+    int left
+    int top
+
+    nint crop
+    int leftOffset
+    int topOffset
+
+    int delay
+    int disposal
+
+    nint nest
+    bool explodeByName
+
+    int noExtensionsFlag
+    int frameNoExtensionsFlag
+    List<Extension> extensions
+
+    bool flipHorizontal
+    bool flipVertical
+    int infoFlags
+    bool positionIsOffset
+    int rotation
+
+    bool hasInputFilename
+    string inputFilename
+}
+
+Frame blankFrame() {
+    return Frame {
+        stream = None, image = None, useFrame = 0, transparent = noColor(), interlacing = 0, left = 0, top = 0,
+        crop = None, leftOffset = 0, topOffset = 0, delay = 0, disposal = 0, nest = None,
+        explodeByName = false, noExtensionsFlag = 0, frameNoExtensionsFlag = 0,
+        extensions = List<Extension>(), flipHorizontal = false, flipVertical = false, infoFlags = 0,
+        positionIsOffset = false, rotation = 0, hasInputFilename = false, inputFilename = "",
+    }
+}
+
+// C copies a frame as a struct: its extensions list is shared, and the caller replaces it.
+Frame frameCopy(read Frame f) {
+    return Frame {
+        stream = f.stream, image = f.image, useFrame = f.useFrame, transparent = f.transparent,
+        interlacing = f.interlacing, left = f.left, top = f.top, crop = f.crop, leftOffset = f.leftOffset,
+        topOffset = f.topOffset, delay = f.delay, disposal = f.disposal, nest = f.nest,
+        explodeByName = f.explodeByName, noExtensionsFlag = f.noExtensionsFlag,
+        frameNoExtensionsFlag = f.frameNoExtensionsFlag, extensions = List<Extension>(),
+        flipHorizontal = f.flipHorizontal, flipVertical = f.flipVertical, infoFlags = f.infoFlags,
+        positionIsOffset = f.positionIsOffset, rotation = f.rotation, hasInputFilename = f.hasInputFilename,
+        inputFilename = f.inputFilename.clone(),
+    }
+}
+
+struct Frameset {
+    List<Frame> f
+}
+
+struct OutputData {
+    bool hasOutputName
+    string outputName
+    bool hasActiveOutputName
+    string activeOutputName
+
+    int maxScreenWidth
+    int maxScreenHeight
+
+    int screenMode
+    int screenWidth
+    int screenHeight
+
+    Color background
+    int loopcount
+
+    int colormapSize
+    nint colormapFixed
+    bool colormapFixedExact
+    int colormapAlgorithm
+    bool colormapNeedsTransparency
+    int ditherType
+    List<byte> ditherData
+    string ditherName
+    int colormapGammaType
+    double colormapGamma
+
+    int optimizing
+
+    int scaling
+    int resizeWidth
+    int resizeHeight
+    int resizeFlags
+    double scaleX
+    double scaleY
+    int scaleMethod
+    int scaleColors
+
+    int conserveMemory
+}
+
+OutputData blankOutputData() {
+    return OutputData {
+        hasOutputName = false, outputName = "", hasActiveOutputName = false, activeOutputName = "",
+        maxScreenWidth = 0, maxScreenHeight = 0, screenMode = 0, screenWidth = 0, screenHeight = 0,
+        background = noColor(), loopcount = 0, colormapSize = 0, colormapFixed = None,
+        colormapFixedExact = false, colormapAlgorithm = 0, colormapNeedsTransparency = false,
+        ditherType = 0, ditherData = List<byte>(), ditherName = "", colormapGammaType = 0,
+        colormapGamma = 0.0, optimizing = 0, scaling = 0, resizeWidth = 0, resizeHeight = 0,
+        resizeFlags = 0, scaleX = 0.0, scaleY = 0.0, scaleMethod = 0, scaleColors = 0, conserveMemory = 0,
+    }
+}
+
+OutputData outputDataCopy(read OutputData o) {
+    return OutputData {
+        hasOutputName = o.hasOutputName, outputName = o.outputName.clone(),
+        hasActiveOutputName = o.hasActiveOutputName, activeOutputName = o.activeOutputName.clone(),
+        maxScreenWidth = o.maxScreenWidth, maxScreenHeight = o.maxScreenHeight, screenMode = o.screenMode,
+        screenWidth = o.screenWidth, screenHeight = o.screenHeight, background = o.background,
+        loopcount = o.loopcount, colormapSize = o.colormapSize, colormapFixed = o.colormapFixed,
+        colormapFixedExact = o.colormapFixedExact, colormapAlgorithm = o.colormapAlgorithm,
+        colormapNeedsTransparency = o.colormapNeedsTransparency, ditherType = o.ditherType,
+        ditherData = o.ditherData.clone(), ditherName = o.ditherName.clone(),
+        colormapGammaType = o.colormapGammaType, colormapGamma = o.colormapGamma, optimizing = o.optimizing,
+        scaling = o.scaling, resizeWidth = o.resizeWidth, resizeHeight = o.resizeHeight,
+        resizeFlags = o.resizeFlags, scaleX = o.scaleX, scaleY = o.scaleY, scaleMethod = o.scaleMethod,
+        scaleColors = o.scaleColors, conserveMemory = o.conserveMemory,
+    }
+}
+
+struct MessageState {
+    bool verbosing
+    int verbosePos
+    int errorCount
+    bool noWarnings
+    bool noIgnoreErrors
+    int warnLocalColormaps
+    bool warnLocalColormapsContext
+    bool irrelevantBackgroundContext
+    bool conflictingBackgroundContext
+    bool unoptimizeComplexityContext
+    bool redundantOptionContext
+    bool stopping
+}
+
+struct ReadErrorState {
+    int lastIsError
+    string lastLandmark
+    // empty: no message held
+    string lastMessage
+    int differentErrorCount
+    int sameErrorCount
+}
+
+// A file kept open by --nextfile, which the next input of the same name goes on reading.
+struct StoredFile {
+    string name
+    Reader reader
+    bool live
+}
+
+// A colormap transformation: a change of one color to another, or a shell command.
+struct ColorTransform : Clonable {
+    // 1: color change, 2: pipe
+    int kind
+    Color from
+    Color to
+    string command
+}
+
+struct Gt {
+    // the GIF library's data
+    List<Stream> streams
+    List<Image> images
+    List<Colormap> colormaps
+    int defaultErrorHandler
+
+    List<Frameset> framesets
+    List<Crop> crops
+
+    // gtst
+    int firstInputFrame
+    nint inputFrames
+    nint frames
+    nint nestedFrames
+    int maxScreenWidth
+    int maxScreenHeight
+    bool unoptimizing
+    int threadCount
+    int gifReadFlags
+    bool nextfile
+    ReadErrorState rderr
+    List<StoredFile> storedFiles
+    int framesDone
+    int filesGiven
+    List<ColorTransform> inputTransforms
+    List<ColorTransform> outputTransforms
+    int infoing
+    int nextFrame
+    int nextInput
+    int nextOutput
+    int activeNextOutput
+    bool anyOutputSuccessful
+
+    MessageState msgs
+    Frame defFrame
+    nint input
+    bool hasInputName
+    string inputName
+    CompressInfo gifWriteInfo
+    int mode
+    int nestedMode
+    OutputData defOutput
+    OutputData activeOutput
+
+    Clp clp
+
+    // the program's input, read whole the first time a GIF is read from it
+    bool stdinRead
+    Reader stdin
+
+    // the merger: the frames being merged, by frameset and place
+    List<nint> mergerSets
+    List<nint> mergerIndexes
+
+    // the optimizer's data, for each image it is working on
+    List<OptData> optData
+    Kc kc
+}
+
+Gt newGt(List<string> args) {
+    string? lang = null
+    match Environment.get("LANG") {
+        Ok(v) => lang = v
+        Error(_) => {}
+    }
+    bool utf8 = false
+    if lang is not null {
+        utf8 = lang.contains("UTF-8") || lang.contains("UTF8") || lang.contains("utf8")
+    }
+    return Gt {
+        streams = List<Stream>(), images = List<Image>(), colormaps = List<Colormap>(),
+        defaultErrorHandler = HandlerSilent, framesets = List<Frameset>(), crops = List<Crop>(),
+        firstInputFrame = 0, inputFrames = None, frames = None, nestedFrames = None,
+        maxScreenWidth = 16384, maxScreenHeight = 16384, unoptimizing = false, threadCount = 0,
+        gifReadFlags = 0, nextfile = false,
+        rderr = ReadErrorState { lastIsError = 0, lastLandmark = "", lastMessage = "", differentErrorCount = 0, sameErrorCount = 0 },
+        storedFiles = List<StoredFile>(), framesDone = 0, filesGiven = 0,
+        inputTransforms = List<ColorTransform>(), outputTransforms = List<ColorTransform>(), infoing = 0,
+        nextFrame = 0, nextInput = 0, nextOutput = 0, activeNextOutput = 0, anyOutputSuccessful = false,
+        msgs = MessageState {
+            verbosing = false, verbosePos = 0, errorCount = 0, noWarnings = false, noIgnoreErrors = false,
+            warnLocalColormaps = 1, warnLocalColormapsContext = false, irrelevantBackgroundContext = false,
+            conflictingBackgroundContext = false, unoptimizeComplexityContext = false,
+            redundantOptionContext = false, stopping = false,
+        },
+        defFrame = blankFrame(), input = None, hasInputName = false, inputName = "",
+        gifWriteInfo = newCompressInfo(), mode = BlankMode, nestedMode = 0, defOutput = blankOutputData(),
+        activeOutput = blankOutputData(), clp = clpNewParser(args, ProgramName, utf8), stdinRead = false,
+        stdin = fileReader(List<byte>()), mergerSets = List<nint>(), mergerIndexes = List<nint>(),
+        optData = List<OptData>(), kc = newKc(),
+    }
+}
+
+// ---- frames ----
+
+nint newFrameset(ref Gt g) {
+    g.framesets.add(Frameset { f = List<Frame>() })
+    return g.framesets.length() - 1
+}
+
+void clearDefFrameOnceOptions(ref Gt g) {
+    // Get rid of next-frame-only options.
+    g.defFrame.extensions.clear()
+    g.defFrame.frameNoExtensionsFlag = 0
+}
+
+nint addFrame(ref Gt g, nint fset, nint gfs, nint gfi) {
+    g.streams[gfs].refcount += 1
+    g.images[gfi].refcount += 1
+    var f = frameCopy(read g.defFrame)
+    f.stream = gfs
+    f.image = gfi
+    gifCopyExtensions(ref f.extensions, read g.defFrame.extensions)
+    g.framesets[fset].f.add(f)
+    clearDefFrameOnceOptions(ref g)
+    return g.framesets[fset].f.length() - 1
+}
+
+void blankFrameset(ref Gt g, nint fset, int f1In, int f2In, bool deleteObject) {
+    int f1 = f1In
+    int f2 = f2In
+    if deleteObject {
+        f1 = 0
+        f2 = -1
+    }
+    if f2 < 0 {
+        f2 = (int)g.framesets[fset].f.length() - 1
+    }
+    int i = f1
+    while i <= f2 {
+        nint k = (nint)i
+        nint image = g.framesets[fset].f[k].image
+        if image != None && g.images[image].refcount > 1 {
+            g.images[image].refcount -= 1
+        }
+        gifDeleteStream(ref g, g.framesets[fset].f[k].stream)
+        g.framesets[fset].f[k].extensions.clear()
+        nint nest = g.framesets[fset].f[k].nest
+        if nest != None {
+            blankFrameset(ref g, nest, 0, 0, true)
+        }
+        i += 1
+    }
+    if deleteObject {
+        g.framesets[fset].f.clear()
+    }
+}
+
+void clearFrameset(ref Gt g, nint fset, int f1) {
+    blankFrameset(ref g, fset, f1, -1, false)
+    while g.framesets[fset].f.length() > (nint)f1 {
+        _ = g.framesets[fset].f.removeLast()
+    }
+}
+
+// ---- modes ----
+
+bool changed(int next, int flag) {
+    return (next & (1 << flag)) != 0
+}
+
+void markFrame(ref Gt g, int what) {
+    if changed(g.nextFrame, what) {
+        redundantOptionWarning(ref g, read frameOptionType(what))
+    }
+    g.nextFrame |= 1 << what
+}
+
+void markOutput(ref Gt g, int what) {
+    if changed(g.nextOutput, what) {
+        redundantOptionWarning(ref g, read outputOptionType(what))
+    }
+    g.nextOutput |= 1 << what
+}
+
+// -1 (after stop_error) if the mode can't change.
+int setMode(ref Gt g, int newmode) {
+    if g.mode == BlankMode {
+        if newmode != BlankMode {
+            g.mode = newmode
+        } else if g.infoing == 1 {
+            g.mode = Infoing
+        } else {
+            g.mode = Merging
+        }
+    }
+    if g.mode != Infoing && g.infoing == 1 {
+        stopError(ref g, "%<--info%> suppresses normal output, can%,t use with an\n  output mode like %<--merge%> or %<--batch%>.\n  (Try %<-II%>, which doesn%,t suppress normal output.)", read List<string>())
+        return -1
+    }
+    if newmode != BlankMode && newmode != g.mode {
+        stopError(ref g, "too late to change modes", read List<string>())
+        return -1
+    }
+    return 0
+}
+
+void setFrameChange(ref Gt g, int kind) {
+    if setMode(ref g, BlankMode) < 0 {
+        return
+    }
+    if (g.framesDone & FrameSelectionModeMask) != 0 {
+        stopError(ref g, "frame selection and frame changes don%,t mix", read List<string>())
+        return
+    }
+    g.nestedMode = g.mode
+    if g.clp.val.fs.frame1 > g.clp.val.fs.frame2 {
+        int t = g.clp.val.fs.frame1
+        g.clp.val.fs.frame1 = g.clp.val.fs.frame2
+        g.clp.val.fs.frame2 = t
+    }
+    // frame specs are relative to the most recent input
+    if kind == ReplaceOpt || kind == InsertOpt {
+        g.clp.val.fs.frame1 += g.firstInputFrame
+        g.clp.val.fs.frame2 += g.firstInputFrame
+        if g.clp.val.fs.frame1 < g.firstInputFrame || (nint)g.clp.val.fs.frame2 >= g.framesets[g.frames].f.length() {
+            stopError(ref g, "frame out of range", read List<string>())
+            return
+        }
+    }
+    var spec = g.clp.val.fs
+    if kind == DeleteOpt {
+        g.mode = Deleting
+    } else if kind == ReplaceOpt || kind == InsertOpt {
+        if kind == ReplaceOpt {
+            int i = spec.frame1
+            while i < spec.frame2 {
+                g.framesets[g.frames].f[(nint)i].useFrame = 0
+                i += 1
+            }
+            // We want to use the last frame's delay, but nothing else about it.
+            g.framesets[g.frames].f[(nint)spec.frame2].useFrame = -1
+        }
+        // Define a nested frameset (or use an existing one).
+        nint fset = g.framesets[g.frames].f[(nint)spec.frame2].nest
+        if fset == None {
+            fset = newFrameset(ref g)
+        }
+        g.framesets[g.frames].f[(nint)spec.frame2].nest = fset
+        // Later: Merge frames at the end of the nested frameset.
+        g.mode = Inserting
+        g.nestedFrames = g.frames
+        g.frames = fset
+    } else if kind == AppendOpt {
+        g.mode = Inserting
+    }
+}
+
+void frameChangeDone(ref Gt g) {
+    if g.nestedMode != 0 {
+        g.mode = g.nestedMode
+    }
+    if g.nestedFrames != None {
+        g.frames = g.nestedFrames
+    }
+    g.nestedMode = 0
+    g.nestedFrames = None
+}
+
+int extensionFlag(read Extension ex) {
+    if ex.kind == GifExApp {
+        return NoexfApp
+    } else if ex.kind == GifExName {
+        return NoexfName
+    } else if ex.kind == GifExComment {
+        return NoexfComment
+    }
+    return NoexfGeneric
+}
+
+void deleteMatchingExtensions(ref List<Extension> exts, int flags) {
+    var kept = List<Extension>()
+    var all = exts.replace(List<Extension>())
+    for ex in all {
+        if (flags & extensionFlag(read ex)) == 0 {
+            kept.add(ex)
+        }
+    }
+    exts = kept
+}
+
+// Start a new set of def_frame extensions of type 'noexf' unless an option of that type has
+// already been given for the next frame.
+void markExtensionChange(ref Gt g, int noexfIn) {
+    int noexf = noexfIn
+    int ch = 0
+    if (noexf & NoexfName) != 0 {
+        ch = ChName
+    } else if (noexf & NoexfComment) != 0 {
+        ch = ChComment
+    } else {
+        ch = ChExtension
+        noexf = NoexfGeneric | NoexfApp
+    }
+    if !changed(g.nextFrame, ch) {
+        deleteMatchingExtensions(ref g.defFrame.extensions, noexf)
+    }
+    g.nextFrame |= 1 << ch
+}
+
+void showFrame(ref Gt g, int imagenumber, bool usename) {
+    if g.input == None {
+        return
+    }
+    var gfi = gifGetImage(read g, g.input, imagenumber)
+    if gfi == None {
+        return
+    }
+    if g.mode == Merging || g.mode == Inserting || g.mode == Exploding || g.mode == Infoing || g.mode == Batching {
+        if g.framesDone == 0 && g.frames == g.inputFrames {
+            clearFrameset(ref g, g.frames, g.firstInputFrame)
+        }
+        var k = addFrame(ref g, g.frames, g.input, gfi)
+        if usename {
+            g.framesets[g.frames].f[k].explodeByName = true
+        }
+    } else if g.mode == Deleting {
+        g.framesets[g.frames].f[(nint)(g.firstInputFrame + imagenumber)].useFrame = 0
+    }
+    g.nextFrame = 0
+    g.framesDone |= 1 << g.mode
+}
+
+// ---- input ----
+
+void gifreadError(ref Gt g, nint gfs, nint gfi, int isError, read string? message) {
+    int whichImage = gifImageNumber(read g, gfs, gfi)
+    if gfs != None && whichImage < 0 {
+        whichImage = gifImageCount(read g, gfs)
+    }
+    // ignore warnings if "no_warning", and everything after a fatal error
+    if (g.msgs.noWarnings && isError == 0) || g.msgs.stopping {
+        return
+    }
+    if message is not null && isError > 0 && g.msgs.noIgnoreErrors {
+        g.msgs.errorCount += 1
+    }
+    string landmark = ""
+    if message is not null {
+        string filename = "<unknown>"
+        if gfs != None && g.streams[gfs].hasLandmark {
+            filename = g.streams[gfs].landmark.clone()
+        }
+        if gfi != None && (whichImage != 0 || gifImageCount(read g, gfs) > 1) {
+            int shown = whichImage
+            if whichImage < 0 {
+                shown = gifImageCount(read g, gfs)
+            }
+            landmark = $"{filename}:#{shown}".toString()
+        } else {
+            landmark = filename
+        }
+        landmark = cutText(read landmark, 255)
+    }
+
+    if g.rderr.lastMessage.length() > 0 && g.rderr.differentErrorCount <= 10 &&
+        (message is null || message != g.rderr.lastMessage || landmark != g.rderr.lastLandmark) {
+        string etype = ""
+        if g.rderr.lastIsError != 0 {
+            etype = "read error: "
+        }
+        // Printing a read error doesn't affect the exit status.
+        int oldErrorCount = g.msgs.errorCount
+        bool reported = gfi != None && g.images[gfi].userFlags != 0
+        var lastLandmark = g.rderr.lastLandmark.clone()
+        var lastMessage = g.rderr.lastMessage.clone()
+        if reported {
+            // error already reported
+        } else if g.rderr.sameErrorCount == 1 {
+            if g.rderr.lastIsError != 0 {
+                lerror(ref g, read lastLandmark, "%s%s", read List<string> { etype, lastMessage })
+            } else {
+                lwarning(ref g, read lastLandmark, "%s%s", read List<string> { etype, lastMessage })
+            }
+        } else if g.rderr.sameErrorCount > 0 {
+            var times = $"{g.rderr.sameErrorCount}".toString()
+            if g.rderr.lastIsError != 0 {
+                lerror(ref g, read lastLandmark, "%s%s (%d times)", read List<string> { etype, lastMessage, times })
+            } else {
+                lwarning(ref g, read lastLandmark, "%s%s (%d times)", read List<string> { etype, lastMessage, times })
+            }
+        }
+        g.msgs.errorCount = oldErrorCount
+        g.rderr.sameErrorCount = 0
+        g.rderr.lastMessage = ""
+    }
+
+    if message is not null {
+        if g.rderr.lastMessage.length() == 0 {
+            g.rderr.differentErrorCount += 1
+        }
+        g.rderr.sameErrorCount += 1
+        g.rderr.lastMessage = cutText(read message, 255)
+        g.rderr.lastLandmark = landmark.clone()
+        g.rderr.lastIsError = isError
+        if g.rderr.differentErrorCount == 11 {
+            if !(gfi != None && g.images[gfi].userFlags != 0) {
+                contextMessage(ref g, 0, "(plus more errors; is this GIF corrupt?)", read List<string>())
+            }
+            g.rderr.differentErrorCount += 1
+        }
+    } else {
+        g.rderr.lastMessage = ""
+    }
+
+    if message is not null && g.msgs.noIgnoreErrors && !g.msgs.stopping {
+        var missing = scanMissingPixels(read message)
+        if missing is not null && missing > 10000 {
+            gifreadError(ref g, gfs, None, -1, null)
+            lerror(ref g, read landmark, "fatal error: too many missing pixels, giving up", read List<string>())
+            // input_stream discards the stream
+            g.msgs.stopping = true
+        }
+    }
+
+    if gfi != None && isError < 0 {
+        g.images[gfi].userFlags |= 1
+    }
+}
+
+// sscanf(message, "missing %lu pixel", &missing) == 1
+ulong? scanMissingPixels(read string message) {
+    var m = message.asBytes()
+    if !message.startsWith("missing ") {
+        return null
+    }
+    nint at = 8
+    var n = cStrtoNum(m, at, 10, false)
+    if n.end == at {
+        return null
+    }
+    return n.ul
+}
+
+// strncpy into a buffer of `n + 1` bytes, its last byte zero: at most `n` bytes.
+string cutText(read string s, nint n) {
+    var b = s.asBytes()
+    if b.length() <= n {
+        return s.clone()
+    }
+    return stringOf(b[0..n])
+}
+
+// The reader of a GIF file: the program's input, a file kept by --nextfile, or a file opened now.
+// -1 for the input, a stored file's place, or -2 (with the file in `opened`) for a new one; -3 on
+// failure.
+nint openGiffile(ref Gt g, read string? name, ref Reader opened) {
+    if name is null || name == "-" {
+        if stdinIsTerminal() {
+            lerror(ref g, "<stdin>", "Is a terminal", read List<string>())
+            return -3
+        }
+        if !g.stdinRead {
+            g.stdin = fileReader(readStdinAll())
+            g.stdinRead = true
+        }
+        return -1
+    }
+    if g.nextfile {
+        for i in 0..g.storedFiles.length() {
+            if g.storedFiles[i].live && g.storedFiles[i].name == name {
+                return i
+            }
+        }
+    }
+    match readFileBytes(name) {
+        Ok(data) => {
+            if g.nextfile {
+                g.storedFiles.add(StoredFile { name = name.clone(), reader = fileReader(data), live = true })
+                return g.storedFiles.length() - 1
+            }
+            opened = fileReader(data)
+            return -2
+        }
+        Error(cause) => {
+            lerror(ref g, name, "%s", read List<string> { ioErrorText(cause) })
+            return -3
+        }
+    }
+}
+
+void closeGiffile(ref Gt g, nint which, bool finalIn) {
+    bool final = finalIn
+    if which >= 0 {
+        if !final && g.nextfile {
+            if gifEof(read g.storedFiles[which].reader) {
+                final = true
+            }
+        }
+        if final {
+            g.storedFiles[which].live = false
+            g.storedFiles[which].reader = fileReader(List<byte>())
+        }
+    }
+}
+
+void inputStream(ref Gt g, read string? name0) {
+    int savedNextFrame0 = g.nextFrame
+    g.input = None
+    if name0 is not null {
+        g.hasInputName = true
+        g.inputName = name0.clone()
+    } else {
+        g.hasInputName = false
+        g.inputName = ""
+    }
+    g.framesDone = 0
+    g.nextFrame = 0
+    g.nextInput = 0
+    if g.nextOutput != 0 {
+        combineOutputOptions(ref g)
+    }
+    g.filesGiven += 1
+
+    if setMode(ref g, BlankMode) < 0 {
+        return
+    }
+
+    var opened = fileReader(List<byte>())
+    nint which = openGiffile(ref g, name0, ref opened)
+    if which == -3 {
+        return
+    }
+    string name = ""
+    if name0 is not null {
+        name = name0.clone()
+    }
+    if which == -1 {
+        name = "<stdin>"
+        g.hasInputName = false
+        g.inputName = ""
+    }
+    // The reader is taken out of where it is kept while a GIF is read from it.
+    var grr = takeReader(ref g, which, ref opened)
+    var mainName = name.clone()
+    int componentno = 0
+    int savedNextFrame = savedNextFrame0
+
+    while true {
+        // change filename for component files
+        componentno += 1
+        if componentno > 1 {
+            name = $"{mainName}~{componentno}".toString()
+        }
+
+        // check for empty file
+        if gifEof(read grr) {
+            if (g.gifReadFlags & GifReadTrailingGarbageOk) == 0 {
+                lerror(ref g, read name, "empty file", read List<string>())
+            } else if g.nextfile {
+                lerror(ref g, read name, "no more images in file", read List<string>())
+            }
+            putReader(ref g, which, ref opened, grr)
+            closeGiffile(ref g, which, true)
+            return
+        }
+
+        if g.msgs.verbosing {
+            verboseOpen(ref g, 0x3C, read name)
+        }
+
+        // read file
+        int oldErrorCount = g.msgs.errorCount
+        var gfs = gifFullReadFile(ref g, ref grr, g.gifReadFlags | GifReadCompressed, read name, HandlerGifsicle)
+        if (gfs == None || (gifImageCount(read g, gfs) == 0 && g.streams[gfs].errors > 0)) && componentno != 1 {
+            lerror(ref g, read name, "trailing garbage ignored", read List<string>())
+        }
+        if !g.msgs.noIgnoreErrors {
+            g.msgs.errorCount = oldErrorCount
+        }
+
+        if gfs == None || (gifImageCount(read g, gfs) == 0 && g.streams[gfs].errors > 0) || g.msgs.stopping {
+            if gfs == None && componentno == 1 && !g.msgs.stopping {
+                lerror(ref g, read name, "file not in GIF format", read List<string>())
+            }
+            if gfs != None {
+                gifDeleteStream(ref g, gfs)
+            }
+            if g.msgs.verbosing {
+                verboseClose(ref g, 0x3E)
+            }
+            putReader(ref g, which, ref opened, grr)
+            closeGiffile(ref g, which, true)
+            return
+        }
+
+        // special processing for components after the first
+        if componentno > 1 {
+            if g.mode == Batching || g.mode == Inserting {
+                stopError(ref g, "%s: %<--multifile%> is useful only in merge mode", read List<string> { name })
+                gifDeleteStream(ref g, gfs)
+                if g.msgs.verbosing {
+                    verboseClose(ref g, 0x3E)
+                }
+                putReader(ref g, which, ref opened, grr)
+                closeGiffile(ref g, which, true)
+                return
+            }
+            inputDone(ref g)
+        }
+
+        g.input = gfs
+
+        // Processing when we've got a new input frame; can't fail, since the same call succeeded above
+        _ = setMode(ref g, BlankMode)
+
+        if !g.activeOutput.hasOutputName {
+            // Don't override explicit output names.
+            if g.mode == Batching {
+                if g.hasInputName {
+                    g.activeOutput.hasOutputName = true
+                    g.activeOutput.outputName = g.inputName.clone()
+                }
+            } else if g.mode == Exploding {
+                // Explode into current directory.
+                string explodeName = "#stdin#"
+                if g.hasInputName {
+                    explodeName = g.inputName.clone()
+                }
+                var slash = explodeName.lastIndexOf('/')
+                g.activeOutput.hasOutputName = true
+                if slash is not null {
+                    g.activeOutput.outputName = explodeName[slash + 1..].clone()
+                } else {
+                    g.activeOutput.outputName = explodeName
+                }
+            }
+        }
+
+        // Clear old options from the last input stream: an option given before this input that was
+        // not changed since the last one does not apply to it.
+        int noexf = 0
+        if !changed(savedNextFrame, ChName) {
+            noexf |= NoexfName
+        }
+        if !changed(savedNextFrame, ChComment) {
+            noexf |= NoexfComment
+        }
+        if !changed(savedNextFrame, ChExtension) {
+            noexf |= NoexfGeneric | NoexfApp
+        }
+        deleteMatchingExtensions(ref g.defFrame.extensions, noexf)
+        g.defFrame.frameNoExtensionsFlag &= ~noexf
+        g.defFrame.hasInputFilename = g.hasInputName
+        g.defFrame.inputFilename = g.inputName.clone()
+
+        // The first frame gets a copy of def_frame's extensions; def_frame keeps them for a later
+        // frame selection.
+        var oldExtensions = g.defFrame.extensions.clone()
+        var oldDefFrame = frameCopy(read g.defFrame)
+        g.inputFrames = g.frames
+        g.firstInputFrame = (int)g.framesets[g.frames].f.length()
+        g.defFrame.positionIsOffset = true
+        nint n = g.streams[gfs].images.length()
+        for i in 0..n {
+            _ = addFrame(ref g, g.frames, gfs, g.streams[gfs].images[i])
+        }
+        clearDefFrameOnceOptions(ref g)
+        g.defFrame = oldDefFrame
+        g.defFrame.extensions = oldExtensions
+
+        if g.unoptimizing {
+            gifCalculateScreenSize(ref g, gfs, false)
+            int sw = (int)g.streams[gfs].screenWidth
+            int sh = (int)g.streams[gfs].screenHeight
+            if sw > g.maxScreenWidth || sh > g.maxScreenHeight {
+                lerror(ref g, read name, "screen size %dx%d too large to unoptimize\n  (The limit is %dx%d. Change it with %<--max-screen%>.)", read List<string> {
+                    $"{sw}".toString(), $"{sh}".toString(), $"{g.maxScreenWidth}".toString(), $"{g.maxScreenHeight}".toString(),
+                })
+            } else if !gifFullUnoptimize(ref g, gfs, GifUnoptimizeSimplestDisposal) {
+                if !g.msgs.unoptimizeComplexityContext {
+                    lwarning(ref g, read name, "GIF too complex to unoptimize\n  (The reason was local color tables or complex transparency.\n  Try running the GIF through %<gifsicle --colors=255%> first.)", read List<string>())
+                    g.msgs.unoptimizeComplexityContext = true
+                } else {
+                    lwarning(ref g, read name, "GIF too complex to unoptimize", read List<string>())
+                }
+            }
+        }
+
+        applyColorTransforms(ref g, true, gfs)
+        g.streams[gfs].refcount += 1
+
+        // Read more files. Once-only frame options apply to the first component only.
+        if (g.gifReadFlags & GifReadTrailingGarbageOk) != 0 && !g.nextfile {
+            savedNextFrame = 0
+            continue
+        }
+        putReader(ref g, which, ref opened, grr)
+        closeGiffile(ref g, which, false)
+        return
+    }
+}
+
+Reader takeReader(ref Gt g, nint which, ref Reader opened) {
+    if which == -1 {
+        return g.stdin.replace(fileReader(List<byte>()))
+    } else if which >= 0 {
+        return g.storedFiles[which].reader.replace(fileReader(List<byte>()))
+    }
+    return opened.replace(fileReader(List<byte>()))
+}
+
+void putReader(ref Gt g, nint which, ref Reader opened, Reader grr) {
+    if which == -1 {
+        g.stdin = grr
+    } else if which >= 0 {
+        g.storedFiles[which].reader = grr
+    } else {
+        opened = grr
+    }
+}
+
+void inputDone(ref Gt g) {
+    if g.input == None {
+        return
+    }
+    if g.msgs.verbosing {
+        verboseClose(ref g, 0x3E)
+    }
+    gifDeleteStream(ref g, g.input)
+    g.input = None
+    if g.mode == Deleting {
+        frameChangeDone(ref g)
+    }
+    if g.mode == Batching || g.mode == Exploding {
+        outputFrames(ref g)
+    }
+}
+
+// ---- colormap stuff ----
+
+void setNewFixedColormap(ref Gt g, read string? name, bool exact) {
+    if name is not null && name == "web" {
+        var cm = gifNewFullColormap(ref g, 216, 256)
+        for i in 0..216 {
+            g.colormaps[cm].col[(nint)i] = color((i / 36) * 0x33, ((i / 6) % 6) * 0x33, (i % 6) * 0x33)
+        }
+        g.defOutput.colormapFixed = cm
+    } else if name is not null && (name == "gray" || name == "grey") {
+        var cm = gifNewFullColormap(ref g, 256, 256)
+        for i in 0..256 {
+            g.colormaps[cm].col[(nint)i] = color(i, i, i)
+        }
+        g.defOutput.colormapFixed = cm
+    } else if name is not null && name == "bw" {
+        var cm = gifNewFullColormap(ref g, 2, 256)
+        g.colormaps[cm].col[0] = color(0, 0, 0)
+        g.colormaps[cm].col[1] = color(255, 255, 255)
+        g.defOutput.colormapFixed = cm
+    } else {
+        g.defOutput.colormapFixed = readColormapFile(ref g, name)
+    }
+    g.defOutput.colormapFixedExact = exact
+}
+
+void doColormapChange(ref Gt g, nint gfs) {
+    if g.activeOutput.colormapFixed != None {
+        var od = outputDataCopy(read g.activeOutput)
+        colormapStream(ref g, gfs, g.activeOutput.colormapFixed, ref od, !g.activeOutput.colormapFixedExact)
+    }
+    if g.activeOutput.colormapSize > 0 {
+        bool anyLocals = false
+        for gfi in read g.streams[gfs].images {
+            if g.images[gfi].local != None {
+                anyLocals = true
+            }
+        }
+        uint ntransp = 0
+        var kch = kchistMake(ref g, gfs, ref ntransp)
+        if kch.n <= g.activeOutput.colormapSize && !anyLocals && g.activeOutput.colormapFixed == None {
+            warning(ref g, 1, "trivial adaptive palette (only %d colors in source)", read List<string> { $"{kch.n}".toString() })
+            return
+        }
+        g.activeOutput.colormapNeedsTransparency = ntransp > 0
+        var od = outputDataCopy(read g.activeOutput)
+        nint newCm = None
+        if g.activeOutput.colormapAlgorithm == ColormapDiversity {
+            newCm = colormapFlatDiversity(ref g, ref kch, ref od)
+        } else if g.activeOutput.colormapAlgorithm == ColormapBlendDiversity {
+            newCm = colormapBlendDiversity(ref g, ref kch, ref od)
+        } else if g.activeOutput.colormapAlgorithm == ColormapMedianCut {
+            newCm = colormapMedianCut(ref g, ref kch, ref od)
+        } else {
+            fatalError(ref g, "can't happen", read List<string>())
+        }
+        colormapStream(ref g, gfs, newCm, ref od, true)
+        gifDeleteColormap(ref g, newCm)
+    }
+}
+
+// ---- output ----
+
+void writeStream(ref Gt g, read string? outputName, nint gfs) {
+    if outputName is null {
+        if stdoutIsTerminal() {
+            lerror(ref g, "<stdout>", "Is a terminal: try `-o OUTPUTFILE`", read List<string>())
+            return
+        }
+        var info = g.gifWriteInfo
+        var bytes = gifFullWriteFile(ref g, gfs, read info)
+        writeOutput(ref g, read bytes)
+        g.anyOutputSuccessful = true
+        return
+    }
+    var info = g.gifWriteInfo
+    var bytes = gifFullWriteFile(ref g, gfs, read info)
+    match File.writeBytes(read outputName, read bytes) {
+        Ok => g.anyOutputSuccessful = true
+        Error(cause) => lerror(ref g, outputName, "%s", read List<string> { ioErrorText(cause) })
+    }
+}
+
+void writeOutput(ref Gt g, read byte[] bytes) {
+    _ = Stdout.writeBytes(bytes)
+    _ = Stdout.flush()
+}
+
+void mergeAndWriteFrames(ref Gt g, read string? outfile, int f1, int f2) {
+    if g.msgs.verbosing {
+        string shown = "#stdout#"
+        if outfile is not null {
+            shown = outfile.clone()
+        }
+        verboseOpen(ref g, 0x5B, read shown)
+    }
+    if outfile is not null {
+        g.activeOutput.hasActiveOutputName = true
+        g.activeOutput.activeOutputName = outfile.clone()
+    } else {
+        g.activeOutput.hasActiveOutputName = false
+        g.activeOutput.activeOutputName = ""
+    }
+    g.activeOutput.maxScreenWidth = g.maxScreenWidth
+    g.activeOutput.maxScreenHeight = g.maxScreenHeight
+
+    bool colormapChange = g.activeOutput.colormapSize > 0 || g.activeOutput.colormapFixed != None
+    if colormapChange {
+        g.msgs.warnLocalColormaps = 0
+    } else {
+        g.msgs.warnLocalColormaps = 1
+    }
+    kcSetGamma(ref g, g.activeOutput.colormapGammaType, g.activeOutput.colormapGamma)
+
+    int compressImmediately = 0
+    if !(g.activeOutput.scaling != 0 || (g.activeOutput.optimizing & GtOptMask) != 0 || colormapChange) {
+        compressImmediately = 1
+    } else {
+        compressImmediately = g.activeOutput.conserveMemory
+    }
+
+    bool hugeStream = false
+    var out = mergeFrameInterval(ref g, g.frames, f1, f2, compressImmediately, ref hugeStream)
+    if out != None {
+        double w = 0.0
+        double h = 0.0
+        bool ok = true
+        if g.activeOutput.scaling == GtScalingScale {
+            w = g.activeOutput.scaleX * (double)g.streams[out].screenWidth
+            h = g.activeOutput.scaleY * (double)g.streams[out].screenHeight
+            // tiny scale factors still produce at least 1 pixel
+            if w < 1.0 {
+                w = 1.0
+            }
+            if h < 1.0 {
+                h = 1.0
+            }
+        } else {
+            w = (double)g.activeOutput.resizeWidth
+            h = (double)g.activeOutput.resizeHeight
+        }
+        if g.activeOutput.scaling != GtScalingNone &&
+            resizeStream(ref g, out, w, h, g.activeOutput.resizeFlags, g.activeOutput.scaleMethod, g.activeOutput.scaleColors, g.threadCount) < 0 {
+            ok = false
+        }
+        if ok {
+            if colormapChange {
+                doColormapChange(ref g, out)
+            }
+            if g.outputTransforms.length() > 0 {
+                applyColorTransforms(ref g, false, out)
+            }
+            if (g.activeOutput.optimizing & GtOptMask) != 0 {
+                var od = outputDataCopy(read g.activeOutput)
+                optimizeFragments(ref g, out, read od, hugeStream)
+            }
+            writeStream(ref g, outfile, out)
+        }
+    }
+    gifDeleteStream(ref g, out)
+    if g.msgs.verbosing {
+        verboseClose(ref g, 0x5D)
+    }
+    g.activeOutput.hasActiveOutputName = false
+    g.activeOutput.activeOutputName = ""
+}
+
+void outputInformation(ref Gt g, read string? outfile) {
+    var out = List<byte>()
+    nint fset = g.frames
+    nint n = g.framesets[fset].f.length()
+    for i in 0..n {
+        g.streams[g.framesets[fset].f[i].stream].userFlags = 97
+    }
+    for i in 0..n {
+        nint gfs = g.framesets[fset].f[i].stream
+        if g.streams[gfs].userFlags == 97 {
+            g.streams[gfs].userFlags = 0
+            string? filename = null
+            if g.framesets[fset].f[i].hasInputFilename {
+                filename = g.framesets[fset].f[i].inputFilename.clone()
+            }
+            streamInfo(ref g, ref out, gfs, read filename, g.framesets[fset].f[i].infoFlags)
+            // C writes as it goes; the information is written at the end of each stream
+            for j in i..n {
+                if g.framesets[fset].f[j].stream == gfs {
+                    var image = g.framesets[fset].f[j].image
+                    var flags = g.framesets[fset].f[j].infoFlags
+                    imageInfo(ref g, ref out, gfs, image, flags)
+                }
+            }
+        }
+    }
+    if g.infoing == 2 {
+        writeError(read out)
+    } else if outfile is null {
+        writeOutput(ref g, read out)
+    } else {
+        match File.writeBytes(read outfile, read out) {
+            Ok => {}
+            Error(cause) => lerror(ref g, outfile, "%s", read List<string> { ioErrorText(cause) })
+        }
+    }
+}
+
+void outputFrames(ref Gt g) {
+    // Use the current output name, not the stored output name.
+    string? outfile = null
+    if g.activeOutput.hasOutputName {
+        outfile = g.activeOutput.outputName.clone()
+    }
+    g.activeOutput.hasOutputName = false
+    g.activeOutput.outputName = ""
+
+    // Output information only now.
+    if g.infoing != 0 {
+        outputInformation(ref g, read outfile)
+    }
+
+    // An input with no images produces no output, which is an error.
+    if g.infoing != 1 {
+        if g.mode == Merging || g.mode == Batching || g.mode == Infoing {
+            mergeAndWriteFrames(ref g, read outfile, 0, -1)
+        } else if g.mode == Exploding {
+            int maxNimages = 0
+            nint n = g.framesets[g.frames].f.length()
+            for i in 0..n {
+                int count = gifImageCount(read g, g.framesets[g.frames].f[i].stream)
+                if count > maxNimages {
+                    maxNimages = count
+                }
+            }
+            string explodeTo = "-"
+            if outfile is not null {
+                explodeTo = outfile.clone()
+            }
+            if n == 0 {
+                error(ref g, 1, "empty output GIF not written", read List<string>())
+            }
+            for i in 0..n {
+                nint gfs = g.framesets[g.frames].f[i].stream
+                nint gfi = g.framesets[g.frames].f[i].image
+                int imagenumber = gifImageNumber(read g, gfs, gfi)
+                List<byte>? imagename = null
+                if g.framesets[g.frames].f[i].explodeByName {
+                    int noexf = g.framesets[g.frames].f[i].noExtensionsFlag | g.framesets[g.frames].f[i].frameNoExtensionsFlag
+                    imagename = gifExtensionListName(read g.framesets[g.frames].f[i].extensions)
+                    if imagename is null && (noexf & NoexfName) == 0 {
+                        imagename = gifImageName(read g, gfi)
+                    }
+                }
+                var explodename = explodeFilename(read explodeTo, imagenumber, read imagename, maxNimages)
+                mergeAndWriteFrames(ref g, read explodename, (int)i, (int)i)
+            }
+        }
+    }
+    g.activeNextOutput = 0
+    clearFrameset(ref g, g.frames, 0)
+    // cropping: clear the 'crop->ready' information, which depended on the last input image.
+    if g.defFrame.crop != None {
+        g.crops[g.defFrame.crop].ready = 0
+    }
+}
+
+// ---- parsing arguments ----
+
+// 0 if a file named `arg` should be tried, -1 if `arg` was an invalid frame specification.
+int frameArgument(ref Gt g, read string arg) {
+    int val = parseFrameSpec(ref g, arg.asBytes(), -1)
+    if val == -97 {
+        return 0
+    }
+    if val <= 0 {
+        return -1
+    }
+    var spec = g.clp.val.fs
+    int delta = 1
+    if spec.frame1 > spec.frame2 {
+        delta = -1
+    }
+    int i = spec.frame1
+    while i != spec.frame2 + delta {
+        showFrame(ref g, i, spec.hasName)
+        i += delta
+    }
+    if g.nextOutput != 0 {
+        combineOutputOptions(ref g)
+    }
+    return 1
+}
+
+bool handleExtension(ref Gt g, bool isApp) {
+    var extensionType = g.clp.vstr.clone()
+    var body = clpShift(ref g.clp, true)
+    if body is null {
+        clpOptionError(ref g, "%O requires two arguments", read List<string>())
+        return false
+    }
+    int kind = 0
+    var t = extensionType.asBytes()
+    var appname = List<byte>()
+    if isApp {
+        // identifier + authentication code: exactly 11 bytes
+        if t.length() > 11 {
+            clpOptionError(ref g, "%O: extension name too long", read List<string>())
+            return false
+        }
+        var a = List<byte>.repeat(0, 11)
+        a[0..t.length()].copyFrom(t)
+        appname = a
+        kind = 255
+    } else if t.length() == 1 && !isDigitByte((int)t[0]) {
+        kind = (int)t[0]
+    } else {
+        var n = cStrtoNum(t, 0, 0, true)
+        if n.end == 0 || n.end != t.length() || n.l < 0 || n.l >= 255 {
+            clpOptionError(ref g, "%O: extension type must be number between 0 and 254", read List<string>())
+            return false
+        }
+        kind = (int)n.l
+    }
+    var gfex = gifNewExtensionData(kind, read appname, body.asBytes())
+    markExtensionChange(ref g, extensionFlag(read gfex))
+    g.defFrame.extensions.add(gfex)
+    return true
+}
+
+// ---- option processing ----
+
+void initializeDefFrame(ref Gt g) {
+    g.defFrame = blankFrame()
+    g.defOutput = blankOutputData()
+    g.defFrame.useFrame = 1
+    g.defFrame.interlacing = -1
+    g.defFrame.left = -1
+    g.defFrame.top = -1
+    g.defFrame.delay = -1
+    g.defFrame.disposal = -1
+    g.defOutput.screenWidth = -1
+    g.defOutput.screenHeight = -1
+    g.defOutput.loopcount = -2
+    g.defOutput.colormapAlgorithm = ColormapDiversity
+    g.defOutput.ditherType = DitherNone
+    g.defOutput.ditherName = "none"
+    g.defOutput.colormapGammaType = KcGammaSrgb
+    g.defOutput.colormapGamma = 2.2
+    g.defOutput.scaling = GtScalingNone
+    g.defOutput.scaleMethod = ScaleMethodMix
+    g.activeOutput = outputDataCopy(read g.defOutput)
+}
+
+void combineOutputOptions(ref Gt g) {
+    int recent = g.nextOutput
+    g.nextOutput = g.activeNextOutput
+    if changed(recent, ChOutput) {
+        markOutput(ref g, ChOutput)
+        g.activeOutput.hasOutputName = g.defOutput.hasOutputName
+        g.activeOutput.outputName = g.defOutput.outputName.clone()
+    }
+    if changed(recent, ChLogicalScreen) {
+        markOutput(ref g, ChLogicalScreen)
+        g.activeOutput.screenMode = g.defOutput.screenMode
+        g.activeOutput.screenWidth = g.defOutput.screenWidth
+        g.activeOutput.screenHeight = g.defOutput.screenHeight
+    }
+    if changed(recent, ChBackground) {
+        markOutput(ref g, ChBackground)
+        g.activeOutput.background = g.defOutput.background
+    }
+    if changed(recent, ChLoopcount) {
+        markOutput(ref g, ChLoopcount)
+        g.activeOutput.loopcount = g.defOutput.loopcount
+    }
+    if changed(recent, ChOptimize) {
+        markOutput(ref g, ChOptimize)
+        g.activeOutput.optimizing = g.defOutput.optimizing
+    }
+    if changed(recent, ChColormap) {
+        markOutput(ref g, ChColormap)
+        g.activeOutput.colormapSize = g.defOutput.colormapSize
+    }
+    if changed(recent, ChColormapMethod) {
+        markOutput(ref g, ChColormapMethod)
+        g.activeOutput.colormapAlgorithm = g.defOutput.colormapAlgorithm
+    }
+    if changed(recent, ChUseColormap) {
+        markOutput(ref g, ChUseColormap)
+        if g.defOutput.colormapFixed != None {
+            g.colormaps[g.defOutput.colormapFixed].refcount += 1
+        }
+        gifDeleteColormap(ref g, g.activeOutput.colormapFixed)
+        g.activeOutput.colormapFixed = g.defOutput.colormapFixed
+        g.activeOutput.colormapFixedExact = g.defOutput.colormapFixedExact
+    }
+    if changed(recent, ChDither) {
+        markOutput(ref g, ChDither)
+        copyDither(ref g.activeOutput, read g.defOutput)
+    }
+    if changed(recent, ChGamma) {
+        markOutput(ref g, ChGamma)
+        g.activeOutput.colormapGammaType = g.defOutput.colormapGammaType
+        g.activeOutput.colormapGamma = g.defOutput.colormapGamma
+    }
+    if changed(recent, ChResize) {
+        markOutput(ref g, ChResize)
+        g.activeOutput.scaling = g.defOutput.scaling
+        g.activeOutput.resizeWidth = g.defOutput.resizeWidth
+        g.activeOutput.resizeHeight = g.defOutput.resizeHeight
+        g.activeOutput.resizeFlags = g.defOutput.resizeFlags
+        g.activeOutput.scaleX = g.defOutput.scaleX
+        g.activeOutput.scaleY = g.defOutput.scaleY
+    }
+    if changed(recent, ChResizeMethod) {
+        markOutput(ref g, ChResizeMethod)
+        g.activeOutput.scaleMethod = g.defOutput.scaleMethod
+    }
+    if changed(recent, ChScaleColors) {
+        markOutput(ref g, ChScaleColors)
+        g.activeOutput.scaleColors = g.defOutput.scaleColors
+    }
+    if changed(recent, ChMemory) {
+        markOutput(ref g, ChMemory)
+        g.activeOutput.conserveMemory = g.defOutput.conserveMemory
+    }
+    g.defOutput.colormapFixed = None
+    g.defOutput.colormapFixedExact = false
+    g.defOutput.hasOutputName = false
+    g.defOutput.outputName = ""
+    g.activeNextOutput |= g.nextOutput
+    g.nextOutput = 0
+}
+
+void redundantOptionWarning(ref Gt g, read string opttype) {
+    if !g.msgs.redundantOptionContext {
+        warning(ref g, 0, "redundant %s option\n  (The %s option was overridden by another %s option\n  before it had any effect.)", read List<string> { opttype.clone(), opttype.clone(), opttype.clone() })
+        g.msgs.redundantOptionContext = true
+    } else {
+        warning(ref g, 0, "redundant %s option", read List<string> { opttype.clone() })
+    }
+}
+
+void printUselessOptions(ref Gt g, read string typeName, int value, int kind) {
+    bool explanationPrinted = false
+    int i = 0
+    while (1 << i) <= value {
+        if changed(value, i) {
+            if !explanationPrinted {
+                warning(ref g, 0, "useless %s-related %s option\n  (It didn%,t affect any %s.)", read List<string> { optionTypeName(kind, i), typeName.clone(), typeName.clone() })
+                explanationPrinted = true
+            } else {
+                warning(ref g, 0, "useless %s-related %s option", read List<string> { optionTypeName(kind, i), typeName.clone() })
+            }
+        }
+        i += 1
+    }
+}
+
+// Frames share crops, so crops live until gifsicle ends.
+nint copyCrop(ref Gt g, nint oc) {
+    var nc = noCrop()
+    if oc != None {
+        nc = g.crops[oc]
+    }
+    nc.ready = 0
+    g.crops.add(nc)
+    return g.crops.length() - 1
+}
+
+bool parseResizeGeometryOpt(ref Gt g, read string str) {
+    var s = str.asBytes()
+    nint p = 0
+    double x = 0.0
+    double y = 0.0
+    int flags = GtResizeFit
+    bool scale = false
+    bool bad = false
+    if byteAt(s, p) == 0x5F || byteAt(s, p) == 0x78 {
+        x = 0.0
+        if byteAt(s, p) == 0x5F {
+            p += 1
+        }
+    } else if isDigitByte(byteAt(s, p)) {
+        var n = cStrtoNum(s, p, 10, true)
+        x = (double)n.l
+        p = n.end
+    } else {
+        bad = true
+    }
+    if !bad {
+        if byteAt(s, p) == 0x78 {
+            p += 1
+            if byteAt(s, p) == 0x5F || !isDigitByte(byteAt(s, p)) {
+                y = 0.0
+                if byteAt(s, p) == 0x5F {
+                    p += 1
+                }
+            } else {
+                var n = cStrtoNum(s, p, 10, true)
+                y = (double)n.l
+                p = n.end
+            }
+        } else {
+            y = x
+        }
+        if x > 65535.0 || y > 65535.0 {
+            bad = true
+        }
+    }
+    while !bad && byteAt(s, p) != 0 {
+        int c = byteAt(s, p)
+        if c == 0x25 {
+            scale = true
+        } else if c == 0x21 {
+            flags = 0
+        } else if c == 0x5E {
+            flags |= GtResizeFit | GtResizeMinDimen
+        } else if c == 0x3C {
+            flags |= GtResizeFit | GtResizeFitUp
+        } else if c == 0x3E {
+            flags |= GtResizeFit | GtResizeFitDown
+        } else {
+            bad = true
+        }
+        p += 1
+    }
+    if bad {
+        clpOptionError(ref g, "argument to %O must be a valid geometry specification", read List<string>())
+        return false
+    }
+    if scale {
+        g.defOutput.scaling = GtScalingScale
+        g.defOutput.scaleX = x / 100.0
+        g.defOutput.scaleY = y / 100.0
+    } else {
+        g.defOutput.scaling = GtScalingResize
+        g.defOutput.resizeWidth = (int)x
+        g.defOutput.resizeHeight = (int)y
+    }
+    g.defOutput.resizeFlags = flags
+    return true
+}
+
+// The parsers of gifsicle's own value types, called by CLP.
+int parseUserValue(ref Gt g, int valType, read byte[] arg, bool complain) {
+    int c = 0
+    if complain {
+        c = 1
+    }
+    if valType == DimensionsType {
+        return parseDimensions(ref g, arg, complain)
+    } else if valType == PositionType {
+        return parsePosition(ref g, arg, complain)
+    } else if valType == ScaleFactorType {
+        return parseScaleFactor(ref g, arg, complain)
+    } else if valType == FrameSpecType {
+        return parseFrameSpec(ref g, arg, c)
+    } else if valType == ColorType {
+        return parseColor(ref g, arg, complain, 0)
+    } else if valType == RectangleType {
+        return parseRectangle(ref g, arg, complain)
+    } else if valType == TwoColorsType {
+        return parseTwoColors(ref g, arg, complain)
+    }
+    return 0
+}
+
+struct OptDef : Copyable {
+    int shortName
+    int id
+    int valType
+    int flags
+}
+
+void option(ref Gt g, ref List<ClpOption> opts, read string longName, int shortName, int id, int valType, int flags) {
+    int name = -1
+    if longName.length() > 0 {
+        name = clpAddName(ref g.clp, longName)
+    }
+    opts.add(ClpOption { longName = name, shortName = shortName, optionId = id, valType = valType, flags = flags })
+}
+
+void defineOptions(ref Gt g) {
+    var o = List<ClpOption>()
+    int n = ClpNegate
+    option(ref g, ref o, "append", 0, AppendOpt, 0, 0)
+    option(ref g, ref o, "app-extension", 0x78, AppExtensionOpt, ClpValString, 0)
+    option(ref g, ref o, "no-app-extensions", 0, NoAppExtensionsOpt, 0, 0)
+    option(ref g, ref o, "background", 0x42, BackgroundOpt, ColorType, n)
+    option(ref g, ref o, "batch", 0x62, 0x62, 0, 0)
+    option(ref g, ref o, "bg", 0, BackgroundOpt, ColorType, n)
+    option(ref g, ref o, "careful", 0, CarefulOpt, 0, n)
+    option(ref g, ref o, "change-color", 0, ChangeColorOpt, TwoColorsType, n)
+    option(ref g, ref o, "cinfo", 0, ColorInfoOpt, 0, n)
+    option(ref g, ref o, "clip", 0, CropOpt, RectangleType, n)
+    option(ref g, ref o, "colors", 0x6B, ColormapOpt, ClpValInt, n)
+    option(ref g, ref o, "color-method", 0, ColormapAlgorithmOpt, ColormapAlgType, 0)
+    option(ref g, ref o, "color-info", 0, ColorInfoOpt, 0, n)
+    option(ref g, ref o, "comment", 0x63, CommentOpt, ClpValString, 0)
+    option(ref g, ref o, "no-comments", 0x63, NoCommentsOpt, 0, 0)
+    option(ref g, ref o, "conserve-memory", 0, ConserveMemoryOpt, 0, n)
+    option(ref g, ref o, "crop", 0, CropOpt, RectangleType, n)
+    option(ref g, ref o, "crop-transparency", 0, CropTransparencyOpt, 0, n)
+    option(ref g, ref o, "delay", 0x64, 0x64, ClpValInt, n)
+    option(ref g, ref o, "delete", 0, DeleteOpt, 0, 0)
+    option(ref g, ref o, "disposal", 0x44, DisposalOpt, DisposalType, n)
+    option(ref g, ref o, "", 0x66, DitherOpt, 0, n)
+    option(ref g, ref o, "dither", 0, DitherOpt, ClpValString, n | ClpOptional)
+    option(ref g, ref o, "done", 0, AlterDoneOpt, 0, 0)
+    option(ref g, ref o, "explode", 0x65, 0x65, 0, 0)
+    option(ref g, ref o, "explode-by-name", 0x45, 0x45, 0, 0)
+    option(ref g, ref o, "extension", 0, ExtensionOpt, ClpValString, 0)
+    option(ref g, ref o, "no-extension", 0, NoExtensionsOpt, 0, 0)
+    option(ref g, ref o, "no-extensions", 0x78, NoExtensionsOpt, 0, 0)
+    option(ref g, ref o, "extension-info", 0, ExtensionInfoOpt, 0, n)
+    option(ref g, ref o, "flip-horizontal", 0, FlipHorizOpt, 0, n)
+    option(ref g, ref o, "flip-vertical", 0, FlipVertOpt, 0, n)
+    option(ref g, ref o, "no-flip", 0, NoFlipOpt, 0, 0)
+    option(ref g, ref o, "gamma", 0, GammaOpt, ClpValString, n)
+    option(ref g, ref o, "gray", 0, GrayOpt, 0, 0)
+    option(ref g, ref o, "help", 0x68, HelpOpt, 0, 0)
+    option(ref g, ref o, "ignore-errors", 0, IgnoreErrorsOpt, 0, n)
+    option(ref g, ref o, "info", 0x49, InfoOpt, 0, n)
+    option(ref g, ref o, "insert-before", 0, InsertOpt, FrameSpecType, 0)
+    option(ref g, ref o, "interlace", 0x69, 0x69, 0, n)
+    option(ref g, ref o, "logical-screen", 0x53, LogicalScreenOpt, DimensionsType, n)
+    option(ref g, ref o, "loopcount", 0x6C, 0x6C, LoopType, ClpOptional | n)
+    option(ref g, ref o, "lossy", 0, LossyOpt, ClpValInt, ClpOptional)
+    option(ref g, ref o, "max-screen", 0, MaxScreenOpt, DimensionsType, n)
+    option(ref g, ref o, "merge", 0x6D, 0x6D, 0, 0)
+    option(ref g, ref o, "method", 0, ColormapAlgorithmOpt, ColormapAlgType, 0)
+    option(ref g, ref o, "multifile", 0, MultifileOpt, 0, n)
+    option(ref g, ref o, "name", 0x6E, NameOpt, ClpValString, 0)
+    option(ref g, ref o, "nextfile", 0, NextfileOpt, 0, n)
+    option(ref g, ref o, "no-names", 0x6E, NoNameOpt, 0, 0)
+    option(ref g, ref o, "optimize", 0x4F, OptimizeOpt, OptimizeType, n | ClpOptional)
+    option(ref g, ref o, "output", 0x6F, OutputOpt, ClpValStringNotOption, 0)
+    option(ref g, ref o, "position", 0x70, PositionOpt, PositionType, n)
+    option(ref g, ref o, "replace", 0, ReplaceOpt, FrameSpecType, 0)
+    option(ref g, ref o, "resize", 0, ResizeOpt, DimensionsType, n)
+    option(ref g, ref o, "resize-width", 0, ResizeWidthOpt, ClpValUnsigned, n)
+    option(ref g, ref o, "resize-height", 0, ResizeHeightOpt, ClpValUnsigned, n)
+    option(ref g, ref o, "resiz", 0, ResizeOpt, DimensionsType, n)
+    option(ref g, ref o, "resi", 0, ResizeOpt, DimensionsType, n)
+    option(ref g, ref o, "res", 0, ResizeOpt, DimensionsType, n)
+    option(ref g, ref o, "resize-fit", 0, ResizeFitOpt, DimensionsType, n)
+    option(ref g, ref o, "resize-fit-width", 0, ResizeFitWidthOpt, ClpValUnsigned, n)
+    option(ref g, ref o, "resize-fit-height", 0, ResizeFitHeightOpt, ClpValUnsigned, n)
+    option(ref g, ref o, "resize-fi", 0, ResizeFitOpt, DimensionsType, n)
+    option(ref g, ref o, "resize-f", 0, ResizeFitOpt, DimensionsType, n)
+    option(ref g, ref o, "resize-touch", 0, ResizeTouchOpt, DimensionsType, n)
+    option(ref g, ref o, "resize-touch-width", 0, ResizeTouchWidthOpt, ClpValUnsigned, n)
+    option(ref g, ref o, "resize-touch-height", 0, ResizeTouchHeightOpt, ClpValUnsigned, n)
+    option(ref g, ref o, "resize-touc", 0, ResizeTouchOpt, DimensionsType, n)
+    option(ref g, ref o, "resize-tou", 0, ResizeTouchOpt, DimensionsType, n)
+    option(ref g, ref o, "resize-to", 0, ResizeTouchOpt, DimensionsType, n)
+    option(ref g, ref o, "resize-t", 0, ResizeTouchOpt, DimensionsType, n)
+    option(ref g, ref o, "resize-geometry", 0, ResizeGeometryOpt, ClpValString, n)
+    option(ref g, ref o, "resize-method", 0, ResizeMethodOpt, ResizeMethodType, 0)
+    option(ref g, ref o, "resize-colors", 0, ResizeColorsOpt, ClpValInt, n)
+    option(ref g, ref o, "rotate-90", 0, Rotate90Opt, 0, 0)
+    option(ref g, ref o, "rotate-180", 0, Rotate180Opt, 0, 0)
+    option(ref g, ref o, "rotate-270", 0, Rotate270Opt, 0, 0)
+    option(ref g, ref o, "no-rotate", 0, NoRotateOpt, 0, 0)
+    option(ref g, ref o, "same-app-extensions", 0, SameAppExtensionsOpt, 0, 0)
+    option(ref g, ref o, "same-background", 0, SameBackgroundOpt, 0, 0)
+    option(ref g, ref o, "same-bg", 0, SameBackgroundOpt, 0, 0)
+    option(ref g, ref o, "same-clip", 0, SameCropOpt, 0, 0)
+    option(ref g, ref o, "same-comments", 0, SameCommentsOpt, 0, 0)
+    option(ref g, ref o, "same-crop", 0, SameCropOpt, 0, 0)
+    option(ref g, ref o, "same-extensions", 0, SameExtensionsOpt, 0, 0)
+    option(ref g, ref o, "same-interlace", 0, SameInterlaceOpt, 0, 0)
+    option(ref g, ref o, "same-logical-screen", 0, SameLogicalScreenOpt, 0, 0)
+    option(ref g, ref o, "same-loopcount", 0, SameLoopcountOpt, 0, 0)
+    option(ref g, ref o, "same-disposal", 0, SameDisposalOpt, 0, 0)
+    option(ref g, ref o, "same-delay", 0, SameDelayOpt, 0, 0)
+    option(ref g, ref o, "same-names", 0, SameNameOpt, 0, 0)
+    option(ref g, ref o, "same-position", 0, SamePositionOpt, 0, 0)
+    option(ref g, ref o, "same-screen", 0, SameLogicalScreenOpt, 0, 0)
+    option(ref g, ref o, "same-transparent", 0, SameTransparentOpt, 0, 0)
+    option(ref g, ref o, "scale", 0, ScaleOpt, ScaleFactorType, n)
+    option(ref g, ref o, "scale-method", 0, ResizeMethodOpt, ResizeMethodType, 0)
+    option(ref g, ref o, "scale-colors", 0, ResizeColorsOpt, ClpValInt, n)
+    option(ref g, ref o, "screen", 0, LogicalScreenOpt, DimensionsType, n)
+    option(ref g, ref o, "sinfo", 0, SizeInfoOpt, 0, n)
+    option(ref g, ref o, "size-info", 0, SizeInfoOpt, 0, n)
+    option(ref g, ref o, "transform-colormap", 0, ColorTransformOpt, ClpValStringNotOption, n)
+    option(ref g, ref o, "transparent", 0x74, 0x74, ColorType, n)
+    option(ref g, ref o, "unoptimize", 0x55, UnoptimizeOpt, 0, n)
+    option(ref g, ref o, "use-colormap", 0, UseColormapOpt, ClpValString, n)
+    option(ref g, ref o, "use-exact-colormap", 0, UseExactColormapOpt, ClpValString, n)
+    option(ref g, ref o, "verbose", 0x56, VerboseOpt, 0, n)
+    option(ref g, ref o, "", 0x76, VerboseOpt, 0, n)
+    option(ref g, ref o, "version", 0, VersionOpt, 0, 0)
+    option(ref g, ref o, "", 0x77, NoWarningsOpt, 0, n)
+    option(ref g, ref o, "warnings", 0, WarningsOpt, 0, n)
+    option(ref g, ref o, "xinfo", 0, ExtensionInfoOpt, 0, n)
+    option(ref g, ref o, "threads", 0x6A, ThreadsOpt, ClpValUnsigned, ClpOptional | n)
+    clpSetOptions(ref g.clp, o)
+
+    clpAddStringListType(ref g.clp, LoopType, ClpAllowNumbers, read List<string> { "infinite", "forever" }, read List<long> { 0, 0 })
+    clpAddStringListType(ref g.clp, DisposalType, ClpAllowNumbers,
+        read List<string> { "none", "asis", "background", "bg", "previous" },
+        read List<long> { (long)GifDisposalNone, (long)GifDisposalAsis, (long)GifDisposalBackground, (long)GifDisposalBackground, (long)GifDisposalPrevious })
+    clpAddStringListType(ref g.clp, ColormapAlgType, 0,
+        read List<string> { "diversity", "blend-diversity", "median-cut" },
+        read List<long> { (long)ColormapDiversity, (long)ColormapBlendDiversity, (long)ColormapMedianCut })
+    clpAddStringListType(ref g.clp, OptimizeType, ClpAllowNumbers,
+        read List<string> { "keep-empty", "no-keep-empty", "drop-empty", "no-drop-empty" },
+        read List<long> { (long)GtOptKeepempty + 1, (long)GtOptKeepempty, (long)GtOptKeepempty, (long)GtOptKeepempty + 1 })
+    clpAddStringListType(ref g.clp, ResizeMethodType, 0,
+        read List<string> { "point", "sample", "mix", "box", "catrom", "lanczos", "lanczos2", "lanczos3", "mitchell", "fast", "good" },
+        read List<long> {
+            (long)ScaleMethodPoint, (long)ScaleMethodPoint, (long)ScaleMethodMix, (long)ScaleMethodBox,
+            (long)ScaleMethodCatrom, (long)ScaleMethodLanczos3, (long)ScaleMethodLanczos2,
+            (long)ScaleMethodLanczos3, (long)ScaleMethodMitchell, (long)ScaleMethodPoint, (long)ScaleMethodMix,
+        })
+    clpAddType(ref g.clp, DimensionsType, 0, ParseUser, 0)
+    clpAddType(ref g.clp, PositionType, 0, ParseUser, 0)
+    clpAddType(ref g.clp, ScaleFactorType, 0, ParseUser, 0)
+    clpAddType(ref g.clp, FrameSpecType, 0, ParseUser, 0)
+    clpAddType(ref g.clp, ColorType, ClpDisallowOptions, ParseUser, 0)
+    clpAddType(ref g.clp, RectangleType, 0, ParseUser, 0)
+    clpAddType(ref g.clp, TwoColorsType, ClpDisallowOptions, ParseUser, 0)
+    clpSetOptionChar(ref g.clp, 0x2B, ClpShortNegated)
+}
+
+// ---- main ----
+
+void main(List<string> args) {
+    var g = newGt(args)
+    defineOptions(ref g)
+    g.frames = newFrameset(ref g)
+    initializeDefFrame(ref g)
+    g.gifWriteInfo = newCompressInfo()
+    g.defaultErrorHandler = HandlerGifsicle
+    exit((byte)gifsicleMain(ref g))
+}
+
+int gifsicleMain(ref Gt g) {
+    while true {
+        if g.msgs.stopping {
+            return 1
+        }
+        int opt = clpNext(ref g)
+        bool badOption = false
+        if opt == 0x62 {
+            _ = setMode(ref g, Batching)
+        } else if opt == 0x6D {
+            _ = setMode(ref g, Merging)
+        } else if opt == 0x65 {
+            _ = setMode(ref g, Exploding)
+            g.defFrame.explodeByName = false
+        } else if opt == 0x45 {
+            _ = setMode(ref g, Exploding)
+            g.defFrame.explodeByName = true
+        } else if opt == InfoOpt {
+            if g.clp.negated {
+                g.infoing = 0
+            } else if g.infoing == 1 {
+                // switch between infoing == 1 (suppress regular output) and 2 (don't suppress)
+                g.infoing = 2
+            } else {
+                g.infoing = 1
+            }
+        } else if opt == ColorInfoOpt || opt == ExtensionInfoOpt || opt == SizeInfoOpt {
+            int flag = InfoColormaps
+            if opt == ExtensionInfoOpt {
+                flag = InfoExtensions
+            } else if opt == SizeInfoOpt {
+                flag = InfoSizes
+            }
+            if g.clp.negated {
+                g.defFrame.infoFlags &= ~flag
+            } else {
+                g.defFrame.infoFlags |= flag
+                if g.infoing == 0 {
+                    g.infoing = 1
+                }
+            }
+        } else if opt == VerboseOpt {
+            g.msgs.verbosing = !g.clp.negated
+        } else if opt == DeleteOpt || opt == ReplaceOpt || opt == InsertOpt || opt == AppendOpt {
+            frameChangeDone(ref g)
+            setFrameChange(ref g, opt)
+        } else if opt == AlterDoneOpt {
+            frameChangeDone(ref g)
+        } else if opt == NameOpt && !g.clp.negated {
+            if changed(g.nextFrame, ChName) && gifExtensionListName(read g.defFrame.extensions) is not null {
+                redundantOptionWarning(ref g, read frameOptionType(ChName))
+            }
+            g.nextFrame |= 1 << ChName
+            var gfex = gifNewExtensionData(GifExName, "".asBytes(), g.clp.vstr.asBytes())
+            deleteMatchingExtensions(ref g.defFrame.extensions, NoexfName)
+            g.defFrame.extensions.add(gfex)
+            g.defFrame.frameNoExtensionsFlag |= NoexfName
+        } else if opt == NoNameOpt || opt == NameOpt {
+            markFrame(ref g, ChName)
+            g.defFrame.noExtensionsFlag |= NoexfName
+            g.defFrame.frameNoExtensionsFlag &= ~NoexfName
+            deleteMatchingExtensions(ref g.defFrame.extensions, NoexfName)
+        } else if opt == SameNameOpt {
+            g.defFrame.noExtensionsFlag &= ~NoexfName
+            g.defFrame.frameNoExtensionsFlag &= ~NoexfName
+            deleteMatchingExtensions(ref g.defFrame.extensions, NoexfName)
+        } else if opt == CommentOpt && !g.clp.negated {
+            markExtensionChange(ref g, NoexfComment)
+            g.defFrame.extensions.add(gifNewExtensionData(GifExComment, "".asBytes(), g.clp.vstr.asBytes()))
+        } else if opt == NoCommentsOpt || opt == CommentOpt {
+            g.defFrame.noExtensionsFlag |= NoexfComment
+            deleteMatchingExtensions(ref g.defFrame.extensions, NoexfComment)
+        } else if opt == SameCommentsOpt {
+            g.defFrame.noExtensionsFlag &= ~NoexfComment
+        } else if opt == 0x69 {
+            markFrame(ref g, ChInterlace)
+            if g.clp.negated {
+                g.defFrame.interlacing = 0
+            } else {
+                g.defFrame.interlacing = 1
+            }
+        } else if opt == SameInterlaceOpt {
+            g.defFrame.interlacing = -1
+        } else if opt == PositionOpt {
+            markFrame(ref g, ChPosition)
+            if g.clp.negated {
+                g.defFrame.left = 0
+                g.defFrame.top = 0
+            } else {
+                g.defFrame.left = g.clp.val.ints[0]
+                g.defFrame.top = g.clp.val.ints[1]
+            }
+        } else if opt == SamePositionOpt {
+            g.defFrame.left = -1
+            g.defFrame.top = -1
+        } else if opt == 0x74 {
+            markFrame(ref g, ChTransparent)
+            if g.clp.negated {
+                g.defFrame.transparent.haspixel = 255
+            } else {
+                var c = g.clp.val.cs[0]
+                g.defFrame.transparent = c
+                if c.haspixel != 0 {
+                    g.defFrame.transparent.haspixel = 2
+                } else {
+                    g.defFrame.transparent.haspixel = 1
+                }
+            }
+        } else if opt == SameTransparentOpt {
+            g.defFrame.transparent.haspixel = 0
+        } else if opt == BackgroundOpt {
+            markOutput(ref g, ChBackground)
+            if g.clp.negated {
+                g.defOutput.background.haspixel = 2
+                g.defOutput.background.pixel = 0
+            } else {
+                var c = g.clp.val.cs[0]
+                g.defOutput.background = c
+                if c.haspixel != 0 {
+                    g.defOutput.background.haspixel = 2
+                } else {
+                    g.defOutput.background.haspixel = 1
+                }
+            }
+        } else if opt == SameBackgroundOpt {
+            markOutput(ref g, ChBackground)
+            g.defOutput.background.haspixel = 0
+        } else if opt == MaxScreenOpt {
+            if g.clp.negated {
+                g.maxScreenWidth = GifMaxScreenWidth
+                g.maxScreenHeight = GifMaxScreenHeight
+            } else if g.clp.val.ints[0] <= 0 || g.clp.val.ints[1] <= 0 {
+                clpOptionError(ref g, "argument to %O must be a positive WxH", read List<string>())
+                badOption = true
+            } else {
+                g.maxScreenWidth = g.clp.val.ints[0]
+                g.maxScreenHeight = g.clp.val.ints[1]
+            }
+        } else if opt == LogicalScreenOpt {
+            markOutput(ref g, ChLogicalScreen)
+            if g.clp.negated {
+                g.defOutput.screenMode = -1
+                g.defOutput.screenWidth = 0
+                g.defOutput.screenHeight = 0
+            } else {
+                g.defOutput.screenMode = 1
+                g.defOutput.screenWidth = g.clp.val.ints[0]
+                g.defOutput.screenHeight = g.clp.val.ints[1]
+            }
+        } else if opt == SameLogicalScreenOpt {
+            markOutput(ref g, ChLogicalScreen)
+            g.defOutput.screenMode = 0
+            g.defOutput.screenWidth = -1
+            g.defOutput.screenHeight = -1
+        } else if opt == CropOpt && !g.clp.negated {
+            markFrame(ref g, ChCrop)
+            var crop = copyCrop(ref g, g.defFrame.crop)
+            g.crops[crop].specX = g.clp.val.ints[0]
+            g.crops[crop].specY = g.clp.val.ints[1]
+            g.crops[crop].specW = g.clp.val.ints[2]
+            g.crops[crop].specH = g.clp.val.ints[3]
+            g.defFrame.crop = crop
+        } else if opt == CropOpt || opt == SameCropOpt {
+            g.defFrame.crop = None
+        } else if opt == CropTransparencyOpt {
+            if !g.clp.negated {
+                var crop = copyCrop(ref g, g.defFrame.crop)
+                g.crops[crop].transparentEdges = true
+                g.defFrame.crop = crop
+            } else if g.defFrame.crop != None && g.crops[g.defFrame.crop].transparentEdges {
+                var crop = copyCrop(ref g, g.defFrame.crop)
+                g.crops[crop].transparentEdges = false
+                g.defFrame.crop = crop
+            }
+        } else if opt == NoExtensionsOpt {
+            g.defFrame.noExtensionsFlag |= NoexfGeneric | NoexfApp
+        } else if opt == NoAppExtensionsOpt {
+            g.defFrame.noExtensionsFlag |= NoexfApp
+        } else if opt == SameExtensionsOpt {
+            g.defFrame.noExtensionsFlag &= ~NoexfGeneric & ~NoexfApp
+        } else if opt == SameAppExtensionsOpt {
+            g.defFrame.noExtensionsFlag &= ~NoexfApp
+        } else if opt == ExtensionOpt {
+            if !handleExtension(ref g, false) {
+                badOption = true
+            }
+        } else if opt == AppExtensionOpt {
+            if !handleExtension(ref g, true) {
+                badOption = true
+            }
+        } else if opt == FlipHorizOpt {
+            markFrame(ref g, ChFlip)
+            g.defFrame.flipHorizontal = !g.clp.negated
+        } else if opt == FlipVertOpt {
+            markFrame(ref g, ChFlip)
+            g.defFrame.flipVertical = !g.clp.negated
+        } else if opt == NoFlipOpt {
+            g.defFrame.flipHorizontal = false
+            g.defFrame.flipVertical = false
+        } else if opt == NoRotateOpt {
+            g.defFrame.rotation = 0
+        } else if opt == Rotate90Opt {
+            markFrame(ref g, ChRotate)
+            g.defFrame.rotation = 1
+        } else if opt == Rotate180Opt {
+            markFrame(ref g, ChRotate)
+            g.defFrame.rotation = 2
+        } else if opt == Rotate270Opt {
+            markFrame(ref g, ChRotate)
+            g.defFrame.rotation = 3
+        } else if opt == 0x64 {
+            markFrame(ref g, ChDelay)
+            if g.clp.negated {
+                g.defFrame.delay = 0
+            } else if g.clp.val.i < 0 || g.clp.val.i > GifMaxDelay {
+                error(ref g, 0, "delay must be between 0 and 65535", read List<string>())
+            } else {
+                g.defFrame.delay = g.clp.val.i
+            }
+        } else if opt == SameDelayOpt {
+            g.defFrame.delay = -1
+        } else if opt == DisposalOpt {
+            markFrame(ref g, ChDisposal)
+            if g.clp.negated {
+                g.defFrame.disposal = GifDisposalNone
+            } else if g.clp.val.i < 0 || g.clp.val.i > 7 {
+                error(ref g, 0, "disposal must be between 0 and 7", read List<string>())
+            } else {
+                g.defFrame.disposal = g.clp.val.i
+            }
+        } else if opt == SameDisposalOpt {
+            g.defFrame.disposal = -1
+        } else if opt == 0x6C {
+            markOutput(ref g, ChLoopcount)
+            if g.clp.negated {
+                g.defOutput.loopcount = -1
+            } else if g.clp.haveVal && (g.clp.val.i < 0 || g.clp.val.i > 65535) {
+                error(ref g, 0, "loopcount must be between 0 and 65535", read List<string>())
+            } else if g.clp.haveVal {
+                g.defOutput.loopcount = g.clp.val.i
+            } else {
+                g.defOutput.loopcount = 0
+            }
+        } else if opt == SameLoopcountOpt {
+            markOutput(ref g, ChLoopcount)
+            g.defOutput.loopcount = -2
+        } else if opt == OptimizeOpt {
+            g.nextOutput |= 1 << ChOptimize
+            int o = 1
+            if g.clp.negated || (g.clp.haveVal && g.clp.val.i < 0) {
+                o = 0
+            } else if g.clp.haveVal {
+                o = g.clp.val.i
+            }
+            if o > GtOptMask && (o & 1) != 0 {
+                g.defOutput.optimizing |= o - 1
+            } else if o > GtOptMask {
+                g.defOutput.optimizing &= ~o
+            } else {
+                g.defOutput.optimizing = (g.defOutput.optimizing & ~GtOptMask) | o
+            }
+        } else if opt == UnoptimizeOpt {
+            g.nextInput |= 1 << ChUnoptimize
+            g.unoptimizing = !g.clp.negated
+        } else if opt == ThreadsOpt {
+            if g.clp.negated {
+                g.threadCount = 0
+            } else if g.clp.haveVal {
+                if g.clp.val.u > 128 {
+                    g.threadCount = 128
+                } else {
+                    g.threadCount = (int)g.clp.val.u
+                }
+            } else {
+                g.threadCount = GifsicleDefaultThreadCount
+            }
+        } else if opt == CarefulOpt {
+            if g.clp.negated {
+                g.gifWriteInfo.flags = 0
+            } else {
+                g.gifWriteInfo.flags = GifWriteCarefulMinCodeSize | GifWriteEagerClear
+            }
+        } else if opt == ChangeColorOpt {
+            g.nextInput |= 1 << ChChangeColor
+            if g.clp.negated {
+                deleteColorTransforms(ref g.inputTransforms, 1)
+            } else if g.clp.val.cs[1].haspixel != 0 {
+                error(ref g, 0, "COLOR2 must be in RGB format in %<--change-color COLOR1 COLOR2%>", read List<string>())
+            } else {
+                g.inputTransforms.add(ColorTransform { kind = 1, from = g.clp.val.cs[0], to = g.clp.val.cs[1], command = "" })
+            }
+        } else if opt == ColorTransformOpt {
+            g.nextOutput |= 1 << ChColorTransform
+            if g.clp.negated {
+                deleteColorTransforms(ref g.outputTransforms, 2)
+            } else {
+                g.outputTransforms.add(ColorTransform { kind = 2, from = noColor(), to = noColor(), command = g.clp.vstr.clone() })
+            }
+        } else if opt == ColormapOpt {
+            markOutput(ref g, ChColormap)
+            if g.clp.negated {
+                g.defOutput.colormapSize = 0
+            } else {
+                g.defOutput.colormapSize = g.clp.val.i
+                if g.defOutput.colormapSize < 2 || g.defOutput.colormapSize > 256 {
+                    clpOptionError(ref g, "argument to %O must be between 2 and 256", read List<string>())
+                    badOption = true
+                }
+            }
+        } else if opt == GrayOpt {
+            markOutput(ref g, ChUseColormap)
+            gifDeleteColormap(ref g, g.defOutput.colormapFixed)
+            setNewFixedColormap(ref g, "gray", false)
+        } else if opt == UseColormapOpt || opt == UseExactColormapOpt {
+            markOutput(ref g, ChUseColormap)
+            gifDeleteColormap(ref g, g.defOutput.colormapFixed)
+            if g.clp.negated {
+                g.defOutput.colormapFixed = None
+            } else {
+                var name = g.clp.vstr.clone()
+                setNewFixedColormap(ref g, read name, opt == UseExactColormapOpt)
+            }
+        } else if opt == ColormapAlgorithmOpt {
+            markOutput(ref g, ChColormapMethod)
+            g.defOutput.colormapAlgorithm = g.clp.val.i
+        } else if opt == DitherOpt {
+            string name = "default"
+            if g.clp.negated {
+                name = "none"
+            } else if g.clp.haveVal {
+                name = g.clp.val.s.clone()
+            }
+            if name == "posterize" {
+                name = "none"
+            }
+            if name != g.defOutput.ditherName && (name == "none" || g.defOutput.ditherName != "default") {
+                markOutput(ref g, ChDither)
+            }
+            g.nextOutput |= 1 << ChDither
+            if setDitherType(ref g.defOutput, read name) < 0 {
+                clpOptionError(ref g, "%<%s%> is not a valid dither", read List<string> { name.clone() })
+                badOption = true
+            } else {
+                g.defOutput.ditherName = name
+            }
+        } else if opt == GammaOpt {
+            if g.clp.negated {
+                markOutput(ref g, ChGamma)
+                g.defOutput.colormapGammaType = KcGammaNumeric
+                g.defOutput.colormapGamma = 1.0
+            } else {
+                var s = g.clp.val.s.clone()
+                var lower = s.toLower()
+                if s.asBytes().length() == 4 && lower == "srgb" {
+                    markOutput(ref g, ChGamma)
+                    g.defOutput.colormapGammaType = KcGammaSrgb
+                } else if s.asBytes().length() == 5 && lower == "oklab" {
+                    markOutput(ref g, ChGamma)
+                    g.defOutput.colormapGammaType = KcGammaOklab
+                } else {
+                    var d = strtodDecimal(s.asBytes(), 0)
+                    if d.end != 0 && d.end >= s.asBytes().length() && d.value > 0.0 && d.value.isFinite() {
+                        markOutput(ref g, ChGamma)
+                        g.defOutput.colormapGammaType = KcGammaNumeric
+                        g.defOutput.colormapGamma = d.value
+                    } else {
+                        clpOptionError(ref g, "invalid gamma %<%s%> (want srgb or a positive number)", read List<string> { s.clone() })
+                        badOption = true
+                    }
+                }
+            }
+        } else if opt == ResizeOpt || opt == ResizeFitOpt || opt == ResizeTouchOpt {
+            markOutput(ref g, ChResize)
+            if g.clp.negated {
+                g.defOutput.scaling = GtScalingNone
+            } else if g.clp.val.ints[0] <= 0 && g.clp.val.ints[1] <= 0 {
+                error(ref g, 0, "one of W and H must be positive in %<%s WxH%>", read List<string> { clpCurOptionName(read g.clp) })
+                g.defOutput.scaling = GtScalingNone
+            } else {
+                g.defOutput.scaling = GtScalingResize
+                g.defOutput.resizeWidth = g.clp.val.ints[0]
+                g.defOutput.resizeHeight = g.clp.val.ints[1]
+                g.defOutput.resizeFlags = 0
+                if opt != ResizeOpt {
+                    g.defOutput.resizeFlags |= GtResizeFit
+                }
+                if opt == ResizeFitOpt {
+                    g.defOutput.resizeFlags |= GtResizeFitDown
+                }
+            }
+        } else if opt == ResizeWidthOpt || opt == ResizeHeightOpt || opt == ResizeFitWidthOpt || opt == ResizeFitHeightOpt ||
+            opt == ResizeTouchWidthOpt || opt == ResizeTouchHeightOpt {
+            markOutput(ref g, ChResize)
+            if g.clp.negated {
+                g.defOutput.scaling = GtScalingNone
+            } else if g.clp.val.u > 65535 {
+                error(ref g, 0, "%s argument must be at most 65535", read List<string> { clpCurOptionName(read g.clp) })
+            } else if g.clp.val.u == 0 {
+                error(ref g, 0, "%s argument must be positive", read List<string> { clpCurOptionName(read g.clp) })
+                g.defOutput.scaling = GtScalingNone
+            } else {
+                var dimen = int[2] { 0, 0 }
+                if opt == ResizeHeightOpt || opt == ResizeFitHeightOpt {
+                    dimen[1] = (int)g.clp.val.u
+                } else {
+                    dimen[0] = (int)g.clp.val.u
+                }
+                g.defOutput.scaling = GtScalingResize
+                g.defOutput.resizeWidth = dimen[0]
+                g.defOutput.resizeHeight = dimen[1]
+                g.defOutput.resizeFlags = 0
+                if opt != ResizeWidthOpt && opt != ResizeHeightOpt {
+                    g.defOutput.resizeFlags |= GtResizeFit
+                }
+                if opt == ResizeFitWidthOpt || opt == ResizeFitHeightOpt {
+                    g.defOutput.resizeFlags |= GtResizeFitDown
+                }
+            }
+        } else if opt == ScaleOpt {
+            markOutput(ref g, ChResize)
+            if g.clp.negated {
+                g.defOutput.scaling = GtScalingNone
+            } else if g.clp.val.ds[0] <= 0.0 || g.clp.val.ds[1] <= 0.0 {
+                error(ref g, 0, "%s X and Y factors must be positive", read List<string> { clpCurOptionName(read g.clp) })
+                g.defOutput.scaling = GtScalingNone
+            } else {
+                g.defOutput.scaling = GtScalingScale
+                g.defOutput.scaleX = g.clp.val.ds[0]
+                g.defOutput.scaleY = g.clp.val.ds[1]
+                g.defOutput.resizeFlags = 0
+            }
+        } else if opt == ResizeGeometryOpt {
+            markOutput(ref g, ChResize)
+            if g.clp.negated {
+                g.defOutput.scaling = GtScalingNone
+            } else {
+                var s = g.clp.val.s.clone()
+                if !parseResizeGeometryOpt(ref g, read s) {
+                    badOption = true
+                }
+            }
+        } else if opt == ResizeMethodOpt {
+            markOutput(ref g, ChResizeMethod)
+            g.defOutput.scaleMethod = g.clp.val.i
+        } else if opt == ResizeColorsOpt {
+            markOutput(ref g, ChScaleColors)
+            if g.clp.negated {
+                g.defOutput.scaleColors = 0
+            } else {
+                g.defOutput.scaleColors = g.clp.val.i
+            }
+            if g.defOutput.scaleColors < 0 {
+                error(ref g, 0, "%s must be nonnegative", read List<string> { clpCurOptionName(read g.clp) })
+                g.defOutput.scaleColors = 0
+            } else if g.defOutput.scaleColors > 256 {
+                error(ref g, 0, "%s can be at most 256", read List<string> { clpCurOptionName(read g.clp) })
+                g.defOutput.scaleColors = 256
+            }
+        } else if opt == LossyOpt {
+            if g.clp.haveVal && g.clp.val.i < 0 {
+                error(ref g, 0, "%s must be nonnegative", read List<string> { clpCurOptionName(read g.clp) })
+            } else if g.clp.haveVal {
+                g.gifWriteInfo.loss = g.clp.val.i
+            } else {
+                g.gifWriteInfo.loss = 20
+            }
+        } else if opt == NoWarningsOpt {
+            g.msgs.noWarnings = !g.clp.negated
+        } else if opt == WarningsOpt {
+            g.msgs.noWarnings = g.clp.negated
+        } else if opt == IgnoreErrorsOpt {
+            g.msgs.noIgnoreErrors = g.clp.negated
+        } else if opt == ConserveMemoryOpt {
+            markOutput(ref g, ChMemory)
+            if g.clp.negated {
+                g.defOutput.conserveMemory = -1
+            } else {
+                g.defOutput.conserveMemory = 1
+            }
+        } else if opt == MultifileOpt {
+            if g.clp.negated {
+                g.gifReadFlags &= ~GifReadTrailingGarbageOk
+            } else {
+                g.gifReadFlags |= GifReadTrailingGarbageOk
+                g.nextfile = false
+            }
+        } else if opt == NextfileOpt {
+            if g.clp.negated {
+                g.gifReadFlags &= ~GifReadTrailingGarbageOk
+            } else {
+                g.gifReadFlags |= GifReadTrailingGarbageOk
+                g.nextfile = true
+            }
+        } else if opt == VersionOpt {
+            var s = $"LCDF Gifsicle {Version}\nCopyright (C) 1997-2025 Eddie Kohler\nThis is free software; see the source for copying conditions.\nThere is NO warranty, not even for merchantability or fitness for a\nparticular purpose.\n".toString()
+            writeOutput(ref g, s.asBytes())
+            return 0
+        } else if opt == HelpOpt {
+            usage(ref g)
+            return 0
+        } else if opt == OutputOpt {
+            markOutput(ref g, ChOutput)
+            if g.clp.vstr == "-" {
+                g.defOutput.hasOutputName = false
+                g.defOutput.outputName = ""
+            } else {
+                g.defOutput.hasOutputName = true
+                g.defOutput.outputName = g.clp.vstr.clone()
+            }
+        } else if opt == ClpNotOption {
+            var arg = g.clp.vstr.clone()
+            int fa = 0
+            if arg.startsWith("#") {
+                fa = frameArgument(ref g, read arg)
+            }
+            if fa < 0 {
+                badOption = true
+            } else if fa == 0 {
+                inputDone(ref g)
+                inputStream(ref g, read arg)
+            }
+        } else if opt == ClpDone {
+            break
+        } else if opt == ClpBadOption {
+            badOption = true
+        }
+        if badOption {
+            shortUsage(ref g)
+            return 1
+        }
+    }
+
+    if g.nextOutput != 0 {
+        combineOutputOptions(ref g)
+    }
+    if g.filesGiven == 0 {
+        inputStream(ref g, null)
+    }
+    if g.msgs.stopping {
+        return 1
+    }
+    frameChangeDone(ref g)
+    inputDone(ref g)
+    if (g.mode == Merging && g.msgs.errorCount == 0) || g.mode == Infoing {
+        outputFrames(ref g)
+    }
+    verboseEndline(ref g)
+    printUselessOptions(ref g, "frame", g.nextFrame, 0)
+    printUselessOptions(ref g, "input", g.nextInput, 1)
+    if g.anyOutputSuccessful {
+        printUselessOptions(ref g, "output", g.activeNextOutput, 2)
+    }
+    if g.msgs.errorCount != 0 {
+        return 1
+    }
+    return 0
+}
+
+string optionTypeName(int kind, int i) {
+    if kind == 0 {
+        return frameOptionType(i)
+    } else if kind == 1 {
+        return inputOptionType(i)
+    }
+    return outputOptionType(i)
+}

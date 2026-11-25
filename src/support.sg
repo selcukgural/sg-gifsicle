@@ -1,0 +1,1073 @@
+// support.sg - Support functions for gifsicle (support.c): messages, information about GIFs,
+// the parsers of option values, colormap files, and frames merged into an output stream.
+// Copyright (C) 1997-2025 Eddie Kohler, ekohler@gmail.com
+// SG translation of gifsicle 1.99. This file is part of sg-gifsicle.
+//
+// Gifsicle is free software. It is distributed under the GNU Public License, version 2; you can
+// copy, distribute, or alter it at will, as long as this notice is kept intact and this source
+// code is made available. There is no warranty, express or implied.
+
+const string ProgramName = "gifsicle"
+
+// ---- messages ----
+
+// A message, as gifsicle writes it: `fmt` is CLP's (`%s` and `%d` take `args` in turn).
+void verror(ref Gt g, read string? landmark0, int needFile, int seriousness, read string fmt, read List<string> args) {
+    if fmt.length() == 0 {
+        return
+    }
+    string landmark = ""
+    if landmark0 is not null {
+        landmark = landmark0.clone()
+    } else if needFile != 0 && g.activeOutput.hasActiveOutputName && g.mode != BlankMode && g.mode != Merging && g.nestedMode != Merging {
+        landmark = g.activeOutput.activeOutputName.clone()
+    }
+    var x = List<byte>()
+    x.addAll(ProgramName.asBytes())
+    x.add(0x3A)
+    x.addAll(landmark.asBytes())
+    if landmark.length() > 0 {
+        x.add(0x3A)
+    }
+    if seriousness > 2 {
+        x.addAll(" fatal error: ".asBytes())
+    } else if seriousness == 1 {
+        x.addAll(" warning: ".asBytes())
+    } else {
+        x.add(0x20)
+    }
+    var buf = List<byte>()
+    clpBuild(read g.clp, ref buf, fmt, args)
+    // C builds the message in BUFSIZ bytes
+    while buf.length() > messageBufSize() - 1 {
+        _ = buf.removeLast()
+    }
+    if buf.length() + 1 < messageBufSize() && (buf.length() == 0 || buf[buf.length() - 1] != 0x0A) {
+        buf.add(0x0A)
+    }
+    x.addAll(read buf)
+    while x.length() > messageBufSize() {
+        _ = x.removeLast()
+    }
+    if seriousness == 1 && g.msgs.noWarnings {
+        return
+    } else if seriousness > 1 {
+        g.msgs.errorCount += 1
+    }
+    verboseEndline(ref g)
+    writeError(read x)
+}
+
+void writeError(read byte[] bytes) {
+    _ = Stderr.writeBytes(bytes)
+    _ = Stderr.flush()
+}
+
+void fatalError(ref Gt g, read string fmt, read List<string> args) {
+    verror(ref g, null, 0, 3, fmt, args)
+    exit(1)
+}
+
+// A fatal error without exiting: the caller returns promptly, and gifsicle stops.
+void stopError(ref Gt g, read string fmt, read List<string> args) {
+    verror(ref g, null, 0, 3, fmt, args)
+    g.msgs.stopping = true
+}
+
+void lerror(ref Gt g, read string? landmark, read string fmt, read List<string> args) {
+    verror(ref g, landmark, 2, 2, fmt, args)
+}
+
+void error(ref Gt g, int needFile, read string fmt, read List<string> args) {
+    verror(ref g, null, needFile, 2, fmt, args)
+}
+
+void lwarning(ref Gt g, read string? landmark, read string fmt, read List<string> args) {
+    verror(ref g, landmark, 2, 1, fmt, args)
+}
+
+void warning(ref Gt g, int needFile, read string fmt, read List<string> args) {
+    verror(ref g, null, needFile, 1, fmt, args)
+}
+
+void contextMessage(ref Gt g, int needFile, read string fmt, read List<string> args) {
+    verror(ref g, null, needFile, 0, fmt, args)
+}
+
+void clpErrorHandler(ref Gt g, read byte[] message) {
+    verboseEndline(ref g)
+    writeError(message)
+}
+
+void shortUsage(ref Gt g) {
+    var q0 = clpQuoteChar(read g.clp, false)
+    var q1 = clpQuoteChar(read g.clp, true)
+    var s = $"Usage: {ProgramName} [OPTION | FILE | FRAME]...\nTry {q0}{ProgramName} --help{q1} for more information.\n".toString()
+    writeError(s.asBytes())
+}
+
+void usage(ref Gt g) {
+    var q0 = clpQuoteChar(read g.clp, false)
+    var q1 = clpQuoteChar(read g.clp, true)
+    var s = string.withCapacity(6000)
+    s.write("Gifsicle manipulates GIF images. Its most common uses include combining\n")
+    s.write("single images into animations, adding transparency, optimizing animations for\n")
+    s.write("space, and printing information about GIFs.\n\n")
+    s.write($"Usage: {ProgramName} [OPTION | FILE | FRAME]...\n\n")
+    s.write("Mode options (at most one, before any filenames):\n")
+    s.write("  -m, --merge                   Merge mode: combine inputs, write stdout\n")
+    s.write("  -b, --batch                   Batch mode: modify inputs, write back to\n")
+    s.write("                                same filenames\n")
+    s.write("  -e, --explode                 Explode mode: write N files for each input,\n")
+    s.write($"                                one per frame, to {q0}input.frame-number{q1}\n")
+    s.write($"  -E, --explode-by-name         Explode mode, but write {q0}input.name{q1}\n\n")
+    s.write("General options (also --no-OPTION for info and verbose):\n")
+    s.write("  -I, --info                    Print info about input GIFs\n")
+    s.write("  -I -I                         Print info to standard error; do not suppress\n")
+    s.write("                                normal output\n")
+    s.write("  --color-info, --cinfo         --info plus colormap details\n")
+    s.write("  --extension-info, --xinfo     --info plus extension details\n")
+    s.write("  --size-info, --sinfo          --info plus compression information\n")
+    s.write("  -V, --verbose                 Print progress (files read and written)\n")
+    s.write("  -h, --help                    Print this message and exit\n")
+    s.write("  --version                     Print version number and exit\n")
+    s.write("  -o, --output FILE             Write output to FILE\n")
+    s.write($"  -w, --no-warnings             Don{q1}t report warnings\n")
+    s.write("  --no-ignore-errors            Quit on very erroneous input GIFs\n")
+    s.write("  --max-screen WxH              Reject logical screens bigger than WxH\n")
+    s.write("                                [16384x16384]\n")
+    s.write("  --conserve-memory             Conserve memory at the expense of speed\n")
+    s.write("  --nextfile, --multifile       Support concatenated GIF files\n\n")
+    s.write("Frame selections:               #num, #num1-num2, #num1-, #name\n\n")
+    s.write("Frame change options:\n")
+    s.write("  --delete FRAMES               Delete FRAMES from input\n")
+    s.write("  --insert-before FRAME GIFS    Insert GIFS before FRAMES in input\n")
+    s.write("  --append GIFS                 Append GIFS to input\n")
+    s.write("  --replace FRAMES GIFS         Replace FRAMES with GIFS in input\n")
+    s.write("  --done                        Done with frame changes\n\n")
+    s.write("Image options (also --no-OPTION and --same-OPTION):\n")
+    s.write("  -B, --background COL          Make COL the background color\n")
+    s.write("  --crop X,Y+WxH, --crop X,Y-X2,Y2\n")
+    s.write("                                Crop the image\n")
+    s.write("  --crop-transparency           Crop transparent borders off the image\n")
+    s.write("  --flip-horizontal, --flip-vertical\n")
+    s.write("                                Flip the image\n")
+    s.write("  -i, --interlace               Turn on interlacing\n")
+    s.write("  -S, --logical-screen WxH      Set logical screen to WxH\n")
+    s.write("  -p, --position X,Y            Set frame position to (X,Y)\n")
+    s.write("  --rotate-90, --rotate-180, --rotate-270, --no-rotate\n")
+    s.write("                                Rotate the image\n")
+    s.write("  -t, --transparent COL         Make COL transparent\n\n")
+    s.write("Extension options:\n")
+    s.write("  --app-extension N D           Add an app extension named N with data D\n")
+    s.write("  -c, --comment TEXT            Add a comment before the next frame\n")
+    s.write("  --extension N D           Add an extension number N with data D\n")
+    s.write($"  -n, --name TEXT               Set next frame{q1}s name\n")
+    s.write("  --no-comments, --no-names, --no-extensions\n")
+    s.write("                                Remove comments (names, extensions) from input\n")
+    s.write("Animation options (also --no-OPTION and --same-OPTION):\n")
+    s.write("  -d, --delay TIME              Set frame delay to TIME (in 1/100sec)\n")
+    s.write("  -D, --disposal METHOD         Set frame disposal to METHOD\n")
+    s.write("  -l, --loopcount[=N]           Set loop extension to N (default forever)\n")
+    s.write("  -O, --optimize[=LEVEL]        Optimize output GIFs\n")
+    s.write("  -U, --unoptimize              Unoptimize input GIFs\n")
+    s.write("  -j, --threads[=THREADS]       Use multiple threads to improve speed\n")
+    s.write("\nWhole-GIF options (also --no-OPTION):\n")
+    s.write("  --careful                     Write larger GIFs that avoid bugs in other\n")
+    s.write("                                programs\n")
+    s.write("  --change-color COL1 COL2      Change COL1 to COL2 throughout\n")
+    s.write("  -k, --colors N                Reduce the number of colors to N\n")
+    s.write("  --color-method METHOD         Set method for choosing reduced colors\n")
+    s.write("  -f, --dither                  Dither image after changing colormap\n")
+    s.write("  --gamma G                     Set gamma for color reduction [2.2]\n")
+    s.write("  --lossy[=LOSSINESS]           Alter image colors to shrink output file size\n")
+    s.write("                                at the cost of artifacts and noise\n")
+    s.write("  --resize WxH                  Resize the output GIF to WxH\n")
+    s.write("  --scale XFACTOR[xYFACTOR]     Scale the output GIF by XFACTORxYFACTOR\n")
+    s.write("  --resize-width W              Resize to width W and proportional height\n")
+    s.write("  --resize-height H             Resize to height H and proportional width\n")
+    s.write("  --resize-fit WxH              Shrink to fit WxH, preserving aspect ratio\n")
+    s.write("  --resize-touch WxH            Resize to touch WxH, preserving aspect ratio\n")
+    s.write("  --resize-geometry GEOM        Resize to a geometry specification\n")
+    s.write("  --resize-method METHOD        Set resizing method\n")
+    s.write("  --resize-colors N             Resize can add new colors up to N\n")
+    s.write("  --transform-colormap CMD      Transform each output colormap by shell CMD\n")
+    s.write("  --use-colormap CMAP           Output GIF uses colors from CMAP, which can\n")
+    s.write($"                                be {q1}web{q0}, {q1}gray{q0}, {q1}bw{q0}, or a GIF file\n")
+    s.write("  --use-exact-colormap CMAP     Same, but use CMAP as is (not a subset)\n")
+    s.write("  --gray                        Same as --use-colormap gray\n\n")
+    s.write("Report bugs to <ekohler@gmail.com>.\n")
+    s.write($"Too much information? Try {q0}{ProgramName} --help | less{q1}.\n")
+    writeOutput(ref g, s.asBytes())
+}
+
+void verboseOpen(ref Gt g, int open, read string name) {
+    var s = List<byte>()
+    nint l = name.asBytes().length()
+    if g.msgs.verbosePos != 0 && (nint)g.msgs.verbosePos + 3 + l > 79 {
+        s.add(0x0A)
+        g.msgs.verbosePos = 0
+    }
+    if g.msgs.verbosePos != 0 {
+        s.add(0x20)
+        g.msgs.verbosePos += 1
+    }
+    s.add((byte)open)
+    s.addAll(name.asBytes())
+    g.msgs.verbosePos += 1 + (int)l
+    _ = Stderr.writeBytes(read s)
+}
+
+void verboseClose(ref Gt g, int close) {
+    var s = List<byte> { (byte)close }
+    _ = Stderr.writeBytes(read s)
+    g.msgs.verbosePos += 1
+}
+
+void verboseEndline(ref Gt g) {
+    if g.msgs.verbosePos != 0 {
+        _ = Stderr.write("\n")
+        _ = Stderr.flush()
+        g.msgs.verbosePos = 0
+    }
+}
+
+// ---- information ----
+
+string debugColorStr(Color c) {
+    return $"#{c.red:X2}{c.green:X2}{c.blue:X2}".toString()
+}
+
+void safePuts(ref List<byte> out, read byte[] s) {
+    nint len = s.length()
+    nint i = 0
+    while i < len {
+        byte b = s[i]
+        if b < 0x20 || b >= 0x7F || b == 0x5C {
+            if b == 7 {
+                out.addAll("\\a".asBytes())
+            } else if b == 8 {
+                out.addAll("\\b".asBytes())
+            } else if b == 12 {
+                out.addAll("\\f".asBytes())
+            } else if b == 10 {
+                out.addAll("\\n".asBytes())
+            } else if b == 13 {
+                out.addAll("\\r".asBytes())
+            } else if b == 9 {
+                out.addAll("\\t".asBytes())
+            } else if b == 11 {
+                out.addAll("\\v".asBytes())
+            } else if b == 0x5C {
+                out.addAll("\\\\".asBytes())
+            } else if b == 0 {
+                if len - i > 1 {
+                    out.addAll("\\000".asBytes())
+                }
+            } else {
+                out.add(0x5C)
+                out.add(0x30 + ((b >> 6) & 7))
+                out.add(0x30 + ((b >> 3) & 7))
+                out.add(0x30 + (b & 7))
+            }
+        } else {
+            out.add(b)
+        }
+        i += 1
+    }
+}
+
+void putText(ref List<byte> out, read string s) {
+    out.addAll(s.asBytes())
+}
+
+void colormapInfo(ref List<byte> out, read Colormap gfcm, read string prefix) {
+    int ncol = gfcm.ncol
+    int nrows = ((ncol - 1) / 4) + 1
+    for j in 0..nrows {
+        int which = j
+        putText(ref out, prefix)
+        int i = 0
+        while i < 4 && which < ncol {
+            if i != 0 {
+                putText(ref out, "    ")
+            }
+            var c = gfcm.col[(nint)which]
+            putText(ref out, read $" {which,3}: #{c.red:X2}{c.green:X2}{c.blue:X2}".toString())
+            i += 1
+            which += nrows
+        }
+        out.add(0x0A)
+    }
+}
+
+void commentInfo(ref List<byte> out, read Extension gfex, read string prefix) {
+    putText(ref out, prefix)
+    safePuts(ref out, read gfex.data)
+    out.add(0x0A)
+}
+
+void extensionInfo(ref List<byte> out, read Extension gfex, read string prefix, read string hexprefix) {
+    putText(ref out, read $"{prefix}extension ".toString())
+    if gfex.kind == GifExApp {
+        putText(ref out, "app '")
+        safePuts(ref out, read gfex.appname)
+        putText(ref out, "'")
+    } else {
+        if gfex.kind >= 32 && gfex.kind < 127 {
+            putText(ref out, read $"'{(char)gfex.kind}' (0x{gfex.kind:X2})".toString())
+        } else {
+            putText(ref out, read $"0x{gfex.kind:X2}".toString())
+        }
+    }
+    if gfex.packetized {
+        putText(ref out, " packetized")
+    }
+    putText(ref out, "\n")
+    // Now, hexl the data.
+    nint len = gfex.data.length()
+    nint pos = 0
+    while len > 0 {
+        nint row = 16
+        if row > len {
+            row = len
+        }
+        putText(ref out, read $"{hexprefix}{(uint)pos:x8}: ".toString())
+        nint i = 0
+        while i < row {
+            if i + 1 >= row {
+                putText(ref out, read $"{gfex.data[pos + i]:x2}   ".toString())
+            } else {
+                putText(ref out, read $"{gfex.data[pos + i]:x2}{gfex.data[pos + i + 1]:x2} ".toString())
+            }
+            i += 2
+        }
+        while i < 16 {
+            putText(ref out, "     ")
+            i += 2
+        }
+        out.add(0x20)
+        for k in 0..row {
+            byte d = gfex.data[pos + k]
+            if d >= 0x20 && d < 127 {
+                out.add(d)
+            } else {
+                out.add(0x2E)
+            }
+        }
+        out.add(0x0A)
+        pos += row
+        len -= row
+    }
+}
+
+void streamInfo(ref Gt g, ref List<byte> out, nint gfs, read string? filename, int flags) {
+    if gfs == None {
+        return
+    }
+    verboseEndline(ref g)
+    string name = "<stdin>"
+    if filename is not null {
+        name = filename.clone()
+    }
+    int n = gifImageCount(read g, gfs)
+    string plural = "s"
+    if n == 1 {
+        plural = ""
+    }
+    out.addAll("* ".asBytes())
+    out.addAll(name.asBytes())
+    putText(ref out, read $" {n} image{plural}\n".toString())
+    putText(ref out, read $"  logical screen {g.streams[gfs].screenWidth}x{g.streams[gfs].screenHeight}\n".toString())
+    nint global = g.streams[gfs].global
+    if global != None {
+        putText(ref out, read $"  global color table [{g.colormaps[global].ncol}]\n".toString())
+        if (flags & InfoColormaps) != 0 {
+            colormapInfo(ref out, read g.colormaps[global], "  |")
+        }
+        putText(ref out, read $"  background {g.streams[gfs].background}\n".toString())
+    }
+    if g.streams[gfs].loopcount == 0 {
+        putText(ref out, "  loop forever\n")
+    } else if g.streams[gfs].loopcount > 0 {
+        putText(ref out, read $"  loop count {(uint)g.streams[gfs].loopcount}\n".toString())
+    }
+    int k = 0
+    for gfex in read g.streams[gfs].endExtensions {
+        if gfex.kind == GifExComment {
+            commentInfo(ref out, gfex, "  end comment ")
+        } else if (flags & InfoExtensions) != 0 {
+            extensionInfo(ref out, gfex, "  end ", "    ")
+        } else {
+            k += 1
+        }
+    }
+    if k != 0 {
+        putText(ref out, read $"  end extensions {k}\n".toString())
+    }
+}
+
+string disposalName(int d) {
+    return match d {
+        0 => "none"
+        1 => "asis"
+        2 => "background"
+        3 => "previous"
+        _ => $"{d}".toString()
+    }
+}
+
+void imageInfo(ref Gt g, ref List<byte> out, nint gfs, nint gfi, int flags) {
+    if gfs == None || gfi == None {
+        return
+    }
+    int num = gifImageNumber(read g, gfs, gfi)
+    verboseEndline(ref g)
+    putText(ref out, read $"  + image #{num} ".toString())
+    var name = gifImageName(read g, gfi)
+    if name is not null {
+        out.add(0x23)
+        out.addAll(cString(read name))
+        out.add(0x20)
+    }
+    putText(ref out, read $"{g.images[gfi].width}x{g.images[gfi].height}".toString())
+    if g.images[gfi].left != 0 || g.images[gfi].top != 0 {
+        putText(ref out, read $" at {g.images[gfi].left},{g.images[gfi].top}".toString())
+    }
+    if g.images[gfi].interlace != 0 {
+        putText(ref out, " interlaced")
+    }
+    if g.images[gfi].transparent >= 0 {
+        putText(ref out, read $" transparent {g.images[gfi].transparent}".toString())
+    }
+    putText(ref out, "\n")
+    if (flags & InfoSizes) != 0 && g.images[gfi].hasCompressed {
+        putText(ref out, read $"    compressed size {g.images[gfi].compressed.length()}\n".toString())
+    }
+    int nex = 0
+    for gfex in read g.images[gfi].extensions {
+        if gfex.kind == GifExComment {
+            commentInfo(ref out, gfex, "    comment ")
+        } else if gfex.kind != GifExName {
+            if (flags & InfoExtensions) != 0 {
+                extensionInfo(ref out, gfex, "    ", "      ")
+            } else {
+                nex += 1
+            }
+        }
+    }
+    if nex != 0 {
+        putText(ref out, read $"    extensions {nex}\n".toString())
+    }
+    nint local = g.images[gfi].local
+    if local != None {
+        putText(ref out, read $"    local color table [{g.colormaps[local].ncol}]\n".toString())
+        if (flags & InfoColormaps) != 0 {
+            colormapInfo(ref out, read g.colormaps[local], "    |")
+        }
+    }
+    int disposal = (int)g.images[gfi].disposal
+    int delay = (int)g.images[gfi].delay
+    if disposal != 0 || delay != 0 {
+        putText(ref out, "   ")
+        if disposal != 0 {
+            putText(ref out, read $" disposal {disposalName(disposal)}".toString())
+        }
+        if delay != 0 {
+            putText(ref out, read $" delay {delay / 100}.{delay % 100:D2}s".toString())
+        }
+        putText(ref out, "\n")
+    }
+}
+
+// The output filename for an exploded frame.
+string explodeFilename(read string filename, int number, read List<byte>? name, int maxNimages) {
+    var s = List<byte>()
+    s.addAll(filename.asBytes())
+    s.add(0x2E)
+    if name is not null {
+        s.addAll(cString(read name))
+    } else if maxNimages <= 1000 {
+        s.addAll($"{number:D3}".toString().asBytes())
+    } else {
+        int digits = 4
+        uint j = 10000
+        uint max = 0
+        if maxNimages >= 0 {
+            max = (uint)maxNimages
+        }
+        while max > j {
+            digits += 1
+            j *= 10
+        }
+        s.addAll(zeroPadded(number, digits).asBytes())
+    }
+    return stringOf(read s)
+}
+
+// printf's "%0*d".
+string zeroPadded(int number, int digits) {
+    var t = $"{number}".toString()
+    bool neg = number < 0
+    var body = t.clone()
+    if neg {
+        body = t[1..].clone()
+    }
+    var out = string.withCapacity(16)
+    if neg {
+        out.write('-')
+    }
+    nint width = (nint)digits
+    if neg {
+        width -= 1
+    }
+    nint pad = width - body.length()
+    for _ in 0..pad {
+        out.write('0')
+    }
+    out.write(read body)
+    return out
+}
+
+// ---- parsing ----
+
+// strtol(s, 10), clamped to +/-INT_MAX so out-of-range numbers are reported as out of range.
+int strtolFrame(read byte[] s, ref nint at) {
+    var n = cStrtoNum(s, at, 10, true)
+    at = n.end
+    if n.l > (long)int.MaxValue {
+        return int.MaxValue
+    }
+    if n.l < -(long)int.MaxValue {
+        return -int.MaxValue
+    }
+    return (int)n.l
+}
+
+// 1 for a frame spec of the current input, 0 for none, -97 for a bad frame name with complain -1.
+int parseFrameSpec(ref Gt g, read byte[] arg, int complain) {
+    g.clp.val.fs = FrameSpec { frame1 = 0, frame2 = -1, hasName = false }
+    g.clp.val.fsName = ""
+    if g.input == None && !g.hasInputName {
+        inputStream(ref g, null)
+    }
+    if g.input == None {
+        return 0
+    }
+    if byteAt(arg, 0) != 0x23 {
+        if complain != 0 {
+            clpOptionError(ref g, "frame specifications must start with #", read List<string>())
+        }
+        return 0
+    }
+    nint c = 1
+    int count = gifImageCount(read g, g.input)
+    // Get a number range (#x, #x-y, or #x-). First, read x.
+    if isDigitByte(byteAt(arg, c)) {
+        int f = strtolFrame(arg, ref c)
+        g.clp.val.fs.frame1 = f
+        g.clp.val.fs.frame2 = f
+    } else if byteAt(arg, c) == 0x2D && isDigitByte(byteAt(arg, c + 1)) {
+        int f = count + strtolFrame(arg, ref c)
+        g.clp.val.fs.frame1 = f
+        g.clp.val.fs.frame2 = f
+    }
+    // Then, if the next character is a dash, read y; #- alone is not a frame range.
+    if byteAt(arg, c) == 0x2D && (g.clp.val.fs.frame2 >= 0 || byteAt(arg, c + 1) != 0) {
+        c += 1
+        if isDigitByte(byteAt(arg, c)) {
+            g.clp.val.fs.frame2 = strtolFrame(arg, ref c)
+        } else if byteAt(arg, c) == 0x2D && isDigitByte(byteAt(arg, c + 1)) {
+            g.clp.val.fs.frame2 = count + strtolFrame(arg, ref c)
+        } else {
+            g.clp.val.fs.frame2 = count - 1
+        }
+    }
+    // It really was a number range only if c is now at the end of the argument.
+    if byteAt(arg, c) != 0 {
+        var name = arg[1..]
+        var gfi = gifGetNamedImage(read g, g.input, name)
+        if gfi != None {
+            g.clp.val.fs.hasName = true
+            g.clp.val.fsName = stringOf(name)
+            int n = gifImageNumber(read g, g.input, gfi)
+            g.clp.val.fs.frame1 = n
+            g.clp.val.fs.frame2 = n
+            return 1
+        }
+        if complain < 0 {
+            return -97
+        } else if complain != 0 {
+            clpOptionError(ref g, "no frame named %<#%s%>", read List<string> { stringOf(name) })
+        }
+        return 0
+    }
+    var fs = g.clp.val.fs
+    if fs.frame1 >= 0 && fs.frame1 < count && fs.frame2 >= 0 && fs.frame2 < count {
+        return 1
+    }
+    if complain != 0 {
+        clpOptionError(ref g, "frame %<#%s%> out of range, image has %d frames", read List<string> { stringOf(arg[1..]), $"{count}".toString() })
+    }
+    return 0
+}
+
+// A decimal coordinate or dimension; values outside +/-65535 leave `at` where it was.
+int strtolCoord(read byte[] s, ref nint at) {
+    var n = cStrtoNum(s, at, 10, true)
+    if n.end == at {
+        return 0
+    }
+    if n.l < -65535 || n.l > 65535 || n.overflow {
+        return 0
+    }
+    at = n.end
+    return (int)n.l
+}
+
+int parseDimensions(ref Gt g, read byte[] arg, bool complain) {
+    nint val = 0
+    if byteAt(arg, 0) == 0x5F && byteAt(arg, 1) == 0x78 {
+        g.clp.val.ints[0] = 0
+        val = 1
+    } else {
+        g.clp.val.ints[0] = strtolCoord(arg, ref val)
+    }
+    if byteAt(arg, val) == 0x78 {
+        if byteAt(arg, val + 1) == 0x5F && byteAt(arg, val + 2) == 0 {
+            g.clp.val.ints[1] = 0
+            val += 2
+        } else {
+            val += 1
+            g.clp.val.ints[1] = strtolCoord(arg, ref val)
+        }
+        if byteAt(arg, val) == 0 {
+            return 1
+        }
+    }
+    if complain {
+        clpOptionError(ref g, "invalid dimensions %<%s%> (want WxH)", read List<string> { stringOf(arg) })
+    }
+    return 0
+}
+
+int parsePosition(ref Gt g, read byte[] arg, bool complain) {
+    nint val = 0
+    g.clp.val.ints[0] = strtolCoord(arg, ref val)
+    if byteAt(arg, val) == 0x2C {
+        val += 1
+        g.clp.val.ints[1] = strtolCoord(arg, ref val)
+        if byteAt(arg, val) == 0 {
+            return 1
+        }
+    }
+    if complain {
+        clpOptionError(ref g, "invalid position %<%s%> (want 'X,Y')", read List<string> { stringOf(arg) })
+    }
+    return 0
+}
+
+// strtod over decimal numbers only: hex floats, "inf" and "nan" are not numbers here.
+CDouble strtodDecimal(read byte[] arg, nint at) {
+    nint p = at
+    if byteAt(arg, p) == 0x2B || byteAt(arg, p) == 0x2D {
+        p += 1
+    }
+    if !isDigitByte(byteAt(arg, p)) && !(byteAt(arg, p) == 0x2E && isDigitByte(byteAt(arg, p + 1))) {
+        return CDouble { value = 0.0, end = at }
+    } else if byteAt(arg, p) == 0x30 && (byteAt(arg, p + 1) == 0x78 || byteAt(arg, p + 1) == 0x58) {
+        return CDouble { value = 0.0, end = p + 1 }
+    }
+    return cStrtod(arg, at)
+}
+
+CDouble strtodFraction(read byte[] arg, nint at) {
+    var d = strtodDecimal(arg, at)
+    if d.end != at && byteAt(arg, d.end) == 0x2F {
+        var denom = strtodDecimal(arg, d.end + 1)
+        if denom.end != d.end + 1 && denom.value != 0.0 {
+            return CDouble { value = d.value / denom.value, end = denom.end }
+        }
+    }
+    return d
+}
+
+int parseScaleFactor(ref Gt g, read byte[] arg, bool complain) {
+    var x = strtodFraction(arg, 0)
+    g.clp.val.ds[0] = x.value
+    nint val = x.end
+    if byteAt(arg, val) == 0x78 {
+        var y = strtodFraction(arg, val + 1)
+        g.clp.val.ds[1] = y.value
+        val = y.end
+    } else {
+        g.clp.val.ds[1] = g.clp.val.ds[0]
+    }
+    // reject NaN and infinity
+    if byteAt(arg, val) == 0 && g.clp.val.ds[0].isFinite() && g.clp.val.ds[1].isFinite() {
+        return 1
+    }
+    if complain {
+        clpOptionError(ref g, "invalid scale factor %<%s%> (want XxY)", read List<string> { stringOf(arg) })
+    }
+    return 0
+}
+
+int parseRectangle(ref Gt g, read byte[] arg, bool complain) {
+    nint val = 0
+    int x = strtolCoord(arg, ref val)
+    if byteAt(arg, val) == 0x2C {
+        val += 1
+        int y = strtolCoord(arg, ref val)
+        if byteAt(arg, val) == 0x2D && parsePosition(ref g, arg[val + 1..], false) != 0 {
+            int positionX = g.clp.val.ints[0]
+            int positionY = g.clp.val.ints[1]
+            if x >= 0 && y >= 0 && (positionX <= 0 || x < positionX) && (positionY <= 0 || y < positionY) {
+                // X,Y-0,0 acts like X,Y+0,0, and similar for negative dimensions.
+                g.clp.val.ints[0] = x
+                g.clp.val.ints[1] = y
+                if positionX <= 0 {
+                    g.clp.val.ints[2] = -positionX
+                } else {
+                    g.clp.val.ints[2] = positionX - x
+                }
+                if positionY <= 0 {
+                    g.clp.val.ints[3] = -positionY
+                } else {
+                    g.clp.val.ints[3] = positionY - y
+                }
+                return 1
+            }
+        } else if byteAt(arg, val) == 0x2B && parseDimensions(ref g, arg[val + 1..], false) != 0 {
+            g.clp.val.ints[2] = g.clp.val.ints[0]
+            g.clp.val.ints[3] = g.clp.val.ints[1]
+            g.clp.val.ints[0] = x
+            g.clp.val.ints[1] = y
+            return 1
+        }
+    } else if byteAt(arg, val) == 0x78 {
+        g.clp.val.ints[2] = x
+        val += 1
+        g.clp.val.ints[3] = strtolCoord(arg, ref val)
+        if byteAt(arg, val) == 0 {
+            g.clp.val.ints[0] = 0
+            g.clp.val.ints[1] = 0
+            return 1
+        }
+    }
+    if complain {
+        clpOptionError(ref g, "invalid rectangle %<%s%> (want X1,Y1-X2,Y2 or X1,Y1+WxH", read List<string> { stringOf(arg) })
+    }
+    return 0
+}
+
+int xvalue(int c) {
+    if c >= 0x30 && c <= 0x39 {
+        return c - 0x30
+    }
+    if c >= 0x41 && c <= 0x46 {
+        return c - 0x41 + 10
+    }
+    if c >= 0x61 && c <= 0x66 {
+        return c - 0x61 + 10
+    }
+    return -1
+}
+
+int parseHexColorChannel(read byte[] s, nint at, nint ndigits) {
+    int val1 = xvalue(byteAt(s, at))
+    if val1 < 0 {
+        return -1
+    }
+    if ndigits == 1 {
+        return val1 * 16 + val1
+    }
+    int val2 = xvalue(byteAt(s, at + 1))
+    if val2 < 0 {
+        return -1
+    }
+    return val1 * 16 + val2
+}
+
+// A color into `val.cs[which]`.
+int parseColor(ref Gt g, read byte[] arg, bool complain, nint which) {
+    int red = 0
+    int green = 0
+    int blue = 0
+    bool ok = false
+    if byteAt(arg, 0) == 0x23 {
+        var hex = arg[1..]
+        nint len = hex.length()
+        bool allHex = true
+        for b in hex {
+            if xvalue((int)b) < 0 {
+                allHex = false
+            }
+        }
+        if len == 0 || len % 3 != 0 || !allHex {
+            if complain {
+                clpOptionError(ref g, "invalid color %<%s%> (want #RGB or #RRGGBB)", read List<string> { stringOf(arg) })
+            }
+            return 0
+        }
+        len /= 3
+        red = parseHexColorChannel(hex, 0, len)
+        green = parseHexColorChannel(hex, len, len)
+        blue = parseHexColorChannel(hex, 2 * len, len)
+        ok = true
+    } else if isDigitByte(byteAt(arg, 0)) {
+        var r = cStrtoNum(arg, 0, 10, true)
+        nint p = r.end
+        if byteAt(arg, p) == 0 {
+            if r.l >= 0 && r.l <= 255 && !r.overflow {
+                g.clp.val.cs[which].haspixel = 1
+                g.clp.val.cs[which].pixel = (uint)r.l
+                return 1
+            }
+        } else if byteAt(arg, p) == 0x2C || byteAt(arg, p) == 0x2F {
+            p += 1
+            if byteAt(arg, p) != 0 {
+                var gr = cStrtoNum(arg, p, 10, true)
+                p = gr.end
+                if byteAt(arg, p) == 0x2C || byteAt(arg, p) == 0x2F {
+                    p += 1
+                    if byteAt(arg, p) != 0 {
+                        var bl = cStrtoNum(arg, p, 10, true)
+                        p = bl.end
+                        if byteAt(arg, p) == 0 {
+                            red = clampToInt(r.l)
+                            green = clampToInt(gr.l)
+                            blue = clampToInt(bl.l)
+                            ok = true
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if ok && red >= 0 && green >= 0 && blue >= 0 && red <= 255 && green <= 255 && blue <= 255 {
+        g.clp.val.cs[which].red = (byte)red
+        g.clp.val.cs[which].green = (byte)green
+        g.clp.val.cs[which].blue = (byte)blue
+        g.clp.val.cs[which].haspixel = 0
+        return 1
+    }
+    if complain {
+        clpOptionError(ref g, "invalid color %<%s%>", read List<string> { stringOf(arg) })
+    }
+    return 0
+}
+
+// C assigns a long to an int: the low 32 bits.
+int clampToInt(long v) {
+    return (int)(v & 0xFFFFFFFF).wrappingToInt()
+}
+
+int parseTwoColors(ref Gt g, read byte[] arg, bool complain) {
+    if parseColor(ref g, arg, complain, 0) <= 0 {
+        return 0
+    }
+    var oldColor = g.clp.val.cs[0]
+    var next = clpShift(ref g.clp, false)
+    if next is null {
+        if complain {
+            clpOptionError(ref g, "%<%O%> takes two color arguments", read List<string>())
+        }
+        return 0
+    }
+    if parseColor(ref g, next.asBytes(), complain, 0) <= 0 {
+        return 0
+    }
+    g.clp.val.cs[1] = g.clp.val.cs[0]
+    g.clp.val.cs[0] = oldColor
+    return 1
+}
+
+// ---- reading a file as a colormap ----
+
+nint readTextColormap(ref Gt g, read byte[] data, read string name) {
+    var cm = gifNewFullColormap(ref g, 0, 256)
+    int ncol = 0
+    nint at = 0
+    nint n = data.length()
+    // fgets reads lines of at most BUFSIZ - 1 bytes; a longer line's rest is skipped
+    while at < n {
+        nint end = at
+        while end < n && data[end] != 0x0A && end - at < messageBufSize() - 1 {
+            end += 1
+        }
+        bool hasNewline = end < n && data[end] == 0x0A
+        var buf = List<byte>()
+        buf.addAll(data[at..end])
+        if hasNewline {
+            buf.add(0x0A)
+        }
+        // what fgets gives is a C string: it stops at a zero byte
+        var line = cString(read buf)
+        at = end
+        if hasNewline {
+            at += 1
+        } else if end < n {
+            // handle too-long lines gracefully
+            while at < n && data[at] != 0x0A {
+                at += 1
+            }
+            if at < n {
+                at += 1
+            }
+        }
+        int red = 0
+        int green = 0
+        int blue = 0
+        bool found = false
+        var three = scanThreeFloats(line)
+        if three is not null {
+            float fred = three[0]
+            float fgreen = three[1]
+            float fblue = three[2]
+            if fred < 0 {
+                fred = 0
+            }
+            if fgreen < 0 {
+                fgreen = 0
+            }
+            if fblue < 0 {
+                fblue = 0
+            }
+            red = floatToUnsigned(fred)
+            green = floatToUnsigned(fgreen)
+            blue = floatToUnsigned(fblue)
+            found = true
+        } else if byteAt(line, 0) == 0x23 && hexSpan(line, 1) == 3 && (byteAt(line, 4) == 0 || isSpaceByte(byteAt(line, 4))) {
+            red = xvalue(byteAt(line, 1))
+            green = xvalue(byteAt(line, 2))
+            blue = xvalue(byteAt(line, 3))
+            red += red << 4
+            green += green << 4
+            blue += blue << 4
+            found = true
+        } else if byteAt(line, 0) == 0x23 && hexSpan(line, 1) == 6 && (byteAt(line, 7) == 0 || isSpaceByte(byteAt(line, 7))) {
+            red = xvalue(byteAt(line, 1)) * 16 + xvalue(byteAt(line, 2))
+            green = xvalue(byteAt(line, 3)) * 16 + xvalue(byteAt(line, 4))
+            blue = xvalue(byteAt(line, 5)) * 16 + xvalue(byteAt(line, 6))
+            found = true
+        }
+        if found {
+            if red > 255 {
+                red = 255
+            }
+            if green > 255 {
+                green = 255
+            }
+            if blue > 255 {
+                blue = 255
+            }
+            if ncol >= 256 {
+                lerror(ref g, name, "maximum 256 colors allowed in colormap", read List<string>())
+                break
+            }
+            g.colormaps[cm].col[(nint)ncol] = color(red, green, blue)
+            ncol += 1
+        }
+    }
+    if ncol == 0 {
+        lerror(ref g, name, "file not in colormap format", read List<string>())
+        gifDeleteColormap(ref g, cm)
+        return None
+    }
+    g.colormaps[cm].ncol = ncol
+    return cm
+}
+
+// (unsigned)(f + .5) for the float sscanf read.
+int floatToUnsigned(float f) {
+    float r = f + (float)0.5
+    if r >= (float)4294967296.0 {
+        return 255
+    }
+    long v = (long)(double)r
+    if v > 255 {
+        return 255
+    }
+    return (int)v
+}
+
+nint hexSpan(read byte[] s, nint at) {
+    nint k = at
+    while k < s.length() && xvalue((int)s[k]) >= 0 {
+        k += 1
+    }
+    return k - at
+}
+
+// sscanf(buf, "%g %g %g", ...) == 3: three floats, separated by whitespace.
+float[3]? scanThreeFloats(read byte[] line) {
+    var out = float[3] { 0, 0, 0 }
+    nint at = 0
+    for k in 0..3 {
+        while isSpaceByte(byteAt(line, at)) {
+            at += 1
+        }
+        var r = cStrtod(line, at)
+        if r.end == at {
+            return null
+        }
+        out[k] = (float)r.value
+        at = r.end
+    }
+    return out
+}
+
+nint readColormapFile(ref Gt g, read string? name0) {
+    string? name = null
+    if name0 is not null && name0 != "-" {
+        name = name0.clone()
+    }
+    List<byte> data = List<byte>()
+    string shown = "<stdin>"
+    if name is not null {
+        shown = name.clone()
+        match readFileBytes(read name) {
+            Ok(d) => data = d
+            Error(cause) => {
+                lerror(ref g, read name, "%s", read List<string> { ioErrorText(cause) })
+                return None
+            }
+        }
+    } else {
+        data = readStdinRest(ref g)
+    }
+    return readColormapData(ref g, read shown, read data)
+}
+
+nint readColormapData(ref Gt g, read string shown, read List<byte> data) {
+    if g.msgs.verbosing {
+        verboseOpen(ref g, 0x3C, read shown)
+    }
+    nint cm = None
+    if data.length() > 0 && data[0] == 0x47 {
+        var grr = fileReader(data.clone())
+        var gfs = gifFullReadFile(ref g, ref grr, GifReadCompressed, null, HandlerSilent)
+        if gfs == None {
+            lerror(ref g, read shown, "file not in GIF format", read List<string>())
+        } else if g.streams[gfs].global == None && (g.streams[gfs].images.length() == 0 || g.images[g.streams[gfs].images[0]].local == None) {
+            lerror(ref g, read shown, "can%,t use as palette (no global color table)", read List<string>())
+        } else {
+            if g.streams[gfs].errors != 0 {
+                lwarning(ref g, read shown, "there were errors reading this GIF", read List<string>())
+            }
+            nint src = g.streams[gfs].global
+            if src == None {
+                src = g.images[g.streams[gfs].images[0]].local
+            }
+            cm = gifCopyColormap(ref g, src)
+        }
+        gifDeleteStream(ref g, gfs)
+    } else {
+        cm = readTextColormap(ref g, read data, read shown)
+    }
+    if g.msgs.verbosing {
+        verboseClose(ref g, 0x3E)
+    }
+    return cm
+}

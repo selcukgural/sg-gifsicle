@@ -1,0 +1,307 @@
+// xform.sg - Image transformation functions for gifsicle (xform.c): color transforms, crops, flips
+// and rotations. Resizing is in resize.sg.
+// Copyright (C) 1997-2025 Eddie Kohler, ekohler@gmail.com
+// SG translation of gifsicle 1.99. This file is part of sg-gifsicle.
+//
+// Gifsicle is free software. It is distributed under the GNU Public License, version 2; you can
+// copy, distribute, or alter it at will, as long as this notice is kept intact and this source
+// code is made available. There is no warranty, express or implied.
+
+// C stores an int in a uint16_t field: its low 16 bits.
+ushort u16(int v) {
+    return (ushort)(v & 0xFFFF)
+}
+
+// ---- color transforms ----
+
+// Delete the transforms of a kind (1 color change, 2 pipe), or all of them for kind 0.
+void deleteColorTransforms(ref List<ColorTransform> list, int kind) {
+    var kept = List<ColorTransform>()
+    var all = list.replace(List<ColorTransform>())
+    for x in all {
+        if kind != 0 && x.kind != kind {
+            kept.add(x)
+        }
+    }
+    list = kept
+}
+
+void applyColorTransforms(ref Gt g, bool input, nint gfs) {
+    var list = g.outputTransforms.clone()
+    if input {
+        list = g.inputTransforms.clone()
+    }
+    // C keeps consecutive color changes in one transform, which applies them in turn to each
+    // colormap entry; a run of them here is one group.
+    nint i = 0
+    while i < list.length() {
+        nint end = i + 1
+        if list[i].kind == 1 {
+            while end < list.length() && list[end].kind == 1 {
+                end += 1
+            }
+        }
+        if g.streams[gfs].global != None {
+            applyColorTransform(ref g, read list, i, end, g.streams[gfs].global)
+        }
+        for k in 0..g.streams[gfs].images.length() {
+            nint local = g.images[g.streams[gfs].images[k]].local
+            if local != None {
+                applyColorTransform(ref g, read list, i, end, local)
+            }
+        }
+        i = end
+    }
+}
+
+void applyColorTransform(ref Gt g, read List<ColorTransform> list, nint from, nint to, nint gfcm) {
+    if list[from].kind == 1 {
+        colorChangeTransformer(ref g.colormaps[gfcm], read list, from, to)
+    } else {
+        pipeColorTransformer(ref g, gfcm, read list[from].command)
+    }
+}
+
+void colorChangeTransformer(ref Colormap gfcm, read List<ColorTransform> list, nint from, nint to) {
+    // change colors named by color
+    for i in 0..(nint)gfcm.ncol {
+        for k in from..to {
+            var change = list[k]
+            bool have = false
+            if change.from.haspixel == 0 {
+                have = colorEq(gfcm.col[i], change.from)
+            } else {
+                have = change.from.pixel == (uint)i
+            }
+            if have {
+                gfcm.col[i] = change.to
+                // ignore remaining color changes
+                break
+            }
+        }
+    }
+}
+
+void pipeColorTransformer(ref Gt g, nint gfcm, read string command) {
+    var tmp = File.createTemp()
+    if tmp is Error(cause) {
+        error(ref g, 1, "can%,t create temporary file: %s", read List<string> { ioErrorText(cause) })
+        return
+    }
+    var tmpFile = tmp ?? ""
+    var text = string.withCapacity(16 * (nint)g.colormaps[gfcm].ncol)
+    for i in 0..(nint)g.colormaps[gfcm].ncol {
+        var c = g.colormaps[gfcm].col[i]
+        text.write($"{c.red} {c.green} {c.blue}\n")
+    }
+    var sh = Command("/bin/sh")
+    sh.arg("-c")
+    sh.arg(read $"{command}  >{tmpFile}".toString())
+    sh.input(read text)
+    var status = sh.status()
+    bool ok = true
+    match status {
+        Ok(Code(code)) => {
+            if code != 0 {
+                error(ref g, 1, "color transformation command failed", read List<string>())
+                ok = false
+            }
+        }
+        Ok(Signal(_)) => {
+            error(ref g, 1, "color transformation command failed", read List<string>())
+            ok = false
+        }
+        Error(cause) => {
+            error(ref g, 1, "can%,t run color transformation command: %s", read List<string> { ioErrorText(cause) })
+            ok = false
+        }
+    }
+    if ok {
+        var newCm = None
+        match File.readBytes(read tmpFile) {
+            Ok(data) => newCm = readColormapData(ref g, "<color transformation>", read data)
+            Error(_) => error(ref g, 1, "color transformation command generated no output", read List<string>())
+        }
+        if newCm != None {
+            int nc = g.colormaps[newCm].ncol
+            if nc < g.colormaps[gfcm].ncol {
+                warning(ref g, 1, "too few colors in color transformation results", read List<string>())
+            } else if nc > g.colormaps[gfcm].ncol {
+                warning(ref g, 1, "too many colors in color transformation results", read List<string>())
+                nc = g.colormaps[gfcm].ncol
+            }
+            for i in 0..(nint)nc {
+                g.colormaps[gfcm].col[i] = g.colormaps[newCm].col[i]
+            }
+        }
+        gifDeleteColormap(ref g, newCm)
+    }
+    _ = File.delete(read tmpFile)
+}
+
+// ---- crop ----
+
+Crop combineCrop(read Crop srccrop, read Image gfi) {
+    var dstcrop = noCrop()
+    int left = (int)gfi.left
+    int top = (int)gfi.top
+    int width = (int)gfi.width
+    int height = (int)gfi.height
+    int cl = srccrop.x - left
+    int cr = cl + srccrop.w
+    int ct = srccrop.y - top
+    int cb = ct + srccrop.h
+    int dl = 0
+    if cl > 0 {
+        dl = cl
+    }
+    int dr = width
+    if cr < width {
+        dr = cr
+    }
+    int dt = 0
+    if ct > 0 {
+        dt = ct
+    }
+    int db = height
+    if cb < height {
+        db = cb
+    }
+    if dl < dr {
+        dstcrop.x = dl
+        dstcrop.w = dr - dl
+    } else {
+        int base = srccrop.w - 1
+        if cl <= 0 || srccrop.w <= 0 {
+            base = 0
+        }
+        dstcrop.x = base + (srccrop.leftOffset - left)
+        dstcrop.w = 0
+    }
+    if dt < db {
+        dstcrop.y = dt
+        dstcrop.h = db - dt
+    } else {
+        int base = srccrop.h - 1
+        if ct <= 0 || srccrop.h <= 0 {
+            base = 0
+        }
+        dstcrop.y = base + (srccrop.topOffset - top)
+        dstcrop.h = 0
+    }
+    return dstcrop
+}
+
+void cropImage(ref Gt g, nint gfi, ref Frame fr) {
+    var crop = g.crops[fr.crop]
+    var c = combineCrop(read crop, read g.images[gfi])
+    fr.leftOffset = crop.leftOffset
+    fr.topOffset = crop.topOffset
+    if c.w > 0 && c.h > 0 && g.images[gfi].hasImg {
+        var rows = List<nint>.withCapacity((nint)c.h)
+        for j in 0..(nint)c.h {
+            rows.add(g.images[gfi].rows[(nint)c.y + j] + (nint)c.x)
+        }
+        g.images[gfi].rows = rows
+        g.images[gfi].left = u16((int)g.images[gfi].left + c.x - fr.leftOffset)
+        g.images[gfi].top = u16((int)g.images[gfi].top + c.y - fr.topOffset)
+        g.images[gfi].width = u16(c.w)
+        g.images[gfi].height = u16(c.h)
+    } else {
+        // The image was cropped out of existence. Keep an empty frame (positioned inside the crop
+        // by combine_crop) to preserve its delay, comments, and extensions; drop its disposal.
+        g.images[gfi].left = u16((int)g.images[gfi].left + c.x - fr.leftOffset)
+        g.images[gfi].top = u16((int)g.images[gfi].top + c.y - fr.topOffset)
+        gifMakeImageEmpty(ref g, gfi)
+        g.images[gfi].disposal = (byte)GifDisposalNone
+    }
+}
+
+// ---- flip and rotate ----
+
+void flipImage(ref Gt g, nint gfi, ref Frame fr, bool isVert) {
+    nint width = (nint)g.images[gfi].width
+    nint height = (nint)g.images[gfi].height
+    int sw = (int)g.streams[fr.stream].screenWidth
+    int sh = (int)g.streams[fr.stream].screenHeight
+    if !isVert {
+        var buffer = List<byte>.repeat(0, width)
+        for y in 0..height {
+            nint row = g.images[gfi].rows[y]
+            buffer.copyFrom(g.images[gfi].data[row..row + width])
+            for x in 0..width {
+                g.images[gfi].data[row + width - 1 - x] = buffer[x]
+            }
+        }
+        g.images[gfi].left = u16(sw - ((int)g.images[gfi].left + (int)width))
+        if fr.crop != None {
+            fr.leftOffset = sw - (fr.leftOffset + g.crops[fr.crop].w)
+        }
+    } else {
+        var buffer = g.images[gfi].rows.clone()
+        for y in 0..height {
+            g.images[gfi].rows[y] = buffer[height - y - 1]
+        }
+        g.images[gfi].top = u16(sh - ((int)g.images[gfi].top + (int)height))
+        if fr.crop != None {
+            fr.topOffset = sh - (fr.topOffset + g.crops[fr.crop].h)
+        }
+    }
+}
+
+void rotateImage(ref Gt g, nint gfi, ref Frame fr, int rotation) {
+    nint width = (nint)g.images[gfi].width
+    nint height = (nint)g.images[gfi].height
+    var newData = List<byte>.withCapacity(width * height)
+    if rotation == 1 {
+        for x in 0..width {
+            for y in (0..height).reversed() {
+                newData.add(g.images[gfi].data[g.images[gfi].rows[y] + x])
+            }
+        }
+    } else {
+        for x in (0..width).reversed() {
+            for y in 0..height {
+                newData.add(g.images[gfi].data[g.images[gfi].rows[y] + x])
+            }
+        }
+    }
+    if newData.length() == 0 {
+        newData.add(0)
+    }
+    int sw = (int)g.streams[fr.stream].screenWidth
+    int sh = (int)g.streams[fr.stream].screenHeight
+    int ntop = 0
+    int nleft = 0
+    if rotation == 1 {
+        ntop = (int)g.images[gfi].left
+        nleft = sh - ((int)g.images[gfi].top + (int)height)
+        if fr.crop != None {
+            int x = fr.leftOffset
+            fr.leftOffset = sh - (fr.topOffset + g.crops[fr.crop].h)
+            fr.topOffset = x
+        }
+    } else {
+        ntop = sw - ((int)g.images[gfi].left + (int)width)
+        nleft = (int)g.images[gfi].top
+        if fr.crop != None {
+            int y = fr.topOffset
+            fr.topOffset = sw - (fr.leftOffset + g.crops[fr.crop].w)
+            fr.leftOffset = y
+        }
+    }
+    gifReleaseUncompressedImage(ref g, gfi)
+    g.images[gfi].width = u16((int)height)
+    g.images[gfi].height = u16((int)width)
+    if nleft > 0 {
+        g.images[gfi].left = u16(nleft)
+    } else {
+        g.images[gfi].left = 0
+    }
+    if ntop > 0 {
+        g.images[gfi].top = u16(ntop)
+    } else {
+        g.images[gfi].top = 0
+    }
+    gifSetUncompressedImage(ref g, gfi, newData, false)
+}

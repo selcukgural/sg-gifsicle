@@ -1,0 +1,1537 @@
+// clp.sg - A parser of command lines (CLP, liblcdf/clp.c).
+// Copyright (c) 1997-2025 Eddie Kohler, ekohler@gmail.com
+// SG translation of gifsicle 1.99. This file is part of sg-gifsicle.
+//
+// CLP is free software; it is distributed under the GNU General Public License version 2 as part
+// of gifsicle. (CLP itself is under the MIT license; this translation is part of a GPL program.)
+//
+// Only what gifsicle uses is here, but it is CLP's code: long options matched by their shortest
+// unambiguous prefix, `--no-` to negate, `-` for short options and `+` for negated short ones,
+// values after `=`, in the same word or in the next, string lists, and the error messages with
+// their quotes. The value types that are gifsicle's own are parsed by gifsicle (`parseUserValue`),
+// since they read its state; CLP calls it through the type's number.
+
+const int ClpNoVal = 0
+const int ClpValString = 1
+const int ClpValStringNotOption = 2
+const int ClpValBool = 3
+const int ClpValInt = 4
+const int ClpValUnsigned = 5
+const int ClpValLong = 6
+const int ClpValUnsignedLong = 7
+const int ClpValDouble = 8
+const int ClpValFirstUser = 10
+
+const int ClpMandatory = 1
+const int ClpOptional = 2
+const int ClpNegate = 4
+const int ClpOnlyNegated = 8
+const int ClpPreferredMatch = 16
+
+const int ClpShort = 1
+const int ClpLong = 2
+const int ClpShortNegated = 4
+const int ClpLongNegated = 8
+const int ClpLongImplicit = 16
+const int ClpDoubledLong = 32
+
+const int ClpNotOption = 0
+const int ClpDone = -1
+const int ClpBadOption = -2
+const int ClpError = -3
+
+const int ClpDisallowOptions = 1
+const int ClpAllowNumbers = 1
+
+const int MaxAmbiguousValues = 4
+
+// The parsers of values: CLP's own, and the user's (gifsicle's, by type number).
+const int ParseString = 1
+const int ParseInt = 2
+const int ParseBool = 3
+const int ParseDouble = 4
+const int ParseStringList = 5
+const int ParseUser = 6
+
+const int ReplacementChar = 0xFFFD
+
+struct ClpOption : Copyable {
+    // `LongName` is an index into the parser's names, -1 for none
+    int longName
+    int shortName
+    int optionId
+    int valType
+    int flags
+}
+
+struct ClpIntern : Copyable {
+    bool ilong
+    bool ishort
+    bool imandatory
+    bool ioptional
+    bool ipos
+    bool ineg
+    bool iprefmatch
+    bool lmmposShort
+    bool lmmnegShort
+    bool unquoted
+    nint ilongoff
+    nint lmmpos
+    nint lmmneg
+}
+
+ClpIntern noIntern() {
+    return ClpIntern {
+        ilong = false, ishort = false, imandatory = false, ioptional = false, ipos = false, ineg = false,
+        iprefmatch = false, lmmposShort = false, lmmnegShort = false, unquoted = false, ilongoff = 0,
+        lmmpos = 0, lmmneg = 0,
+    }
+}
+
+struct ClpValType : Copyable {
+    int valType
+    int func
+    int flags
+    // for ParseInt, which kind; for ParseStringList, which list
+    int userData
+}
+
+struct ClpStringList {
+    List<ClpOption> items
+    List<ClpIntern> iopt
+    List<long> lvals
+    nint nitems
+    bool allowInt
+    nint nitemsInvalidReport
+}
+
+struct FrameSpec : Copyable {
+    int frame1
+    int frame2
+    // the name, when the frame was named: an index into the parser's arguments, -1 for none
+    bool hasName
+}
+
+struct ClpVal {
+    int i
+    uint u
+    long l
+    ulong ul
+    double d
+    string s
+    int[4] ints
+    double[2] ds
+    Color[2] cs
+    FrameSpec fs
+    string fsName
+}
+
+ClpVal noClpVal() {
+    return ClpVal {
+        i = 0, u = 0, l = 0, ul = 0, d = 0.0, s = "", ints = int[4] { 0, 0, 0, 0 }, ds = double[2] { 0.0, 0.0 },
+        cs = Color[2] { noColor(), noColor() }, fs = FrameSpec { frame1 = 0, frame2 = 0, hasName = false },
+        fsName = "",
+    }
+}
+
+struct ClpState {
+    nint argi
+    nint arg
+    nint xtext
+    nint xtextArg
+    string optionCharsText
+    nint optionChars
+    bool optionProcessing
+    // the option (an index), or a sentinel: -1 Done, -2 BadOption, -3 Error, -4 NotOption
+    int option
+    bool isShort
+    bool wholeNegated
+    bool currentShort
+    bool negatedByNo
+    uint optGeneration
+}
+
+struct Clp {
+    // the names: of the options, of the string lists' items
+    List<string> names
+    List<ClpOption> opt
+    List<ClpIntern> iopt
+    List<ClpValType> valtype
+    List<ClpStringList> stringLists
+    uint optGeneration
+
+    List<string> argv
+    nint argi
+    // the current argument (an index into argv), and where in it the option's text starts
+    nint arg
+    nint xtext
+    // the argument `xtext` is in: C's `xtext` points into it, and stays there when the next
+    // argument is read as the option's value
+    nint xtextArg
+    // how many bytes of the argument introduced the option, and those bytes ("-" or "--"), which
+    // C copies
+    nint optionChars
+    string optionCharsText
+
+    List<int> oclassC
+    List<int> oclassType
+    bool long1pos
+    bool long1neg
+    bool utf8
+
+    string programName
+    bool optionProcessing
+
+    bool isShort
+    bool wholeNegated
+    bool couldBeShort
+    bool currentShort
+    bool negatedByNo
+
+    int ambiguous
+    int[4] ambiguousValues
+
+    // the public part: the last option, as above
+    int option
+    bool negated
+    bool haveVal
+    bool hasVstr
+    string vstr
+    ClpVal val
+}
+
+Clp clpNewParser(List<string> args, read string programName, bool utf8) {
+    var clp = Clp {
+        names = List<string>(), opt = List<ClpOption>(), iopt = List<ClpIntern>(),
+        valtype = List<ClpValType>(), stringLists = List<ClpStringList>(), optGeneration = 0,
+        argv = args, argi = 0, arg = -1, xtext = -1, xtextArg = -1, optionChars = 0, optionCharsText = "",
+        oclassC = List<int> { 0x2D }, oclassType = List<int> { ClpShort }, long1pos = false,
+        long1neg = false, utf8 = utf8, programName = programName.clone(), optionProcessing = true,
+        isShort = false, wholeNegated = false, couldBeShort = false, currentShort = false,
+        negatedByNo = false, ambiguous = 0, ambiguousValues = int[4] { 0, 0, 0, 0 }, option = ClpDone,
+        negated = false, haveVal = false, hasVstr = false, vstr = "", val = noClpVal(),
+    }
+    clpAddType(ref clp, ClpValString, 0, ParseString, 0)
+    clpAddType(ref clp, ClpValStringNotOption, ClpDisallowOptions, ParseString, 0)
+    clpAddType(ref clp, ClpValInt, 0, ParseInt, 0)
+    clpAddType(ref clp, ClpValUnsigned, 0, ParseInt, 1)
+    clpAddType(ref clp, ClpValLong, 0, ParseInt, 2)
+    clpAddType(ref clp, ClpValUnsignedLong, 0, ParseInt, 3)
+    clpAddType(ref clp, ClpValBool, 0, ParseBool, 0)
+    clpAddType(ref clp, ClpValDouble, 0, ParseDouble, 0)
+    return clp
+}
+
+// ---- UTF-8 ----
+
+// The character at `at` of `s`, and where the next one starts.
+int decodeUtf8(read byte[] s, nint at, ref nint next) {
+    nint p = at
+    int c = 0
+    nint n = s.length()
+    int b0 = 0
+    if p < n {
+        b0 = (int)s[p]
+    }
+    int b1 = 0
+    int b2 = 0
+    int b3 = 0
+    if p + 1 < n {
+        b1 = (int)s[p + 1]
+    }
+    if p + 2 < n {
+        b2 = (int)s[p + 2]
+    }
+    if p + 3 < n {
+        b3 = (int)s[p + 3]
+    }
+    bool replacement = false
+    if b0 == 0 {
+        c = 0
+    } else if b0 <= 0x7F {
+        c = b0
+        p += 1
+    } else if b0 <= 0xC1 {
+        replacement = true
+    } else if b0 <= 0xDF {
+        if (b1 & 0xC0) != 0x80 {
+            replacement = true
+        } else {
+            c = ((b0 & 0x1F) << 6) + (b1 & 0x3F)
+            p += 2
+        }
+    } else if b0 <= 0xEF {
+        if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b0 == 0xE0 && (b1 & 0xE0) == 0x80) ||
+            (b0 == 0xED && (b1 & 0xE0) == 0xA0) {
+            replacement = true
+        } else {
+            c = ((b0 & 0x0F) << 12) + ((b1 & 0x3F) << 6) + (b2 & 0x3F)
+            p += 3
+        }
+    } else if b0 <= 0xF4 {
+        if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80 ||
+            (b0 == 0xF0 && (b1 & 0xF0) == 0x80) || (b0 == 0xF4 && b1 >= 0x90) {
+            replacement = true
+        } else {
+            c = ((b0 & 0x07) << 18) + ((b1 & 0x3F) << 12) + ((b2 & 0x3F) << 6) + (b3 & 0x3F)
+            p += 4
+        }
+    } else {
+        replacement = true
+    }
+    if replacement {
+        // Skip at most 3 continuation bytes, so a character is at most 4 bytes long
+        c = ReplacementChar
+        p += 1
+        nint k = 0
+        while k < 3 && p < n && (s[p] & 0xC0) == 0x80 {
+            p += 1
+            k += 1
+        }
+    }
+    next = p
+    return c
+}
+
+void encodeUtf8(ref List<byte> out, int c0) {
+    int c = c0
+    if c < 0 || c >= 0x110000 || (c >= 0xD800 && c <= 0xDFFF) {
+        c = ReplacementChar
+    }
+    if c <= 0x7F {
+        out.add((byte)c)
+    } else if c <= 0x7FF {
+        out.add((byte)(0xC0 | (c >> 6)))
+        out.add((byte)(0x80 | (c & 0x3F)))
+    } else if c <= 0xFFFF {
+        out.add((byte)(0xE0 | (c >> 12)))
+        out.add((byte)(0x80 | ((c >> 6) & 0x3F)))
+        out.add((byte)(0x80 | (c & 0x3F)))
+    } else {
+        out.add((byte)(0xF0 | (c >> 18)))
+        out.add((byte)(0x80 | ((c >> 12) & 0x3F)))
+        out.add((byte)(0x80 | ((c >> 6) & 0x3F)))
+        out.add((byte)(0x80 | (c & 0x3F)))
+    }
+}
+
+nint clpUtf8Charlen(read Clp clp, read byte[] s, nint at) {
+    if clp.utf8 {
+        nint next = at
+        _ = decodeUtf8(s, at, ref next)
+        return next - at
+    }
+    return 1
+}
+
+// A byte of text, 0 past its end, as C reads a string up to its terminating zero.
+int byteAt(read byte[] s, nint at) {
+    if at < s.length() {
+        return (int)s[at]
+    }
+    return 0
+}
+
+// ---- options ----
+
+nint minDifferentChars(read byte[] s, read byte[] t) {
+    nint i = 0
+    while i < s.length() && i < t.length() && s[i] == t[i] {
+        i += 1
+    }
+    if i >= s.length() {
+        return i
+    }
+    return i + 1
+}
+
+read byte[] optLongName(read Clp clp, read List<ClpOption> opt, read List<ClpIntern> iopt, nint i) from clp {
+    return clp.names[(nint)opt[i].longName].asBytes()[iopt[i].ilongoff..]
+}
+
+int longAsShort(read Clp clp, read List<ClpOption> opt, read List<ClpIntern> iopt, nint i, int failure) {
+    if (clp.long1pos || clp.long1neg) && iopt[i].ilong {
+        var name = optLongName(read clp, read opt, read iopt, i)
+        if clp.utf8 {
+            nint next = 0
+            int c = decodeUtf8(name, 0, ref next)
+            if next >= name.length() && c != 0 && c != ReplacementChar {
+                return c
+            }
+        } else if name.length() == 1 {
+            return (int)name[0]
+        }
+    }
+    return failure
+}
+
+bool strEq(read byte[] a, read byte[] b) {
+    return a == b
+}
+
+// strncmp(a, b, n) == 0, for texts that end where they end.
+bool strnEq(read byte[] a, read byte[] b, nint n) {
+    for i in 0..n {
+        int ca = byteAt(a, i)
+        int cb = byteAt(b, i)
+        if ca != cb {
+            return false
+        }
+        if ca == 0 {
+            return true
+        }
+    }
+    return true
+}
+
+void compareOptions(ref Clp clp, read List<ClpOption> opt, ref List<ClpIntern> iopt, nint i1, nint i2, bool same) {
+    var io1 = iopt[i1]
+    var io2 = iopt[i2]
+    if (!io1.ishort && !io1.ilong) || (!io2.ishort && !io2.ilong) || !((io1.ipos && io2.ipos) || (io1.ineg && io2.ineg)) || same {
+        return
+    }
+    // (the checks for duplicate short names report CLP's own errors, which gifsicle never meets)
+    if io1.ilong {
+        var name1 = clp.names[(nint)opt[i1].longName].asBytes()[io1.ilongoff..]
+        if io2.ishort && !io1.iprefmatch {
+            int name1char = byteAt(name1, 0)
+            if clp.utf8 {
+                nint next = 0
+                name1char = decodeUtf8(name1, 0, ref next)
+            }
+            if name1char == opt[i2].shortName {
+                if io1.ipos && io2.ipos {
+                    iopt[i1].lmmposShort = true
+                }
+                if io1.ineg && io2.ineg {
+                    iopt[i1].lmmnegShort = true
+                }
+            }
+        }
+        if io2.ilong {
+            var name2 = clp.names[(nint)opt[i2].longName].asBytes()[io2.ilongoff..]
+            if io1.ipos && io2.ipos && strnEq(name1, name2, iopt[i1].lmmpos) &&
+                (!io1.iprefmatch || !strnEq(name1, name2, name1.length())) {
+                iopt[i1].lmmpos = minDifferentChars(name1, name2)
+            }
+            if io1.ineg && io2.ineg && strnEq(name1, name2, iopt[i1].lmmneg) &&
+                (!io1.iprefmatch || !strnEq(name1, name2, name1.length())) {
+                iopt[i1].lmmneg = minDifferentChars(name1, name2)
+            }
+        }
+    }
+}
+
+void calculateLmm(ref Clp clp, read List<ClpOption> opt, ref List<ClpIntern> iopt, read List<long>? lvals) {
+    nint nopt = opt.length()
+    for i in 0..nopt {
+        iopt[i].lmmpos = 1
+        iopt[i].lmmneg = 1
+        iopt[i].lmmposShort = false
+        iopt[i].lmmnegShort = false
+        for j in 0..nopt {
+            bool same = opt[i].optionId == opt[j].optionId
+            if lvals is not null {
+                same = lvals[i] == lvals[j]
+            }
+            compareOptions(ref clp, read opt, ref iopt, i, j, same)
+        }
+    }
+}
+
+int clpOptionChar(read Clp clp, int c) {
+    int oclass = 0
+    if clp.oclassC.length() > 0 && clp.oclassC[0] == 0 {
+        oclass = clp.oclassType[0]
+    }
+    for i in 0..clp.oclassC.length() {
+        if clp.oclassC[i] == c {
+            oclass = clp.oclassType[i]
+        }
+    }
+    return oclass
+}
+
+void clpSetOptionChar(ref Clp clp, int c, int type) {
+    nint i = 0
+    while i < clp.oclassC.length() && clp.oclassC[i] != c {
+        i += 1
+    }
+    if i == clp.oclassC.length() {
+        clp.oclassC.add(c)
+        clp.oclassType.add(type)
+    } else {
+        clp.oclassType[i] = type
+    }
+    bool long1pos = false
+    bool long1neg = false
+    for k in 0..clp.oclassC.length() {
+        int t = clp.oclassType[k]
+        if (t & ClpShort) != 0 && (t & ClpLong) != 0 {
+            long1pos = true
+        }
+        if (t & ClpShortNegated) != 0 && (t & ClpLongNegated) != 0 {
+            long1neg = true
+        }
+    }
+    if long1pos != clp.long1pos || long1neg != clp.long1neg {
+        clp.long1pos = long1pos
+        clp.long1neg = long1neg
+        var opt = clp.opt.clone()
+        var iopt = clp.iopt.replace(List<ClpIntern>())
+        calculateLmm(ref clp, read opt, ref iopt, null)
+        clp.iopt = iopt
+    }
+}
+
+bool validShortName(read Clp clp, int c) {
+    if clp.utf8 {
+        return c > 0 && c < 0x110000
+    }
+    return c > 0 && c < 256
+}
+
+void clpSetOptions(ref Clp clp, List<ClpOption> opt) {
+    clp.optGeneration += 1
+    clp.option = ClpDone
+    var iopt = List<ClpIntern>()
+    for o in read opt {
+        var io = noIntern()
+        io.ilong = o.longName >= 0 && clp.names[(nint)o.longName].length() > 0
+        io.ishort = validShortName(read clp, o.shortName)
+        io.ipos = true
+        io.ineg = (o.flags & ClpNegate) != 0
+        io.imandatory = (o.flags & ClpMandatory) != 0
+        io.ioptional = (o.flags & ClpOptional) != 0
+        io.iprefmatch = (o.flags & ClpPreferredMatch) != 0
+        if o.valType <= 0 {
+            io.imandatory = false
+            io.ioptional = false
+        }
+        if o.valType > 0 && !io.ioptional {
+            io.imandatory = true
+        }
+        if io.ilong && clp.names[(nint)o.longName].startsWith("no-") {
+            io.ipos = false
+            io.ineg = true
+            io.ilongoff = 3
+        } else if (o.flags & ClpOnlyNegated) != 0 {
+            io.ipos = false
+            io.ineg = true
+        }
+        iopt.add(io)
+    }
+    calculateLmm(ref clp, read opt, ref iopt, null)
+    clp.opt = opt
+    clp.iopt = iopt
+}
+
+int clpAddName(ref Clp clp, read string name) {
+    clp.names.add(name.clone())
+    return (int)(clp.names.length() - 1)
+}
+
+void clpAddType(ref Clp clp, int valType, int flags, int func, int userData) {
+    for i in 0..clp.valtype.length() {
+        if clp.valtype[i].valType == valType {
+            clp.valtype[i] = ClpValType { valType = valType, func = func, flags = flags, userData = userData }
+            return
+        }
+    }
+    clp.valtype.add(ClpValType { valType = valType, func = func, flags = flags, userData = userData })
+}
+
+// A string list type: names and the values they stand for.
+void clpAddStringListType(ref Clp clp, int valType, int flags, read List<string> names, read List<long> vals) {
+    var items = List<ClpOption>()
+    for n in read names {
+        int id = clpAddName(ref clp, n)
+        items.add(ClpOption { longName = id, shortName = 0, optionId = 0, valType = 0, flags = 0 })
+    }
+    nint nitems = items.length()
+    // the capacity of C's array of items, which decides whether "any integer" fits in it
+    nint itemscap = 5
+    while itemscap < nitems {
+        itemscap *= 2
+    }
+    bool allowInt = (flags & ClpAllowNumbers) != 0
+    nint niitems = nitems
+    if allowInt {
+        niitems += 1
+    }
+    var iopt = List<ClpIntern>()
+    for _ in 0..niitems {
+        var io = noIntern()
+        io.ilong = true
+        io.ipos = true
+        iopt.add(io)
+    }
+    var lvals = vals.clone()
+    var opts = items.clone()
+    calculateLmm(ref clp, read opts, ref iopt, read lvals)
+    nint report = nitems
+    if nitems < (nint)MaxAmbiguousValues && nitems < itemscap && allowInt {
+        int id = clpAddName(ref clp, "any integer")
+        items.add(ClpOption { longName = id, shortName = 0, optionId = 0, valType = 0, flags = 0 })
+        iopt[nitems].unquoted = true
+        report = nitems + 1
+    } else if nitems > (nint)MaxAmbiguousValues + 1 {
+        report = (nint)MaxAmbiguousValues + 1
+    }
+    clp.stringLists.add(ClpStringList {
+        items = items, iopt = iopt, lvals = lvals, nitems = nitems, allowInt = allowInt,
+        nitemsInvalidReport = report,
+    })
+    clpAddType(ref clp, valType, 0, ParseStringList, (int)(clp.stringLists.length() - 1))
+}
+
+// ---- matching ----
+
+// 0 if they don't match; -1 if they match in fewer than min_match characters; else the number of
+// characters of `arg` that matched. `arg` may have fewer dashes than `ref` if `fewerDashes`.
+nint argcmp(read byte[] refName, read byte[] arg, nint minMatch, bool fewerDashes) {
+    nint r = 0
+    nint a = 0
+    while true {
+        while byteAt(refName, r) != 0 && byteAt(arg, a) != 0 && byteAt(arg, a) != 0x3D && byteAt(refName, r) == byteAt(arg, a) {
+            r += 1
+            a += 1
+        }
+        if fewerDashes && byteAt(refName, r) == 0x2D && byteAt(refName, r + 1) != 0 && byteAt(refName, r + 1) == byteAt(arg, a) {
+            r += 1
+            continue
+        }
+        break
+    }
+    if byteAt(arg, a) != 0 && byteAt(arg, a) != 0x3D {
+        return 0
+    } else if r < minMatch {
+        return -1
+    }
+    return a
+}
+
+// An unambiguous match of `arg` among the long options; -1 if none, with the ambiguous ones noted.
+int findPrefixOpt(ref Clp clp, bool useClp, read byte[] arg, read List<ClpOption> opt, read List<ClpIntern> iopt, ref int ambiguous, ref int[4] ambiguousValues) {
+    bool fewerDashes = false
+    int firstAmbiguous = ambiguous
+    bool negated = useClp && clp.negated
+    nint firstCharlen = 1
+    if useClp {
+        firstCharlen = clpUtf8Charlen(read clp, arg, 0)
+    }
+    if byteAt(arg, 0) == 0 || byteAt(arg, 0) == 0x3D {
+        return -1
+    }
+    while true {
+        for i in 0..opt.length() {
+            if !iopt[i].ilong || (negated && !iopt[i].ineg) || (!negated && !iopt[i].ipos) {
+                continue
+            }
+            nint lmm = iopt[i].lmmpos
+            if negated {
+                lmm = iopt[i].lmmneg
+            }
+            if useClp && clp.couldBeShort && ((negated && iopt[i].lmmnegShort) || (!negated && iopt[i].lmmposShort)) {
+                if firstCharlen >= lmm {
+                    lmm = firstCharlen + 1
+                }
+            }
+            var name = clp.names[(nint)opt[i].longName].asBytes()[iopt[i].ilongoff..]
+            nint len = argcmp(name, arg, lmm, fewerDashes)
+            if len > 0 {
+                return (int)i
+            } else if len < 0 {
+                if ambiguous < MaxAmbiguousValues {
+                    ambiguousValues[(nint)ambiguous] = (int)i
+                }
+                ambiguous += 1
+            }
+        }
+        if ambiguous == firstAmbiguous && !fewerDashes {
+            fewerDashes = true
+            continue
+        }
+        break
+    }
+    return -1
+}
+
+// ---- values ----
+
+// C's strtol/strtoul with base 0, from `at`: the value, where it stopped, and whether it overflowed.
+struct CNumber : Copyable {
+    long l
+    ulong ul
+    nint end
+    bool overflow
+}
+
+bool isSpaceByte(int c) {
+    return c == 0x20 || (c >= 9 && c <= 13)
+}
+
+bool isDigitByte(int c) {
+    return c >= 0x30 && c <= 0x39
+}
+
+int digitValue(int c) {
+    if c >= 0x30 && c <= 0x39 {
+        return c - 0x30
+    }
+    if c >= 0x61 && c <= 0x7A {
+        return c - 0x61 + 10
+    }
+    if c >= 0x41 && c <= 0x5A {
+        return c - 0x41 + 10
+    }
+    return 99
+}
+
+// strtoul and strtol alike: `signed` gives strtol's range.
+CNumber cStrtoNum(read byte[] s, nint at, int base0, bool signed) {
+    nint p = at
+    while isSpaceByte(byteAt(s, p)) {
+        p += 1
+    }
+    bool neg = false
+    if byteAt(s, p) == 0x2B || byteAt(s, p) == 0x2D {
+        neg = byteAt(s, p) == 0x2D
+        p += 1
+    }
+    int base = base0
+    if (base == 0 || base == 16) && byteAt(s, p) == 0x30 && (byteAt(s, p + 1) == 0x78 || byteAt(s, p + 1) == 0x58) &&
+        digitValue(byteAt(s, p + 2)) < 16 {
+        p += 2
+        base = 16
+    } else if base == 0 {
+        if byteAt(s, p) == 0x30 {
+            base = 8
+        } else {
+            base = 10
+        }
+    }
+    nint start = p
+    ulong acc = 0
+    bool over = false
+    while digitValue(byteAt(s, p)) < base {
+        ulong d = (ulong)digitValue(byteAt(s, p))
+        if acc > (ulong.MaxValue - d) / (ulong)base {
+            over = true
+        } else {
+            acc = acc * (ulong)base + d
+        }
+        p += 1
+    }
+    if p == start {
+        return CNumber { l = 0, ul = 0, end = at, overflow = false }
+    }
+    var r = CNumber { l = 0, ul = 0, end = p, overflow = false }
+    if signed {
+        ulong limit = (ulong)long.MaxValue
+        if neg {
+            limit += 1
+        }
+        if over || acc > limit {
+            r.overflow = true
+            if neg {
+                r.l = long.MinValue
+            } else {
+                r.l = long.MaxValue
+            }
+        } else if neg {
+            r.l = (long)(0 - (long)(acc - 1)) - 1
+        } else {
+            r.l = (long)acc
+        }
+    } else {
+        if over {
+            r.overflow = true
+            r.ul = ulong.MaxValue
+        } else if neg {
+            r.ul = 0 - acc
+        } else {
+            r.ul = acc
+        }
+    }
+    return r
+}
+
+int parseInt(ref Gt g, read byte[] arg, bool complain, int type) {
+    nint end = 0
+    bool erange = false
+    ulong ul = 0
+    long l = 0
+    if byteAt(arg, 0) == 0 || isSpaceByte(byteAt(arg, 0)) || ((type & 1) != 0 && byteAt(arg, 0) == 0x2D) {
+        end = 0
+    } else if (type & 1) != 0 {
+        var n = cStrtoNum(arg, 0, 0, false)
+        ul = n.ul
+        end = n.end
+        erange = n.overflow
+        if type == 1 && ul > (ulong)uint.MaxValue {
+            erange = true
+        }
+    } else {
+        var n = cStrtoNum(arg, 0, 0, true)
+        l = n.l
+        end = n.end
+        erange = n.overflow
+        if type == 0 && (l < (long)int.MinValue || l > (long)int.MaxValue) {
+            erange = true
+        }
+    }
+    if end >= arg.length() && end != 0 && !erange {
+        g.clp.val.ul = 0
+        if type == 0 {
+            g.clp.val.i = (int)l
+        } else if type == 1 {
+            g.clp.val.u = (uint)ul
+        } else if type == 2 {
+            g.clp.val.l = l
+        } else {
+            g.clp.val.ul = ul
+        }
+        return 1
+    }
+    if complain {
+        var a = stringOf(arg)
+        if end < arg.length() || end == 0 {
+            if (type & 1) != 0 {
+                clpOptionError(ref g, "%<%O%> expects a nonnegative integer, not %<%s%>", read List<string> { a })
+            } else {
+                clpOptionError(ref g, "%<%O%> expects an integer, not %<%s%>", read List<string> { a })
+            }
+        } else {
+            clpOptionError(ref g, "%<%O%> argument %<%s%> out of range", read List<string> { a })
+        }
+    }
+    return 0
+}
+
+int parseBool(ref Gt g, read byte[] arg, bool complain) {
+    if arg.length() <= 5 && arg.indexOf(0x3D) is null {
+        var lc = List<byte>()
+        for b in arg {
+            if b >= 0x41 && b <= 0x5A {
+                lc.add(b + 32)
+            } else {
+                lc.add(b)
+            }
+        }
+        if argcmp("yes".asBytes(), read lc, 1, false) > 0 || argcmp("true".asBytes(), read lc, 1, false) > 0 ||
+            argcmp("1".asBytes(), read lc, 1, false) > 0 {
+            g.clp.val.i = 1
+            return 1
+        } else if argcmp("no".asBytes(), read lc, 1, false) > 0 || argcmp("false".asBytes(), read lc, 1, false) > 0 ||
+            argcmp("0".asBytes(), read lc, 1, false) > 0 {
+            g.clp.val.i = 0
+            return 1
+        }
+    }
+    if complain {
+        clpOptionError(ref g, "%<%O%> expects a true-or-false value, not %<%s%>", read List<string> { stringOf(arg) })
+    }
+    return 0
+}
+
+int parseDouble(ref Gt g, read byte[] arg, bool complain) {
+    nint end = 0
+    double d = 0.0
+    if byteAt(arg, 0) != 0 && !isSpaceByte(byteAt(arg, 0)) {
+        var r = cStrtod(arg, 0)
+        d = r.value
+        end = r.end
+    }
+    if end != 0 && end >= arg.length() && d.isFinite() {
+        g.clp.val.d = d
+        return 1
+    }
+    if complain {
+        if end != 0 && end >= arg.length() {
+            clpOptionError(ref g, "%<%O%> argument %<%s%> out of range", read List<string> { stringOf(arg) })
+        } else {
+            clpOptionError(ref g, "%<%O%> expects a real number, not %<%s%>", read List<string> { stringOf(arg) })
+        }
+    }
+    return 0
+}
+
+int parseStringList(ref Gt g, read byte[] arg, bool complain, nint which) {
+    int ambiguous = 0
+    var ambiguousValues = int[4] { 0, 0, 0, 0 }
+    var sl = g.clp.stringLists[which].replace(emptyStringList())
+    int idx = findPrefixOpt(ref g.clp, false, arg, read sl.items, read sl.iopt, ref ambiguous, ref ambiguousValues)
+    // C's list keeps the "any integer" item past `nitems`, where matching does not look
+    if idx >= 0 && (nint)idx >= sl.nitems {
+        idx = -1
+    }
+    if idx >= 0 {
+        g.clp.val.i = (int)sl.lvals[(nint)idx]
+        g.clp.stringLists[which] = sl
+        return 1
+    }
+    if sl.allowInt {
+        if parseInt(ref g, arg, false, 0) != 0 {
+            g.clp.stringLists[which] = sl
+            return 1
+        }
+    }
+    if !complain {
+        g.clp.stringLists[which] = sl
+        return 0
+    }
+    string complaint = "invalid"
+    if ambiguous != 0 {
+        complaint = "ambiguous"
+    } else {
+        ambiguous = (int)sl.nitemsInvalidReport
+        for k in 0..(nint)ambiguous {
+            if k < 4 {
+                ambiguousValues[k] = (int)k
+            }
+        }
+    }
+    ambiguityError(ref g, ambiguous, read ambiguousValues, read sl.items, read sl.iopt, "", "option %<%V%> is %s", read List<string> { complaint })
+    g.clp.stringLists[which] = sl
+    return 0
+}
+
+ClpStringList emptyStringList() {
+    return ClpStringList {
+        items = List<ClpOption>(), iopt = List<ClpIntern>(), lvals = List<long>(), nitems = 0,
+        allowInt = false, nitemsInvalidReport = 0,
+    }
+}
+
+int parseValue(ref Gt g, read ClpValType atr, read byte[] arg, bool complain) {
+    if atr.func == ParseString {
+        g.clp.val.s = stringOf(arg)
+        return 1
+    } else if atr.func == ParseInt {
+        return parseInt(ref g, arg, complain, atr.userData)
+    } else if atr.func == ParseBool {
+        return parseBool(ref g, arg, complain)
+    } else if atr.func == ParseDouble {
+        return parseDouble(ref g, arg, complain)
+    } else if atr.func == ParseStringList {
+        return parseStringList(ref g, arg, complain, (nint)atr.userData)
+    }
+    return parseUserValue(ref g, atr.valType, arg, complain)
+}
+
+// ---- the arguments ----
+
+read byte[] curArg(read Clp clp) from clp {
+    return clp.argv[clp.arg].asBytes()
+}
+
+void setOptionText(ref Clp clp, nint nOptionChars) {
+    clp.optionChars = nOptionChars
+    clp.optionCharsText = stringOf(clp.argv[clp.arg].asBytes()[0..nOptionChars])
+    clp.xtext = nOptionChars
+    clp.xtextArg = clp.arg
+}
+
+int getOclass(read Clp clp, read byte[] text, ref nint ocharskip) {
+    int c = 0
+    if clp.utf8 {
+        nint next = 0
+        c = decodeUtf8(text, 0, ref next)
+        ocharskip = next
+    } else {
+        c = byteAt(text, 0)
+        if c != 0 {
+            ocharskip = 1
+        } else {
+            ocharskip = 0
+        }
+    }
+    return clpOptionChar(read clp, c)
+}
+
+// Moves to the next argument: true if it is an option; false at the end, or with `haveVal` and
+// `vstr` set when it is not an option. `wantArgument` 1 takes an argument that is not an option,
+// 2 any argument.
+bool nextArgument(ref Clp clp, int wantArgument) {
+    clp.haveVal = false
+    clp.hasVstr = false
+    clp.couldBeShort = false
+
+    // in a string of short options, move up one char in the string
+    if clp.isShort {
+        var text = clp.argv[clp.arg].asBytes()
+        clp.xtext += clpUtf8Charlen(read clp, text, clp.xtext)
+        if byteAt(text, clp.xtext) == 0 {
+            clp.isShort = false
+        } else if wantArgument > 0 {
+            // handle -O[=]argument case
+            clp.haveVal = true
+            clp.hasVstr = true
+            if byteAt(text, clp.xtext) == 0x3D {
+                clp.vstr = stringOf(text[clp.xtext + 1..])
+            } else {
+                clp.vstr = stringOf(text[clp.xtext..])
+            }
+            clp.isShort = false
+            return false
+        }
+    }
+    if clp.isShort {
+        return true
+    }
+
+    clp.wholeNegated = false
+    clp.xtext = -1
+    if clp.argi >= clp.argv.length() {
+        return false
+    }
+    clp.arg = clp.argi
+    clp.argi += 1
+    var text = clp.argv[clp.arg].asBytes()
+    int oclass = 0
+    nint ocharskip = 0
+    bool notOption = wantArgument > 1
+    if !notOption {
+        if byteAt(text, 0) == 0x2D && byteAt(text, 1) == 0x2D {
+            oclass = ClpDoubledLong
+            ocharskip = 2
+        } else {
+            oclass = getOclass(read clp, text, ref ocharskip)
+        }
+        if (oclass & (ClpShort | ClpShortNegated)) != 0 && (oclass & (ClpLong | ClpLongNegated)) != 0 {
+            oclass &= ~(ClpShort | ClpShortNegated)
+            if byteAt(text, ocharskip) != 0 {
+                clp.couldBeShort = true
+            }
+        }
+        if oclass == ClpShort || oclass == ClpShortNegated || oclass == ClpLong || oclass == ClpLongNegated {
+            if oclass == ClpShort || oclass == ClpShortNegated {
+                clp.isShort = true
+            }
+            if oclass == ClpShortNegated || oclass == ClpLongNegated {
+                clp.wholeNegated = true
+            }
+            // For options introduced with one character, '[option-char]' alone is NOT an option.
+            if byteAt(text, ocharskip) == 0 {
+                notOption = true
+            } else {
+                setOptionText(ref clp, ocharskip)
+            }
+        } else if oclass == ClpLongImplicit {
+            if wantArgument > 0 {
+                notOption = true
+            } else {
+                setOptionText(ref clp, 0)
+            }
+        } else if oclass == ClpDoubledLong {
+            setOptionText(ref clp, ocharskip)
+        } else {
+            notOption = true
+        }
+    }
+    if notOption {
+        clp.isShort = false
+        clp.haveVal = true
+        clp.hasVstr = true
+        clp.vstr = clp.argv[clp.arg].clone()
+        return false
+    }
+    return true
+}
+
+void switchToShortArgument(ref Clp clp) {
+    nint ocharskip = 0
+    int oclass = getOclass(read clp, clp.argv[clp.arg].asBytes(), ref ocharskip)
+    clp.isShort = true
+    clp.wholeNegated = (oclass & ClpShortNegated) != 0
+    setOptionText(ref clp, ocharskip)
+}
+
+int findLong(ref Clp clp, nint argAt) {
+    var opt = clp.opt.clone()
+    var iopt = clp.iopt.clone()
+    var whole = clp.argv[clp.arg].clone()
+    var text = whole.asBytes()
+    nint at = argAt
+    int ambiguous = clp.ambiguous
+    var values = clp.ambiguousValues
+    int optno = findPrefixOpt(ref clp, true, text[at..], read opt, read iopt, ref ambiguous, ref values)
+    if optno < 0 {
+        // look for a negated option; --no-no-option is a double negative synonym for --option
+        int firstNegativeAmbiguous = ambiguous
+        while optno < 0 && byteAt(text, at) == 0x6E && byteAt(text, at + 1) == 0x6F && byteAt(text, at + 2) == 0x2D {
+            at += 3
+            clp.negated = !clp.negated
+            optno = findPrefixOpt(ref clp, true, text[at..], read opt, read iopt, ref ambiguous, ref values)
+        }
+        if optno < 0 {
+            int max = ambiguous
+            if max > MaxAmbiguousValues {
+                max = MaxAmbiguousValues
+            }
+            for i in (nint)firstNegativeAmbiguous..(nint)max {
+                values[i] = -values[i] - 1
+            }
+            clp.ambiguous = ambiguous
+            clp.ambiguousValues = values
+            return -1
+        }
+    }
+    clp.ambiguous = ambiguous
+    clp.ambiguousValues = values
+    nint o = (nint)optno
+    nint lmm = iopt[o].lmmpos
+    if clp.negated {
+        lmm = iopt[o].lmmneg
+    }
+    if clp.couldBeShort && ((clp.negated && iopt[o].lmmnegShort) || (!clp.negated && iopt[o].lmmposShort)) {
+        nint firstCharlen = clpUtf8Charlen(read clp, text, at)
+        if firstCharlen >= lmm {
+            lmm = firstCharlen + 1
+        }
+    }
+    var name = clp.names[(nint)opt[o].longName].asBytes()[iopt[o].ilongoff..]
+    nint len = argcmp(name, text[at..], lmm, true)
+    if byteAt(text, at + len) == 0x3D {
+        clp.haveVal = true
+        clp.hasVstr = true
+        clp.vstr = stringOf(text[at + len + 1..])
+    }
+    return optno
+}
+
+int findShort(ref Clp clp) {
+    var text = clp.argv[clp.arg].asBytes()
+    int c = byteAt(text, clp.xtext)
+    if clp.utf8 {
+        nint next = 0
+        c = decodeUtf8(text, clp.xtext, ref next)
+    }
+    for i in 0..clp.opt.length() {
+        if clp.iopt[i].ishort && clp.opt[i].shortName == c && (!clp.negated || clp.iopt[i].ineg) {
+            clp.negated = clp.negated || !clp.iopt[i].ipos
+            return (int)i
+        }
+    }
+    return -1
+}
+
+ClpState clpSave(read Clp clp) {
+    return ClpState {
+        argi = clp.argi, arg = clp.arg, xtext = clp.xtext, xtextArg = clp.xtextArg,
+        optionCharsText = clp.optionCharsText.clone(), optionChars = clp.optionChars,
+        optionProcessing = clp.optionProcessing, option = clp.option, isShort = clp.isShort,
+        wholeNegated = clp.wholeNegated, currentShort = clp.currentShort, negatedByNo = clp.negatedByNo,
+        optGeneration = clp.optGeneration,
+    }
+}
+
+void clpRestore(ref Clp clp, read ClpState state) {
+    clp.argi = state.argi
+    clp.arg = state.arg
+    clp.xtext = state.xtext
+    clp.xtextArg = state.xtextArg
+    clp.optionCharsText = state.optionCharsText.clone()
+    clp.optionChars = state.optionChars
+    clp.optionProcessing = state.optionProcessing
+    clp.isShort = state.isShort
+    clp.wholeNegated = state.wholeNegated
+    clp.currentShort = state.currentShort
+    clp.negatedByNo = state.negatedByNo
+    if clp.optGeneration == state.optGeneration {
+        clp.option = state.option
+    } else {
+        clp.option = ClpDone
+    }
+}
+
+nint valTypeFind(read Clp clp, int valType) {
+    for i in 0..clp.valtype.length() {
+        if clp.valtype[i].valType == valType {
+            return i
+        }
+    }
+    return -1
+}
+
+// The next option's id, or ClpNotOption (`vstr` the argument), ClpDone or ClpBadOption.
+int clpNext(ref Gt g) {
+    g.clp.option = ClpDone
+    g.clp.negated = false
+    g.clp.val = noClpVal()
+    g.clp.ambiguous = 0
+
+    int want = 0
+    if !g.clp.optionProcessing {
+        want = 2
+    }
+    if !nextArgument(ref g.clp, want) {
+        if g.clp.haveVal {
+            g.clp.val.s = g.clp.vstr.clone()
+            g.clp.option = -4
+            return ClpNotOption
+        }
+        g.clp.option = ClpDone
+        return ClpDone
+    }
+
+    g.clp.negated = g.clp.wholeNegated
+    int optno = -1
+    if g.clp.isShort {
+        optno = findShort(ref g.clp)
+    } else {
+        optno = findLong(ref g.clp, g.clp.xtext)
+    }
+    if optno < 0 && g.clp.couldBeShort {
+        switchToShortArgument(ref g.clp)
+        g.clp.negated = g.clp.wholeNegated
+        optno = findShort(ref g.clp)
+    }
+
+    if optno < 0 || (g.clp.negated && !g.clp.iopt[(nint)optno].ineg) {
+        if g.clp.argv[g.clp.arg] == "--" {
+            g.clp.optionProcessing = false
+            return clpNext(ref g)
+        }
+        g.clp.option = ClpBadOption
+        g.clp.currentShort = g.clp.isShort && !g.clp.couldBeShort
+        g.clp.negatedByNo = false
+        if g.clp.couldBeShort {
+            g.clp.isShort = false
+        }
+        if g.clp.ambiguous != 0 {
+            var opt = g.clp.opt.clone()
+            var iopt = g.clp.iopt.clone()
+            var values = g.clp.ambiguousValues
+            var prefix = g.clp.optionCharsText.clone()
+            ambiguityError(ref g, g.clp.ambiguous, read values, read opt, read iopt, read prefix, "option %<%O%> is ambiguous", read List<string>())
+        } else {
+            clpOptionError(ref g, "unrecognized option %<%O%>", read List<string>())
+        }
+        return ClpBadOption
+    }
+
+    nint o = (nint)optno
+    g.clp.option = optno
+    g.clp.currentShort = g.clp.isShort
+    g.clp.negatedByNo = g.clp.negated && !g.clp.wholeNegated
+
+    // The no-argument (or should-have-no-argument) case
+    if g.clp.negated || (!g.clp.iopt[o].imandatory && !g.clp.iopt[o].ioptional) {
+        if g.clp.haveVal {
+            clpOptionError(ref g, "%<%O%> can%,t take an argument", read List<string>())
+            g.clp.option = ClpBadOption
+            return ClpBadOption
+        }
+        return g.clp.opt[o].optionId
+    }
+
+    var opt = g.clp.opt[o]
+    if opt.valType <= 0 {
+        g.clp.option = ClpError
+        return ClpError
+    }
+    nint vtpos = valTypeFind(read g.clp, opt.valType)
+    if vtpos < 0 {
+        g.clp.option = ClpError
+        return ClpError
+    }
+
+    // complain only if the argument was explicitly given, or it is mandatory
+    bool complain = g.clp.haveVal || g.clp.iopt[o].imandatory
+    var save = clpSave(read g.clp)
+
+    if g.clp.iopt[o].imandatory && !g.clp.haveVal {
+        // Mandatory argument case: allow arguments that start with a dash, unless the type says not
+        bool disallow = (g.clp.valtype[vtpos].flags & ClpDisallowOptions) != 0
+        if disallow {
+            _ = nextArgument(ref g.clp, 1)
+        } else {
+            _ = nextArgument(ref g.clp, 2)
+        }
+        if !g.clp.haveVal {
+            bool gotOption = g.clp.xtext >= 0
+            clpRestore(ref g.clp, read save)
+            if gotOption {
+                clpOptionError(ref g, "%<%O%> requires a non-option argument", read List<string>())
+            } else {
+                clpOptionError(ref g, "%<%O%> requires an argument", read List<string>())
+            }
+            g.clp.option = ClpBadOption
+            return ClpBadOption
+        }
+    } else if g.clp.isShort && !g.clp.haveVal {
+        var text = g.clp.argv[g.clp.arg].asBytes()
+        if byteAt(text, g.clp.xtext + clpUtf8Charlen(read g.clp, text, g.clp.xtext)) != 0 {
+            // The -[option]argument case: the rest of the current string is the argument.
+            _ = nextArgument(ref g.clp, 1)
+        }
+    }
+
+    // Parse the argument
+    if g.clp.haveVal {
+        var atr = g.clp.valtype[vtpos]
+        var value = g.clp.vstr.clone()
+        if parseValue(ref g, read atr, value.asBytes(), complain) <= 0 {
+            // parser failed
+            g.clp.haveVal = false
+            if complain {
+                g.clp.xtext = save.xtext
+                g.clp.xtextArg = save.xtextArg
+                g.clp.option = ClpBadOption
+                return ClpBadOption
+            }
+            // optional value rejected: report no value
+            clpRestore(ref g.clp, read save)
+            g.clp.hasVstr = false
+            g.clp.vstr = ""
+            g.clp.val = noClpVal()
+        }
+    }
+    return opt.optionId
+}
+
+// The next argument, unparsed; null at the end.
+string? clpShift(ref Clp clp, bool allowOptions) {
+    var save = clpSave(read clp)
+    if allowOptions {
+        _ = nextArgument(ref clp, 2)
+    } else {
+        _ = nextArgument(ref clp, 1)
+    }
+    if !clp.haveVal {
+        clpRestore(ref clp, read save)
+    }
+    if clp.hasVstr {
+        return clp.vstr.clone()
+    }
+    return null
+}
+
+// ---- messages ----
+
+string clpQuoteChar(read Clp clp, bool isclose) {
+    if !clp.utf8 {
+        return "'"
+    } else if isclose {
+        return "\u{2019}"
+    }
+    return "\u{2018}"
+}
+
+void appendChar(read Clp clp, ref List<byte> bs, int c) {
+    if c >= 32 && c <= 126 {
+        bs.add((byte)c)
+    } else if c < 32 {
+        bs.add(0x5E)
+        bs.add((byte)(c + 64))
+    } else if clp.utf8 && c >= 127 && c < 0x110000 {
+        encodeUtf8(ref bs, c)
+    } else if c >= 127 && c <= 255 {
+        bs.add(0x5C)
+        bs.add((byte)((c >> 6) + 0x30))
+        bs.add((byte)(((c >> 3) & 7) + 0x30))
+        bs.add((byte)((c & 7) + 0x30))
+    } else {
+        bs.add(0x5C)
+        bs.add(0x3F)
+    }
+}
+
+// CLP's printf: `%s` and `%d` take the next of `args` (numbers are given as text), `%c` a
+// character given as its number in text, `%O` and `%V` the current option, `%<` and `%>` (or `%,`)
+// the quotes, `%%` a percent sign.
+void clpBuild(read Clp clp, ref List<byte> bs, read string fmt, read List<string> args) {
+    var f = fmt.asBytes()
+    nint i = 0
+    nint argn = 0
+    nint n = f.length()
+    while i < n {
+        byte b = f[i]
+        if b != 0x25 {
+            bs.add(b)
+            i += 1
+            continue
+        }
+        i += 1
+        if i >= n {
+            bs.add(0x25)
+            break
+        }
+        byte k = f[i]
+        i += 1
+        if k == 0x73 || k == 0x64 {
+            if argn < args.length() {
+                bs.addAll(args[argn].asBytes())
+            } else {
+                bs.addAll("(null)".asBytes())
+            }
+            argn += 1
+        } else if k == 0x63 {
+            int c = 0
+            if argn < args.length() {
+                c = int.parse(read args[argn]) ?? 0
+            }
+            argn += 1
+            appendChar(read clp, ref bs, c)
+        } else if k == 0x4F || k == 0x56 {
+            clpOptionName(read clp, ref bs, k == 0x56)
+        } else if k == 0x25 {
+            bs.add(0x25)
+        } else if k == 0x3C {
+            bs.addAll(clpQuoteChar(read clp, false).asBytes())
+        } else if k == 0x2C || k == 0x3E {
+            bs.addAll(clpQuoteChar(read clp, true).asBytes())
+        } else {
+            bs.add(0x25)
+            bs.add(k)
+        }
+    }
+}
+
+void clpOptionName(read Clp clp, ref List<byte> bs, bool withValue) {
+    if clp.option < 0 {
+        bool errorSentinel = clp.option == ClpBadOption || clp.option == ClpError
+        if !errorSentinel || clp.xtext < 0 {
+            bs.addAll("(no current option!)".asBytes())
+            return
+        }
+        var text = clp.argv[clp.xtextArg].asBytes()
+        bs.addAll(clp.optionCharsText.asBytes())
+        if clp.haveVal && withValue {
+            bs.addAll(text[clp.xtext..])
+        } else if clp.currentShort {
+            int c = byteAt(text, clp.xtext)
+            if clp.utf8 {
+                nint next = 0
+                c = decodeUtf8(text, clp.xtext, ref next)
+            }
+            appendChar(read clp, ref bs, c)
+        } else {
+            var rest = text[clp.xtext..]
+            var eq = rest.indexOf(0x3D)
+            if eq is not null {
+                bs.addAll(rest[0..eq])
+            } else {
+                bs.addAll(rest)
+            }
+        }
+        return
+    }
+    nint o = (nint)clp.option
+    bs.addAll(clp.optionCharsText.asBytes())
+    if clp.currentShort {
+        if clp.utf8 {
+            encodeUtf8(ref bs, clp.opt[o].shortName)
+        } else {
+            bs.add((byte)clp.opt[o].shortName)
+        }
+    } else {
+        if clp.negatedByNo {
+            bs.addAll("no-".asBytes())
+        }
+        bs.addAll(clp.names[(nint)clp.opt[o].longName].asBytes()[clp.iopt[o].ilongoff..])
+    }
+    if clp.haveVal && withValue {
+        if clp.currentShort && !clp.iopt[o].ioptional {
+            bs.add(0x20)
+        } else if !clp.currentShort {
+            bs.add(0x3D)
+        }
+        bs.addAll(clp.vstr.asBytes())
+    }
+}
+
+void clpProgramPrefix(read Clp clp, ref List<byte> bs) {
+    if clp.programName.length() > 0 {
+        bs.addAll(clp.programName.asBytes())
+        bs.addAll(": ".asBytes())
+    }
+}
+
+void clpOptionError(ref Gt g, read string fmt, read List<string> args) {
+    var bs = List<byte>()
+    clpProgramPrefix(read g.clp, ref bs)
+    clpBuild(read g.clp, ref bs, fmt, args)
+    bs.add(0x0A)
+    clpErrorHandler(ref g, read bs)
+}
+
+void ambiguityError(ref Gt g, int ambiguous, read int[4] values, read List<ClpOption> opt, read List<ClpIntern> iopt, read string prefix, read string fmt, read List<string> args) {
+    var bs = List<byte>()
+    clpProgramPrefix(read g.clp, ref bs)
+    clpBuild(read g.clp, ref bs, fmt, args)
+    bs.add(0x0A)
+    if ambiguous > 0 {
+        clpProgramPrefix(read g.clp, ref bs)
+        bs.addAll("(Possibilities are".asBytes())
+        nint i = 0
+        while i < (nint)ambiguous && i < (nint)MaxAmbiguousValues {
+            int value = values[i]
+            bool noDash = false
+            if value < 0 {
+                value = -(value + 1)
+                noDash = true
+            }
+            if i == 0 {
+                bs.add(0x20)
+            } else if i == (nint)ambiguous - 1 {
+                if i == 1 {
+                    bs.addAll(" and ".asBytes())
+                } else {
+                    bs.addAll(", and ".asBytes())
+                }
+            } else {
+                bs.addAll(", ".asBytes())
+            }
+            nint v = (nint)value
+            if !iopt[v].unquoted {
+                bs.addAll(clpQuoteChar(read g.clp, false).asBytes())
+            }
+            bs.addAll(prefix.asBytes())
+            if noDash {
+                bs.addAll("no-".asBytes())
+            }
+            bs.addAll(g.clp.names[(nint)opt[v].longName].asBytes()[iopt[v].ilongoff..])
+            if !iopt[v].unquoted {
+                bs.addAll(clpQuoteChar(read g.clp, true).asBytes())
+            }
+            i += 1
+        }
+        if ambiguous > MaxAmbiguousValues {
+            bs.addAll(", and others".asBytes())
+        }
+        bs.addAll(".)\n".asBytes())
+    }
+    clpErrorHandler(ref g, read bs)
+}
+
+string clpCurOptionName(read Clp clp) {
+    var bs = List<byte>()
+    clpOptionName(read clp, ref bs, false)
+    return stringOf(read bs)
+}
+
+// Bytes as text; what is not UTF-8 is replaced, as no text here holds bytes that are not.
+string stringOf(read byte[] b) {
+    match string.fromUtf8(b) {
+        Ok(s) => return s.clone()
+        Error(_) => {}
+    }
+    var out = List<byte>()
+    nint i = 0
+    while i < b.length() {
+        nint next = i
+        int c = decodeUtf8(b, i, ref next)
+        if next == i {
+            next = i + 1
+        }
+        encodeUtf8(ref out, c)
+        i = next
+    }
+    match string.fromUtf8(read out) {
+        Ok(s) => return s.clone()
+        Error(_) => return ""
+    }
+}

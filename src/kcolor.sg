@@ -1,0 +1,162 @@
+// kcolor.sg - Kcolor subsystem for gifsicle (kcolor.h, kcolor.c): colors of three components of
+// 15 bits, gamma corrected.
+// Copyright (C) 1997-2025 Eddie Kohler, ekohler@gmail.com
+// SG translation of gifsicle 1.99. This file is part of sg-gifsicle.
+//
+// Gifsicle is free software. It is distributed under the GNU Public License, version 2; you can
+// copy, distribute, or alter it at will, as long as this notice is kept intact and this source
+// code is made available. There is no warranty, express or implied.
+//
+// C keeps the gamma tables in a global, which `kc_set_gamma` changes; here they are part of the
+// program's state (`g.kc`).
+
+const int KcMax = 0x7FFF
+const int KcWhole = 0x8000
+const int KcHalf = 0x4000
+const int KcQuarter = 0x2000
+const int KcBits = 15
+
+struct Kcolor : Copyable {
+    short[3] a
+}
+
+struct Wkcolor : Copyable {
+    int[3] a
+}
+
+struct Kc {
+    int curType
+    double curGamma
+    List<ushort> gamma
+    List<ushort> revgamma
+}
+
+Kc newKc() {
+    var gamma = List<ushort>()
+    gamma.addAll(read SrgbGammaTable)
+    var revgamma = List<ushort>()
+    revgamma.addAll(read SrgbRevgammaTable)
+    return Kc { curType = KcGammaSrgb, curGamma = 2.2, gamma = gamma, revgamma = revgamma }
+}
+
+Kcolor kcolor(int a0, int a1, int a2) {
+    return Kcolor { a = short[3] { (short)a0, (short)a1, (short)a2 } }
+}
+
+int kcMin(int a, int b) {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+int kcMax(int a, int b) {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+int kcClampv(int v) {
+    return kcMax(0, kcMin(v, KcMax))
+}
+
+// the gamma transformation of `a0/a1/a2` [RGB]
+Kcolor kcMake8g(read Kc kc, int a0, int a1, int a2) {
+    return kcolor((int)kc.gamma[(nint)a0], (int)kc.gamma[(nint)a1], (int)kc.gamma[(nint)a2])
+}
+
+Kcolor kcMakegfcg(read Kc kc, Color c) {
+    return kcMake8g(kc, (int)c.red, (int)c.green, (int)c.blue)
+}
+
+// the uncorrected representation of `a0/a1/a2` [RGB]
+Kcolor kcMake8ng(int a0, int a1, int a2) {
+    return kcolor((a0 << 7) + (a0 >> 1), (a1 << 7) + (a1 >> 1), (a2 << 7) + (a2 >> 1))
+}
+
+Kcolor kcMakegfcng(Color c) {
+    return kcMake8ng((int)c.red, (int)c.green, (int)c.blue)
+}
+
+// the squared Euclidean distance between `x` and `y`, in 32 bits as C's unsigned arithmetic gives it
+uint kcDistance(Kcolor x, Kcolor y) {
+    uint d0 = ((uint)(int)x.a[0]).wrappingSubtract((uint)(int)y.a[0])
+    uint d1 = ((uint)(int)x.a[1]).wrappingSubtract((uint)(int)y.a[1])
+    uint d2 = ((uint)(int)x.a[2]).wrappingSubtract((uint)(int)y.a[2])
+    return d0.wrappingMultiply(d0).wrappingAdd(d1.wrappingMultiply(d1)).wrappingAdd(d2.wrappingMultiply(d2))
+}
+
+// the luminance value for `kc`; between 0 and KC_MAX
+int kcLuminance(Kcolor kc) {
+    return (54 * (int)kc.a[0] + 183 * (int)kc.a[1] + 19 * (int)kc.a[2]) >> 8
+}
+
+Kcolor kcLuminanceTransform(read Kc kc, int a0, int a1, int a2) {
+    var k = kcMake8g(kc, a0, a1, a2)
+    int l = kcLuminance(k)
+    return kcolor(l, l, l)
+}
+
+Wkcolor wkcZero() {
+    return Wkcolor { a = int[3] { 0, 0, 0 } }
+}
+
+bool wkcIszero(Wkcolor w) {
+    return w.a[0] == 0 && w.a[1] == 0 && w.a[2] == 0
+}
+
+Kcolor kcAdjust(Kcolor k, Wkcolor delta) {
+    return kcolor(kcClampv((int)k.a[0] + delta.a[0]), kcClampv((int)k.a[1] + delta.a[1]), kcClampv((int)k.a[2] + delta.a[2]))
+}
+
+// `x` through the reverse gamma transformation
+Kcolor kcRevgammaTransform(read Kc kc, Kcolor x) {
+    var out = x
+    for d in 0..3 {
+        int v = (int)x.a[d]
+        int c = (int)kc.revgamma[(nint)(v >> 7)]
+        while c < 0x7F80 && v >= (int)kc.gamma[(nint)((c + 0x80) >> 7)] {
+            c += 0x80
+        }
+        out.a[d] = (short)c
+    }
+    return out
+}
+
+Color kcTogfcg(read Kc kc, Kcolor x0) {
+    var x = kcRevgammaTransform(kc, x0)
+    return Color { haspixel = 0, red = (byte)((int)x.a[0] >> 7), green = (byte)((int)x.a[1] >> 7), blue = (byte)((int)x.a[2] >> 7), pixel = 0 }
+}
+
+void kcSetGamma(ref Gt g, int type, double gamma) {
+    if type == g.kc.curType && (type != KcGammaNumeric || gamma == g.kc.curGamma) {
+        return
+    }
+    if type != KcGammaNumeric {
+        g.kc.gamma.clear()
+        g.kc.gamma.addAll(read SrgbGammaTable)
+        g.kc.revgamma.clear()
+        g.kc.revgamma.addAll(read SrgbRevgammaTable)
+    } else {
+        var g0 = List<ushort>.repeat(0, 256)
+        var g1 = List<ushort>.repeat(0, 256)
+        for j in 0..256 {
+            g0[j] = (ushort)(int)(((double)j / 255.0).pow(gamma) * 32767.0 + 0.5)
+            g1[j] = (ushort)(int)(((double)j / 256.0).pow(1.0 / gamma) * 32767.0 + 0.5)
+            // round-trip gamma correction always preserves the input colors
+            if j != 0 {
+                while g0[j] <= g0[j - 1] && g0[j] < 32767 {
+                    g0[j] += 1
+                }
+                while g1[j] <= g1[j - 1] && g1[j] < 32767 {
+                    g1[j] += 1
+                }
+            }
+        }
+        g.kc.gamma = g0
+        g.kc.revgamma = g1
+    }
+    g.kc.curType = type
+    g.kc.curGamma = gamma
+}

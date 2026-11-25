@@ -1,0 +1,640 @@
+// gifread.sg - Functions to read GIFs (gifread.c).
+// Copyright (C) 1997-2025 Eddie Kohler, ekohler@gmail.com
+// SG translation of gifsicle 1.99. This file is part of sg-gifsicle.
+//
+// The GIF library is free software. It is distributed under the GNU General Public License,
+// version 2; you can copy, distribute, or alter it at will, as long as this notice is kept intact
+// and this source code is made available. There is no warranty, express or implied.
+//
+// gifsicle reads a file through a `FILE*`, byte by byte and block by block, and a file may hold
+// several GIFs one after another (`--multifile`). Here the whole file is in memory and a `Reader`
+// walks it as C's file reader walks the file: a byte past the end reads as 0 and marks the end
+// seen, and a block cut short is filled with zeros. The reader of a record (compressed data kept
+// in memory) is the other kind C has, and differs where the data ends early.
+
+struct Reader {
+    List<byte> v
+    nint pos
+    nint length
+    bool isRecord
+    bool sawEof
+}
+
+Reader fileReader(List<byte> data) {
+    nint n = data.length()
+    return Reader { v = data, pos = 0, length = n, isRecord = false, sawEof = false }
+}
+
+Reader dataReader(List<byte> data) {
+    nint n = data.length()
+    return Reader { v = data, pos = 0, length = n, isRecord = true, sawEof = false }
+}
+
+byte gifGetByte(ref Reader grr) {
+    if grr.pos >= grr.length {
+        grr.sawEof = true
+        return 0
+    }
+    byte b = grr.v[grr.pos]
+    grr.pos += 1
+    return b
+}
+
+int gifGetUnsigned(ref Reader grr) {
+    int one = (int)gifGetByte(ref grr)
+    int two = (int)gifGetByte(ref grr)
+    return one | (two << 8)
+}
+
+// `size` bytes into `p` from `at`; what is not there is zero. The count read.
+nint gifGetBlock(ref Reader grr, ref List<byte> p, nint at, nint size) {
+    nint n = size
+    if grr.pos + size > grr.length {
+        n = grr.length - grr.pos
+        grr.sawEof = true
+    }
+    p[at..at + n].copyFrom(grr.v[grr.pos..grr.pos + n])
+    for i in at + n..at + size {
+        p[i] = 0
+    }
+    grr.pos += n
+    return n
+}
+
+void gifSkipBlock(ref Reader grr, nint size) {
+    nint n = size
+    if grr.pos + size > grr.length {
+        n = grr.length - grr.pos
+        grr.sawEof = true
+    }
+    grr.pos += n
+}
+
+bool gifEof(read Reader grr) {
+    return grr.pos >= grr.length
+}
+
+// The state of a read: the stream and the image being read, and the decoder's tables.
+struct Context {
+    nint stream
+    nint gfi
+    List<ushort> prefix
+    List<byte> suffix
+    List<ushort> length
+    nint decodepos
+    // Where the image's pixels start and end in its data, C's `image` and `maximage`.
+    nint maximage
+    // The error handler: 0 for none, 1 for gifsicle's (gifread_error), 2 for one that says nothing.
+    int handler
+    int[2] errors
+}
+
+Context newContext(nint stream, nint gfi, int handler) {
+    return Context {
+        stream = stream, gfi = gfi, prefix = List<ushort>.repeat(0, (nint)GifMaxCode),
+        suffix = List<byte>.repeat(0, (nint)GifMaxCode), length = List<ushort>.repeat(0, (nint)GifMaxCode),
+        decodepos = 0, maximage = 0, handler = handler, errors = int[2] { 0, 0 },
+    }
+}
+
+const int HandlerDefault = 0
+const int HandlerGifsicle = 1
+const int HandlerSilent = 2
+
+void gifReadError(ref Gt g, ref Context gfc, int isError, read string? text) {
+    if isError >= 0 {
+        if isError > 0 {
+            gfc.errors[1] += 1
+        } else {
+            gfc.errors[0] += 1
+        }
+    }
+    int handler = gfc.handler
+    if handler == HandlerDefault {
+        handler = g.defaultErrorHandler
+    }
+    if handler == HandlerGifsicle {
+        gifreadError(ref g, gfc.stream, gfc.gfi, isError, text)
+    }
+}
+
+// The pixels of one code, written back from its end; the first of them.
+byte oneCode(ref Context gfc, ref List<byte> image, nint code0) {
+    nint code = code0
+    byte lastsuffix = 0
+    nint codelength = (nint)gfc.length[code]
+    gfc.decodepos += codelength
+    nint ptr = gfc.decodepos
+    while codelength > 0 {
+        lastsuffix = gfc.suffix[code]
+        code = (nint)gfc.prefix[code]
+        ptr -= 1
+        if ptr < gfc.maximage {
+            image[ptr] = lastsuffix
+        }
+        codelength -= 1
+    }
+    return lastsuffix
+}
+
+bool readImageBlock(ref Reader grr, ref List<byte> buffer, ref nint bitPosStore, ref nint bitLenStore, nint bitsNeeded) {
+    nint bitPosition = bitPosStore
+    nint bitLength = bitLenStore
+    while bitPosition + bitsNeeded > bitLength {
+        if bitPosition >= 8 {
+            nint i = bitPosition / 8
+            buffer[0] = buffer[i]
+            buffer[1] = buffer[i + 1]
+            bitPosition -= i * 8
+            bitLength -= i * 8
+        }
+        nint blockLen = (nint)gifGetByte(ref grr)
+        if blockLen == 0 {
+            return false
+        }
+        bitLength += gifGetBlock(ref grr, ref buffer, bitLength / 8, blockLen) * 8
+    }
+    bitPosStore = bitPosition
+    bitLenStore = bitLength
+    return true
+}
+
+void readImageData(ref Gt g, ref Context gfc, ref Reader grr, ref List<byte> image) {
+    var buffer = List<byte>.repeat(0, (nint)GifMaxBlock + 5)
+    gfc.decodepos = 0
+    int minCodeSize = (int)gifGetByte(ref grr)
+    if minCodeSize >= GifMaxCodeBits {
+        gifReadError(ref g, ref gfc, 1, "image corrupted, min_code_size too big")
+        minCodeSize = GifMaxCodeBits - 1
+    } else if minCodeSize < 2 {
+        gifReadError(ref g, ref gfc, 1, "image corrupted, min_code_size too small")
+        minCodeSize = 2
+    } else if minCodeSize > 8 {
+        // nonstandard; strict decoders reject it, so record a silent warning
+        gfc.errors[0] += 1
+    }
+    nint clearCode = 1 << minCodeSize
+    for code in 0..clearCode {
+        gfc.prefix[code] = 49428
+        gfc.suffix[code] = (byte)(code & 0xFF)
+        gfc.length[code] = 1
+    }
+    nint nextCode = clearCode + 1
+    nint bitsNeeded = (nint)minCodeSize + 1
+    nint code = clearCode
+    nint bitLength = 0
+    nint bitPosition = 0
+    bool reachedZero = false
+
+    while true {
+        nint oldCode = code
+        if bitPosition + bitsNeeded > bitLength {
+            if !readImageBlock(ref grr, ref buffer, ref bitPosition, ref bitLength, bitsNeeded) {
+                // no EOI; record a silent warning so compressed_errors is set
+                gfc.errors[0] += 1
+                reachedZero = true
+                break
+            }
+        }
+        nint i = bitPosition / 8
+        uint accum = (uint)buffer[i] + ((uint)buffer[i + 1] << 8)
+        if bitsNeeded >= 8 {
+            accum |= (uint)buffer[i + 2] << 16
+        }
+        code = (nint)((accum >> (bitPosition % 8)) & (uint)((1 << bitsNeeded) - 1))
+        bitPosition += bitsNeeded
+
+        if code == clearCode {
+            bitsNeeded = (nint)minCodeSize + 1
+            nextCode = clearCode + 1
+            continue
+        } else if code == clearCode + 1 {
+            // superfluous data after EOI may be rejected by strict decoders
+            if bitLength - bitPosition >= 8 {
+                gfc.errors[0] += 1
+            }
+            break
+        } else if code > nextCode && nextCode != 0 && nextCode != clearCode {
+            if gfc.errors[1] < 20 {
+                gifReadError(ref g, ref gfc, 1, "image corrupted, code out of range")
+            } else if gfc.errors[1] == 20 {
+                gifReadError(ref g, ref gfc, 1, "(not reporting more errors)")
+            }
+            code = 0
+        }
+
+        // First, the prefix and length of the next code (in case code == nextCode).
+        gfc.prefix[nextCode] = (ushort)oldCode
+        gfc.length[nextCode] = gfc.length[oldCode].wrappingAdd(1)
+        gfc.suffix[nextCode] = oneCode(ref gfc, ref image, code)
+        if code == nextCode && gfc.decodepos <= gfc.maximage {
+            image[gfc.decodepos - 1] = gfc.suffix[nextCode]
+        }
+        if nextCode != clearCode {
+            nextCode += 1
+            if nextCode == (1 << bitsNeeded) {
+                if bitsNeeded < (nint)GifMaxCodeBits {
+                    bitsNeeded += 1
+                } else {
+                    nextCode = clearCode
+                }
+            }
+        }
+    }
+
+    if !reachedZero {
+        // read blocks until zero-length reached
+        nint n = (nint)gifGetByte(ref grr)
+        while n > 0 {
+            gfc.errors[0] += 1
+            gifSkipBlock(ref grr, n)
+            n = (nint)gifGetByte(ref grr)
+        }
+    }
+
+    long delta = (long)gfc.maximage - (long)gfc.decodepos
+    if delta > 0 {
+        if delta == 1 {
+            gifReadError(ref g, ref gfc, 1, read $"missing {delta} pixel of image data".toString())
+        } else {
+            gifReadError(ref g, ref gfc, 1, read $"missing {delta} pixels of image data".toString())
+        }
+        // C zeroes the missing pixels; here the image was made of zeros and nothing past
+        // `decodepos` was written
+    } else if delta < -1 {
+        gifReadError(ref g, ref gfc, 0, read $"{-delta} superfluous pixels of image data".toString())
+    } else if delta == -1 {
+        gfc.errors[0] += 1
+    }
+}
+
+nint readColorTable(ref Gt g, int size, ref Reader grr) {
+    var gfcm = gifNewFullColormap(ref g, size, size)
+    var buf = List<byte>.repeat(0, 256 * 3)
+    // always initialize 256 colors; colors not in the map are black in case of bad input
+    _ = gifGetBlock(ref grr, ref buf, 0, (nint)size * 3)
+    for k in 0..256 {
+        g.colormaps[gfcm].col[k] = Color {
+            haspixel = 0, red = buf[3 * k], green = buf[3 * k + 1], blue = buf[3 * k + 2], pixel = 0,
+        }
+    }
+    return gfcm
+}
+
+void readLogicalScreenDescriptor(ref Gt g, nint gfs, ref Reader grr) {
+    g.streams[gfs].screenWidth = (ushort)gifGetUnsigned(ref grr)
+    g.streams[gfs].screenHeight = (ushort)gifGetUnsigned(ref grr)
+    byte packed = gifGetByte(ref grr)
+    g.streams[gfs].background = (int)gifGetByte(ref grr)
+    // don't care about pixel aspect ratio
+    _ = gifGetByte(ref grr)
+    if (packed & 0x80) != 0 {
+        int ncol = 1 << ((int)(packed & 0x07) + 1)
+        var cm = readColorTable(ref g, ncol, ref grr)
+        g.colormaps[cm].refcount = 1
+        g.streams[gfs].global = cm
+    } else {
+        g.streams[gfs].background = 256
+    }
+}
+
+void readCompressedImage(ref Gt g, nint gfi, ref Reader grr) {
+    if grr.isRecord {
+        nint imagePos = grr.pos
+        // scan over image
+        grr.pos += 1
+        grr.sawEof = true
+        while grr.pos < grr.length {
+            nint amt = (nint)grr.v[grr.pos]
+            grr.pos += amt + 1
+            if amt == 0 {
+                grr.sawEof = false
+                break
+            }
+        }
+        if grr.pos > grr.length {
+            grr.pos = grr.length
+        }
+        var comp = List<byte>()
+        comp.addAll(grr.v[imagePos..grr.pos])
+        g.images[gfi].compressed = comp
+        g.images[gfi].hasCompressed = true
+        g.images[gfi].compressedErrors = 0
+        return
+    }
+    // a file: read block by block
+    var comp = List<byte>.withCapacity(1024)
+    comp.add(gifGetByte(ref grr))
+    nint i = (nint)gifGetByte(ref grr)
+    var block = List<byte>.repeat(0, 256)
+    while i > 0 {
+        nint n = gifGetBlock(ref grr, ref block, 0, i)
+        if n > 0 {
+            comp.add((byte)n)
+            comp.addAll(block[0..n])
+        }
+        if n < i {
+            break
+        }
+        i = (nint)gifGetByte(ref grr)
+    }
+    comp.add(0)
+    g.images[gfi].compressed = comp
+    g.images[gfi].hasCompressed = true
+    g.images[gfi].compressedErrors = 0
+}
+
+void uncompressImage(ref Gt g, ref Context gfc, nint gfi, ref Reader grr) {
+    gifCreateUncompressedImage(ref g, gfi, g.images[gfi].interlace != 0)
+    gfc.maximage = (nint)g.images[gfi].width * (nint)g.images[gfi].height
+    int oldNerrors = gfc.errors[0] + gfc.errors[1]
+    var image = g.images[gfi].data.replace(List<byte>())
+    readImageData(ref g, ref gfc, ref grr, ref image)
+    g.images[gfi].data = image
+    g.images[gfi].compressedErrors = (uint)(gfc.errors[0] + gfc.errors[1] - oldNerrors)
+}
+
+// 2 when the image was uncompressed already, 1 when it is now and had no errors, 0 otherwise.
+int gifFullUncompressImage(ref Gt g, nint gfs, nint gfi, int handler) {
+    if g.images[gfi].hasImg {
+        return 2
+    }
+    var gfc = newContext(gfs, gfi, handler)
+    int ok = 0
+    if g.images[gfi].hasCompressed {
+        var grr = dataReader(g.images[gfi].compressed.clone())
+        uncompressImage(ref g, ref gfc, gfi, ref grr)
+        ok = 1
+    }
+    if gfc.errors[0] != 0 || gfc.errors[1] != 0 {
+        gifReadError(ref g, ref gfc, -1, null)
+    }
+    if ok != 0 && gfc.errors[1] == 0 {
+        return 1
+    }
+    return 0
+}
+
+int gifUncompressImage(ref Gt g, nint gfs, nint gfi) {
+    return gifFullUncompressImage(ref g, gfs, gfi, HandlerDefault)
+}
+
+// False when the GIF ends before the image's data.
+bool readImage(ref Gt g, ref Reader grr, ref Context gfc, nint gfi, int readFlags0) {
+    int readFlags = readFlags0
+    g.images[gfi].left = (ushort)gifGetUnsigned(ref grr)
+    g.images[gfi].top = (ushort)gifGetUnsigned(ref grr)
+    g.images[gfi].width = (ushort)gifGetUnsigned(ref grr)
+    g.images[gfi].height = (ushort)gifGetUnsigned(ref grr)
+    byte packed = gifGetByte(ref grr)
+    if (packed & 0x80) != 0 {
+        int ncol = 1 << ((int)(packed & 0x07) + 1)
+        var cm = readColorTable(ref g, ncol, ref grr)
+        g.colormaps[cm].refcount = 1
+        g.images[gfi].local = cm
+    }
+    if (packed & 0x40) != 0 {
+        g.images[gfi].interlace = 1
+    } else {
+        g.images[gfi].interlace = 0
+    }
+    if grr.sawEof || gifEof(read grr) {
+        grr.sawEof = true
+        return false
+    }
+    // Mainline GIF processors process a missing width (height) as the screen's.
+    if g.images[gfi].width == 0 {
+        g.images[gfi].width = g.streams[gfc.stream].screenWidth
+    }
+    if g.images[gfi].height == 0 {
+        g.images[gfi].height = g.streams[gfc.stream].screenHeight
+    }
+    if g.images[gfi].width == 0 || g.images[gfi].height == 0 {
+        gifReadError(ref g, ref gfc, 1, "ignoring frame, zero width and/or height")
+        gifMakeImageEmpty(ref g, gfi)
+        readFlags = 0
+    }
+    if (int)g.images[gfi].left + (int)g.images[gfi].width > 0xFFFF ||
+        (int)g.images[gfi].top + (int)g.images[gfi].height > 0xFFFF {
+        gifReadError(ref g, ref gfc, 1, "ignoring frame, violates 65535x65535 screen size limit")
+        gifMakeImageEmpty(ref g, gfi)
+        readFlags = 0
+    }
+
+    if (readFlags & GifReadCompressed) != 0 {
+        readCompressedImage(ref g, gfi, ref grr)
+        if (readFlags & GifReadUncompressed) != 0 {
+            var newGrr = dataReader(g.images[gfi].compressed.clone())
+            uncompressImage(ref g, ref gfc, gfi, ref newGrr)
+        }
+    } else if (readFlags & GifReadUncompressed) != 0 {
+        uncompressImage(ref g, ref gfc, gfi, ref grr)
+    } else {
+        // skip over the image: minimum code size, then data sub-blocks
+        _ = gifGetByte(ref grr)
+        nint i = (nint)gifGetByte(ref grr)
+        while i > 0 {
+            gifSkipBlock(ref grr, i)
+            i = (nint)gifGetByte(ref grr)
+        }
+    }
+    return true
+}
+
+void readGraphicControlExtension(ref Gt g, ref Context gfc, nint gfi, ref Reader grr) {
+    nint len = (nint)gifGetByte(ref grr)
+    if len == 0 {
+        // a zero-length block ends the extension
+        if !grr.sawEof {
+            gifReadError(ref g, ref gfc, 1, "bad graphic extension")
+        }
+        return
+    }
+    if len == 4 {
+        byte packed = gifGetByte(ref grr)
+        g.images[gfi].disposal = (packed >> 2) & 0x07
+        g.images[gfi].delay = (ushort)gifGetUnsigned(ref grr)
+        g.images[gfi].transparent = (int)gifGetByte(ref grr)
+        if (packed & 0x01) == 0 {
+            g.images[gfi].transparent = -1
+        }
+        len -= 4
+    }
+    if len > 0 {
+        gifReadError(ref g, ref gfc, 1, "bad graphic extension")
+        gifSkipBlock(ref grr, len)
+    }
+    len = (nint)gifGetByte(ref grr)
+    while len > 0 {
+        gifReadError(ref g, ref gfc, 1, "bad graphic extension")
+        gifSkipBlock(ref grr, len)
+        len = (nint)gifGetByte(ref grr)
+    }
+}
+
+bool readExtension(ref Gt g, ref Context gfc, ref Reader grr, int kind, read byte[] appname, bool packetized) {
+    nint blockLen = (nint)gifGetByte(ref grr)
+    var data = List<byte>()
+    bool any = false
+    bool made = false
+    var block = List<byte>.repeat(0, 256)
+    bool cut = false
+    while blockLen > 0 {
+        any = true
+        if packetized {
+            data.add((byte)blockLen)
+        }
+        _ = gifGetBlock(ref grr, ref block, 0, blockLen)
+        if grr.sawEof {
+            cut = true
+            break
+        }
+        data.addAll(block[0..blockLen])
+        blockLen = (nint)gifGetByte(ref grr)
+    }
+    if !cut && any {
+        var gfex = gifNewExtension(kind, appname)
+        gfex.hasData = true
+        gfex.data = data
+        gfex.packetized = packetized
+        gifAppendExtensionNear(ref g, gfc.stream, gfc.gfi, gfex)
+        made = true
+    }
+    while blockLen > 0 && !grr.sawEof {
+        gifSkipBlock(ref grr, blockLen)
+        blockLen = (nint)gifGetByte(ref grr)
+    }
+    return made
+}
+
+bool readApplicationExtension(ref Gt g, ref Context gfc, ref Reader grr) {
+    var buffer = List<byte>.repeat(0, (nint)GifMaxBlock + 1)
+    nint len = (nint)gifGetByte(ref grr)
+    if len == 0 {
+        if !grr.sawEof {
+            gifReadError(ref g, ref gfc, 0, "bad application extension identifier")
+        }
+        return true
+    }
+    _ = gifGetBlock(ref grr, ref buffer, 0, len)
+    if grr.sawEof {
+        return false
+    }
+    if len != GifExAppIdSize {
+        gifReadError(ref g, ref gfc, 0, "bad application extension identifier")
+        if len < GifExAppIdSize {
+            for k in len..GifExAppIdSize {
+                buffer[k] = 0
+            }
+        }
+    }
+    if buffer[0..11] == "NETSCAPE2.0".asBytes() || buffer[0..11] == "ANIMEXTS1.0".asBytes() {
+        len = (nint)gifGetByte(ref grr)
+        if len == 3 {
+            _ = gifGetByte(ref grr)
+            int loopcount = gifGetUnsigned(ref grr)
+            if !grr.sawEof {
+                g.streams[gfc.stream].loopcount = (long)loopcount
+            }
+            len = (nint)gifGetByte(ref grr)
+            if len != 0 {
+                gifReadError(ref g, ref gfc, 1, "bad loop extension")
+            }
+        } else if !grr.sawEof {
+            gifReadError(ref g, ref gfc, 1, "bad loop extension")
+        }
+        while len > 0 {
+            gifSkipBlock(ref grr, len)
+            len = (nint)gifGetByte(ref grr)
+        }
+        return true
+    }
+    var name = List<byte>()
+    name.addAll(buffer[0..GifExAppIdSize])
+    return readExtension(ref g, ref gfc, ref grr, 0xFF, read name, true)
+}
+
+nint readGif(ref Gt g, ref Reader grr, int readFlags, read string? landmark, int handler) {
+    if gifGetByte(ref grr) != 0x47 || gifGetByte(ref grr) != 0x49 || gifGetByte(ref grr) != 0x46 {
+        return None
+    }
+    _ = gifGetByte(ref grr)
+    _ = gifGetByte(ref grr)
+    _ = gifGetByte(ref grr)
+
+    var gfs = gifNewStream(ref g)
+    var gfi = gifNewImage(ref g)
+    var gfc = newContext(gfs, gfi, handler)
+    int unknownBlockType = 0
+    if landmark is not null {
+        g.streams[gfs].hasLandmark = true
+        g.streams[gfs].landmark = landmark.clone()
+    }
+    readLogicalScreenDescriptor(ref g, gfs, ref grr)
+
+    reading: while !grr.sawEof && !gifEof(read grr) {
+        byte block = gifGetByte(ref grr)
+        if block == 0x2C {
+            // image block
+            gifAddImage(ref g, gfs, gfi)
+            if !readImage(ref g, ref grr, ref gfc, gfi, readFlags) {
+                // Keep gfi so its extensions move to end_extensions.
+                g.images[gfi].refcount += 1
+                gifRemoveImage(ref g, gfs, g.streams[gfs].images.length() - 1)
+                break reading
+            }
+            gfi = gifNewImage(ref g)
+            gfc.gfi = gfi
+        } else if block == 0x3B {
+            break reading
+        } else if block == 0x21 {
+            block = gifGetByte(ref grr)
+            if block == 0xF9 {
+                readGraphicControlExtension(ref g, ref gfc, gfi, ref grr)
+            } else if (int)block == GifExApp {
+                _ = readApplicationExtension(ref g, ref gfc, ref grr)
+            } else if (int)block == GifExComment || (int)block == GifExName {
+                _ = readExtension(ref g, ref gfc, ref grr, (int)block, "".asBytes(), false)
+            } else {
+                _ = readExtension(ref g, ref gfc, ref grr, (int)block, "".asBytes(), true)
+            }
+        } else {
+            if unknownBlockType == 0 {
+                gifReadError(ref g, ref gfc, 1, read $"unknown block type {block} at file offset {(uint)grr.pos - 1}".toString())
+            }
+            unknownBlockType += 1
+            if unknownBlockType > 20 {
+                break reading
+            }
+        }
+    }
+
+    // Move extensions after last image into stream.
+    g.streams[gfs].endExtensions = g.images[gfi].extensions.replace(List<Extension>())
+    gifDeleteImage(ref g, gfi)
+    gfc.gfi = None
+
+    if grr.sawEof {
+        gifReadError(ref g, ref gfc, 1, "GIF truncated")
+    }
+    g.streams[gfs].errors = (uint)gfc.errors[1]
+    if gfc.errors[1] == 0 && (readFlags & GifReadTrailingGarbageOk) == 0 && !gifEof(read grr) {
+        gifReadError(ref g, ref gfc, 0, "trailing garbage after GIF ignored")
+    }
+    // finally, export last message
+    gifReadError(ref g, ref gfc, -1, null)
+    return gfs
+}
+
+nint gifFullReadFile(ref Gt g, ref Reader grr, int readFlags, read string? landmark, int handler) {
+    return readGif(ref g, ref grr, readFlags, landmark, handler)
+}
+
+nint gifFullReadRecord(ref Gt g, List<byte> record, int readFlags0, read string? landmark, int handler) {
+    int readFlags = readFlags0
+    var grr = dataReader(record)
+    if (readFlags & GifReadConstRecord) != 0 {
+        readFlags |= GifReadCompressed
+    }
+    return readGif(ref g, ref grr, readFlags, landmark, handler)
+}
