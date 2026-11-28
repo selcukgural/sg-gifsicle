@@ -650,7 +650,7 @@ nint readGif(ref Gt g, ref Reader grr, int readFlags, read string? landmark, int
     }
     readLogicalScreenDescriptor(ref g, gfs, ref grr)
 
-    reading: while !grr.sawEof && !gifEof(read grr) {
+    while !grr.sawEof && !gifEof(read grr) {
         byte block = gifGetByte(ref grr)
         if block == 0x2C {
             // image block
@@ -659,12 +659,12 @@ nint readGif(ref Gt g, ref Reader grr, int readFlags, read string? landmark, int
                 // Keep gfi so its extensions move to end_extensions.
                 g.images[gfi].refcount += 1
                 gifRemoveImage(ref g, gfs, g.streams[gfs].images.length() - 1)
-                break reading
+                break
             }
             gfi = gifNewImage(ref g)
             gfc.gfi = gfi
         } else if block == 0x3B {
-            break reading
+            break
         } else if block == 0x21 {
             block = gifGetByte(ref grr)
             if block == 0xF9 {
@@ -682,7 +682,7 @@ nint readGif(ref Gt g, ref Reader grr, int readFlags, read string? landmark, int
             }
             unknownBlockType += 1
             if unknownBlockType > 20 {
-                break reading
+                break
             }
         }
     }
