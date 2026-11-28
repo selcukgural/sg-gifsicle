@@ -1,7 +1,7 @@
 # sg-gifsicle
 
 [gifsicle](https://www.lcdf.org/gifsicle/) 1.99, the command-line tool for GIF images by Eddie Kohler,
-translated file by file into [SG](https://github.com/selcukgural/sg-lang), a small, memory-safe systems
+translated file by file into [SG](https://github.com/sg-language/sg-lang), a small, memory-safe systems
 language. The program takes the same options and writes the same bytes, the same messages and the same
 exit codes as gifsicle 1.99, except where noted below.
 
@@ -14,7 +14,7 @@ of each translated file.
 SG is not released yet; it is built from its repository at the commit named in `SG_COMMIT`:
 
 ```
-git clone https://github.com/selcukgural/sg-lang
+git clone https://github.com/sg-language/sg-lang
 cd sg-lang
 git checkout $(cat ../sg-gifsicle/SG_COMMIT)
 cd interpreter && cargo build --release && cd ../..
